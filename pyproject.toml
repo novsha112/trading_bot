@@ -1,0 +1,63 @@
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "Modular cryptocurrency trading bot (backtest, paper, testnet, live)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "structlog>=26.1.0",
+]
+
+[tool.uv]
+# Application, not a distributable library: uv installs dependencies only.
+package = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "S",     # flake8-bandit (security)
+    "DTZ",   # naive datetimes are forbidden: all timestamps are UTC
+    "T20",   # print() instead of structured logging
+    "SIM",   # flake8-simplify
+    "PT",    # flake8-pytest-style
+    "ASYNC", # flake8-async
+    "RUF",   # ruff-specific rules
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert and deliberately fake credentials.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["app", "tests"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.9",
+]
