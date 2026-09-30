@@ -13,9 +13,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Final
+from enum import Enum
+from typing import Final, TypeVar
 
 from app.domain.errors import DomainValidationError
+
+E = TypeVar("E", bound=Enum)
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _ZERO_OFFSET: Final = timedelta(0)
@@ -56,6 +59,26 @@ def require_text(value: object, field: str) -> str:
     if not value or value != value.strip():
         raise DomainValidationError(
             f"{field} must be non-empty and without surrounding whitespace, got {value!r}"
+        )
+    return value
+
+
+def require_bool(value: object, field: str) -> bool:
+    """Return ``value`` if it is a ``bool`` (``1``/``0`` and strings are rejected)."""
+    if not isinstance(value, bool):
+        raise DomainValidationError(f"{field} must be a bool, got {type(value).__name__}")
+    return value
+
+
+def require_enum(value: object, enum_type: type[E], field: str) -> E:
+    """Return ``value`` if it is a member of ``enum_type``.
+
+    A plain string equal to a member value is rejected: external values must be
+    mapped explicitly, not passed through.
+    """
+    if not isinstance(value, enum_type):
+        raise DomainValidationError(
+            f"{field} must be a {enum_type.__name__}, got {type(value).__name__}"
         )
     return value
 

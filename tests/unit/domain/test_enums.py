@@ -9,6 +9,7 @@ import pytest
 from app.domain.enums import (
     OrderStatus,
     OrderType,
+    PositionSide,
     RoundingDirection,
     Side,
     TimeInForce,
@@ -34,6 +35,7 @@ EXPECTED_VALUES: dict[type[StrEnum], set[str]] = {
         "unknown",
     },
     RoundingDirection: {"down", "up"},
+    PositionSide: {"long", "short", "flat"},
 }
 
 

@@ -62,3 +62,11 @@ class RoundingDirection(StrEnum):
 
     DOWN = "down"
     UP = "up"
+
+
+class PositionSide(StrEnum):
+    """Direction of a position, derived from its signed quantity."""
+
+    LONG = "long"
+    SHORT = "short"
+    FLAT = "flat"

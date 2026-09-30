@@ -8,11 +8,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.domain.enums import OrderType, Side
 from app.domain.errors import DomainError, DomainValidationError
 from app.domain.validation import (
+    require_bool,
     require_decimal,
+    require_enum,
     require_non_negative,
     require_positive,
+    require_text,
     require_utc,
     utc_from_ms,
 )
@@ -176,3 +180,52 @@ def test_utc_from_ms_rejects_negative() -> None:
 def test_utc_from_ms_rejects_out_of_range() -> None:
     with pytest.raises(DomainValidationError, match=r"^ms is out of the supported datetime range"):
         utc_from_ms(253_402_300_800_000)
+
+
+# --- require_text ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["BTCUSDT", "a", "BTC-USDT_PERP", "exec 1"])
+def test_require_text_returns_original_string(value: str) -> None:
+    assert require_text(value, "symbol") is value
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t\n", " BTCUSDT", "BTCUSDT ", "BTCUSDT\n"])
+def test_require_text_rejects_empty_and_surrounding_whitespace(value: str) -> None:
+    with pytest.raises(DomainValidationError, match=r"^symbol must be non-empty"):
+        require_text(value, "symbol")
+
+
+@pytest.mark.parametrize("value", [None, 1, 1.5, True, b"BTCUSDT", Decimal("1"), ["BTC"]])
+def test_require_text_rejects_non_str(value: object) -> None:
+    with pytest.raises(DomainValidationError, match=r"^symbol must be a str"):
+        require_text(value, "symbol")
+
+
+# --- require_bool ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_require_bool_accepts_bool(value: bool) -> None:
+    assert require_bool(value, "is_maker") is value
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", "False", None, Decimal("1")])
+def test_require_bool_rejects_non_bool(value: object) -> None:
+    with pytest.raises(DomainValidationError, match=r"^is_maker must be a bool"):
+        require_bool(value, "is_maker")
+
+
+# --- require_enum ------------------------------------------------------------------------
+
+
+def test_require_enum_returns_member() -> None:
+    assert require_enum(Side.BUY, Side, "side") is Side.BUY
+
+
+@pytest.mark.parametrize("value", ["buy", "Buy", OrderType.LIMIT, None, 1])
+def test_require_enum_rejects_other_values(value: object) -> None:
+    # A plain string equal to a member value is still rejected: callers must map
+    # external values explicitly, never pass them through.
+    with pytest.raises(DomainValidationError, match=r"^side must be a Side"):
+        require_enum(value, Side, "side")
