@@ -6,7 +6,14 @@ from enum import StrEnum
 
 import pytest
 
-from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce, TradingMode
+from app.domain.enums import (
+    OrderStatus,
+    OrderType,
+    RoundingDirection,
+    Side,
+    TimeInForce,
+    TradingMode,
+)
 
 EXPECTED_VALUES: dict[type[StrEnum], set[str]] = {
     TradingMode: {"backtest", "paper", "testnet", "live"},
@@ -26,6 +33,7 @@ EXPECTED_VALUES: dict[type[StrEnum], set[str]] = {
         "failed",
         "unknown",
     },
+    RoundingDirection: {"down", "up"},
 }
 
 

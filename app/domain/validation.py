@@ -46,6 +46,20 @@ def require_non_negative(value: object, field: str) -> Decimal:
     return decimal
 
 
+def require_text(value: object, field: str) -> str:
+    """Return ``value`` if it is a non-empty ``str`` without surrounding whitespace.
+
+    Identifiers are not normalized: " BTCUSDT" is a producer bug, not a symbol.
+    """
+    if not isinstance(value, str):
+        raise DomainValidationError(f"{field} must be a str, got {type(value).__name__}")
+    if not value or value != value.strip():
+        raise DomainValidationError(
+            f"{field} must be non-empty and without surrounding whitespace, got {value!r}"
+        )
+    return value
+
+
 def require_utc(value: object, field: str) -> datetime:
     """Return ``value`` if it is a timezone-aware ``datetime`` with UTC offset 0.
 

@@ -55,3 +55,10 @@ class OrderStatus(StrEnum):
     # Submission outcome is unknown (e.g. timeout after sending): must be resolved
     # through the exchange, never by blindly re-sending the order.
     UNKNOWN = "unknown"
+
+
+class RoundingDirection(StrEnum):
+    """Explicit direction for rounding to a tick size / quantity step."""
+
+    DOWN = "down"
+    UP = "up"
