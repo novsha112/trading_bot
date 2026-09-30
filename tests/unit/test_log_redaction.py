@@ -53,6 +53,14 @@ def stream() -> io.StringIO:
     return io.StringIO()
 
 
+def _keep_only_own_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detach pytest's capture handlers: they format stdlib records on their own
+    and would fail on the deliberately broken records, masking our handler's result."""
+    root = logging.getLogger()
+    own = [h for h in root.handlers if getattr(h, "_trading_bot_handler", False)]
+    monkeypatch.setattr(root, "handlers", own)
+
+
 def _configure(stream: io.StringIO, log_format: str = "json") -> None:
     configure_logging(
         level="DEBUG",
@@ -86,6 +94,15 @@ def _assert_no_secrets(output: str) -> None:
         "password",
         "passphrase",
         "Cookie",
+        # Plural and short forms.
+        "apiKeys",
+        "APIKeys",
+        "api_keys",
+        "secrets",
+        "tokens",
+        "access_tokens",
+        "pwd",
+        "db_pwd",
     ],
 )
 def test_sensitive_names_detected(name: str) -> None:
@@ -171,11 +188,17 @@ def test_exception_object_as_field_value(stream: io.StringIO) -> None:
 
 
 def test_secret_wrapper_object_masked(stream: io.StringIO) -> None:
+    # Neither the field name nor a registered secret may be what masks the value:
+    # only the get_secret_value() branch.
+    assert not is_sensitive_name("loaded_value")
     configure_logging(log_format="json", stream=stream)
-    structlog.get_logger().info("settings_loaded", exchange_credential_ref=FakeSecretStr("x-y-z"))
+    structlog.get_logger().info(
+        "settings_loaded", loaded_value=FakeSecretStr("unregistered-wrapped-value")
+    )
 
     [record] = _json_lines(stream)
-    assert record["exchange_credential_ref"] == REDACTED
+    assert record["loaded_value"] == REDACTED
+    assert "unregistered-wrapped-value" not in stream.getvalue()
 
 
 def test_stdlib_logger_secrets_masked(stream: io.StringIO) -> None:
@@ -260,3 +283,111 @@ def test_invalid_level_rejected() -> None:
 def test_invalid_format_rejected() -> None:
     with pytest.raises(ValueError, match="Unknown log format"):
         configure_logging(log_format="xml")  # type: ignore[arg-type]
+
+
+# --- Regression tests for issues found in the Phase 0 review ---------------------------
+
+
+def test_stdlib_positional_args_masked_by_name_before_formatting(stream: io.StringIO) -> None:
+    """Structured %-args of stdlib logging are redacted before the message is rendered."""
+    configure_logging(level="DEBUG", log_format="json", stream=stream)
+    foreign = logging.getLogger("some.third_party.http")
+    foreign.debug("headers %s", {"X-BAPI-API-KEY": "unregistered-header-key"})
+    foreign.debug("auth %s %s", "BTCUSDT", {"api_secret": "unregistered-api-secret"})
+
+    output = stream.getvalue()
+    assert "unregistered-header-key" not in output
+    assert "unregistered-api-secret" not in output
+    first, second = _json_lines(stream)
+    assert first["event"] == f"headers {{'X-BAPI-API-KEY': '{REDACTED}'}}"
+    assert second["event"] == f"auth BTCUSDT {{'api_secret': '{REDACTED}'}}"
+
+
+def test_stdlib_named_args_still_formatted(stream: io.StringIO) -> None:
+    configure_logging(log_format="json", stream=stream)
+    logging.getLogger("lib").info("order %(id)s token %(token)s", {"id": 7, "token": "tk-value"})
+
+    [record] = _json_lines(stream)
+    assert record["event"] == f"order 7 token {REDACTED}"
+
+
+def test_stdlib_bad_format_args_do_not_raise(
+    stream: io.StringIO, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configure_logging(log_format="json", stream=stream)
+    _keep_only_own_handlers(monkeypatch)
+    logging.getLogger("lib").info("value %d", "not-a-number")
+
+    [record] = _json_lines(stream)
+    assert "value %d" in record["event"]
+    assert "Logging error" not in capsys.readouterr().err
+
+
+def test_reconfiguration_updates_existing_logger_instances(stream: io.StringIO) -> None:
+    secret = "late-registered-secret-42"
+    configure_logging(log_format="json", stream=io.StringIO())
+    log = structlog.get_logger()
+    log.info("before secrets are known")
+
+    configure_logging(log_format="json", secrets=[secret], stream=stream)
+    log.info(f"after reconfigure {secret}")
+
+    assert secret not in stream.getvalue()
+    [record] = _json_lines(stream)
+    assert record["event"] == f"after reconfigure {REDACTED}"
+
+
+def test_secret_as_mapping_key_masked(stream: io.StringIO) -> None:
+    _configure(stream)
+    structlog.get_logger().info(
+        "balances", by_account={API_KEY: 100, API_SECRET: 200, "sub-account": 300}
+    )
+
+    _assert_no_secrets(stream.getvalue())
+    [record] = _json_lines(stream)
+    # Structure and non-secret keys stay visible; colliding redacted keys are kept apart.
+    assert record["by_account"] == {REDACTED: 100, f"{REDACTED}#2": 200, "sub-account": 300}
+
+
+class ExplodingObject:
+    def __str__(self) -> str:
+        raise RuntimeError("broken __str__")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("broken __repr__")
+
+
+@pytest.mark.parametrize("log_format", ["json", "console"])
+def test_unprintable_object_does_not_break_logging(
+    stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    log_format: str,
+) -> None:
+    _configure(stream, log_format=log_format)
+    _keep_only_own_handlers(monkeypatch)
+    log = structlog.get_logger()
+
+    log.info("order_state", order=ExplodingObject(), nested={"items": [ExplodingObject()]})
+    logging.getLogger("lib").info("obj %s", ExplodingObject())
+
+    assert stream.getvalue().count("[UNPRINTABLE]") == 3
+    # logging.Handler.handleError reports formatting failures to stderr.
+    assert "Logging error" not in capsys.readouterr().err
+
+
+class ReprLeaksSecret:
+    """str() is safe, repr() exposes a registered secret (e.g. a naive client repr)."""
+
+    def __str__(self) -> str:
+        return "BybitClient"
+
+    def __repr__(self) -> str:
+        return f"BybitClient(api_key={API_KEY!r})"
+
+
+def test_console_does_not_expose_secret_via_repr(stream: io.StringIO) -> None:
+    _configure(stream, log_format="console")
+    structlog.get_logger().info("client_ready", client=ReprLeaksSecret())
+
+    _assert_no_secrets(stream.getvalue())

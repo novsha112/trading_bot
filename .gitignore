@@ -10,8 +10,8 @@
 *.db-journal
 *.sqlite
 *.sqlite3
-logs/
-data/
+/logs/
+/data/
 
 # Python
 __pycache__/

@@ -784,3 +784,4 @@ v1 — мінімально, без зовнішньої інфраструкт�
 5. Дані для бектесту: 1m свічки (простіше) чи трейди (точніше для Grid).
 6. Testnet чи Demo Trading як етап перед live (або обидва).
 7. Kill switch за замовчуванням: закривати позиції чи лише скасовувати ордери.
+8. Власник і напрямок залежностей KillSwitch. Зараз KillSwitch описаний у `risk/`, якому дозволено імпортувати тільки `domain` і `portfolio`, але KillSwitch потребує `TradingAdapter` з `exchanges/`. Follow-up: *Define the ownership and dependency direction for KillSwitch before implementing the risk/execution integration.*

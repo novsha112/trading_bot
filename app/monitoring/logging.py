@@ -11,7 +11,14 @@ Redaction works on two levels:
    (``api_key``, ``X-BAPI-SIGN``, ``bot_token``...) are masked entirely,
    including inside nested dicts and lists (e.g. HTTP headers).
 2. By value: every registered secret value is replaced wherever it appears in
-   any string (event text, other fields, rendered tracebacks).
+   any string (event text, other fields, mapping keys, rendered tracebacks).
+
+%-style arguments (stdlib ``logger.debug("headers %s", headers)``) are redacted
+as structured data first and only then interpolated into the message.
+
+Objects other than primitives are converted to ``str`` during redaction, so the
+renderer never calls ``repr()`` / ``str()`` on raw objects. An object that cannot
+be converted is logged as ``[UNPRINTABLE]``: a logging call must never raise.
 
 Name-based masking alone cannot catch a secret embedded in free text, so the
 actual secret values must be registered via ``configure_logging(secrets=...)``.
@@ -29,6 +36,7 @@ import structlog
 from structlog.typing import EventDict, Processor, WrappedLogger
 
 REDACTED: Final = "[REDACTED]"
+UNPRINTABLE: Final = "[UNPRINTABLE]"
 
 # Field names are split into lowercase tokens ("X-BAPI-API-KEY" -> x, bapi, api, key;
 # "apiKey" -> api, key). A field is sensitive if any token is in this set. Token
@@ -36,19 +44,25 @@ REDACTED: Final = "[REDACTED]"
 SENSITIVE_NAME_TOKENS: Final = frozenset(
     {
         "apikey",
+        "apikeys",
         "auth",
         "authorization",
         "cookie",
         "credential",
         "credentials",
         "key",
+        "keys",
         "passphrase",
         "passwd",
         "password",
+        "passwords",
+        "pwd",
         "secret",
+        "secrets",
         "sign",
         "signature",
         "token",
+        "tokens",
     }
 )
 
@@ -81,10 +95,54 @@ class SecretRedactor:
         )
 
     def __call__(self, logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
-        return {
-            key: value if key in _META_KEYS else self._redact_field(key, value)
-            for key, value in event_dict.items()
-        }
+        meta = {key: event_dict[key] for key in _META_KEYS if key in event_dict}
+        fields = {key: value for key, value in event_dict.items() if key not in _META_KEYS}
+        return {**self._redact_mapping(fields), **meta}
+
+    def format_positional_args(
+        self, logger: WrappedLogger, method_name: str, event_dict: EventDict
+    ) -> EventDict:
+        """Redact %-style arguments, then interpolate them into the event text.
+
+        Runs before the main redaction step, so the resulting text is scrubbed
+        for registered secrets once more.
+        """
+        args = event_dict.pop("positional_args", None)
+        if not args:
+            return event_dict
+        try:
+            safe_args: Any = (
+                self._redact_mapping(args)
+                if isinstance(args, Mapping)
+                else tuple(self._redact_value(arg) for arg in args)
+            )
+        except Exception:
+            safe_args = (UNPRINTABLE,)
+        event = event_dict.get("event")
+        try:
+            event_dict["event"] = str(event) % safe_args
+        except Exception:
+            # Mismatched format string: keep both parts instead of failing.
+            event_dict["event"] = f"{event} {safe_args!r}"
+        return event_dict
+
+    def _redact_mapping(self, mapping: Mapping[Any, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for raw_key, value in mapping.items():
+            name = raw_key if isinstance(raw_key, str) else self._to_text(raw_key)
+            try:
+                redacted = self._redact_field(name, value)
+            except Exception:
+                redacted = UNPRINTABLE
+            key = self._scrub(name)
+            if key in result:
+                # Two keys collapsed into the same text (e.g. two masked secrets).
+                suffix = 2
+                while f"{key}#{suffix}" in result:
+                    suffix += 1
+                key = f"{key}#{suffix}"
+            result[key] = redacted
+        return result
 
     def _redact_field(self, name: str, value: Any) -> Any:
         if is_sensitive_name(name) and value is not None and value != "":
@@ -100,14 +158,19 @@ class SecretRedactor:
             # pydantic.SecretStr / SecretBytes and similar wrappers.
             return REDACTED
         if isinstance(value, Mapping):
-            return {str(k): self._redact_field(str(k), v) for k, v in value.items()}
+            return self._redact_mapping(value)
         if isinstance(value, list | tuple | set | frozenset):
             return [self._redact_value(item) for item in value]
-        # Arbitrary objects (exceptions, bytes, models) are rendered with str()
-        # later by the renderer; check that text now.
-        text = str(value)
-        scrubbed = self._scrub(text)
-        return scrubbed if scrubbed != text else value
+        # Any other object (exceptions, bytes, Decimal, models): the renderer
+        # gets its scrubbed str() and never touches the object itself.
+        return self._scrub(self._to_text(value))
+
+    @staticmethod
+    def _to_text(value: Any) -> str:
+        try:
+            return str(value)
+        except Exception:
+            return UNPRINTABLE
 
     def _scrub(self, text: str) -> str:
         for secret in self._secrets:
@@ -125,6 +188,7 @@ def _build_shared_processors(redactor: SecretRedactor) -> list[Processor]:
         structlog.processors.StackInfoRenderer(),
         # Render exceptions to text BEFORE redaction so tracebacks are scrubbed.
         structlog.processors.format_exc_info,
+        redactor.format_positional_args,
         # Must stay last: nothing may add unredacted data after it.
         redactor,
     ]
@@ -161,6 +225,10 @@ def configure_logging(
     shared_processors = _build_shared_processors(SecretRedactor(secrets))
 
     formatter = structlog.stdlib.ProcessorFormatter(
+        # Keep stdlib %-args separate from the message so they are redacted
+        # before interpolation (see SecretRedactor.format_positional_args).
+        use_get_message=False,
+        pass_foreign_args=True,
         foreign_pre_chain=shared_processors,
         processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, renderer],
     )
@@ -183,5 +251,7 @@ def configure_logging(
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
+        # No caching: a cached logger would keep the processor chain (and the
+        # registered secrets) from the configuration active at its first use.
+        cache_logger_on_first_use=False,
     )

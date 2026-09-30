@@ -24,6 +24,8 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "execution": frozenset({"domain", "exchanges"}),
     "portfolio": frozenset({"domain"}),
     "persistence": frozenset({"domain"}),
+    # Orchestration / infrastructure packages: restrictions will be refined as
+    # their modules appear.
     "backtesting": None,
     "paper_trading": None,
     "monitoring": None,
