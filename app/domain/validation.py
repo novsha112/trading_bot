@@ -16,6 +16,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Final, TypeVar
 
+from app.domain.enums import OrderType, TimeInForce
 from app.domain.errors import DomainValidationError
 
 E = TypeVar("E", bound=Enum)
@@ -115,3 +116,23 @@ def utc_from_ms(ms: int) -> datetime:
         raise DomainValidationError(
             f"ms is out of the supported datetime range, got {ms}"
         ) from None
+
+
+def require_order_terms(
+    *, order_type: object, price: object, qty: object, time_in_force: object
+) -> None:
+    """Shared terms of an order and a place-order intent.
+
+    LIMIT requires a positive price, MARKET must have none, POST_ONLY is limit-only.
+    Instrument alignment (tick/step, minimums) is not checked here: it needs an
+    InstrumentSpec and is a pre-trade (risk) check.
+    """
+    order_type = require_enum(order_type, OrderType, "order_type")
+    require_enum(time_in_force, TimeInForce, "time_in_force")
+    require_positive(qty, "qty")
+    if order_type is OrderType.LIMIT:
+        require_positive(price, "price")
+    elif price is not None:
+        raise DomainValidationError(f"price must be None for a market order, got {price}")
+    if time_in_force is TimeInForce.POST_ONLY and order_type is not OrderType.LIMIT:
+        raise DomainValidationError("post_only time_in_force requires a limit order")

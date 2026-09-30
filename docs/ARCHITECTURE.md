@@ -157,7 +157,7 @@ app/
 
 | Хто | Може | Не може |
 |---|---|---|
-| Strategy | Задати ціну, кількість, сторону, `reduce_only`, `post_only`, тег рівня сітки | Звертатися до біржі |
+| Strategy | Задати ціну, кількість, сторону, `reduce_only`, `time_in_force` (включно з `POST_ONLY`), тег рівня сітки | Звертатися до біржі |
 | RiskManager | Відхилити; **зменшити** кількість; додати `reduce_only` | Збільшити кількість, змінити ціну чи сторону |
 | ExecutionEngine | Нічого не змінює в суті ордера | Округлювати, змінювати ціну чи кількість |
 
@@ -191,10 +191,10 @@ app/
 
 | Модель | Ключові поля |
 |---|---|
-| `PlaceOrderIntent` | `intent_id`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `post_only`, `tag` (наприклад, `grid:L07:buy`), `created_at` |
+| `PlaceOrderIntent` | `intent_id`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force` (`GTC` / `IOC` / `FOK` / `POST_ONLY`; окремого `post_only` немає), `reduce_only`, `tag` (наприклад, `grid:L07:buy`), `created_at` |
 | `CancelOrderIntent` | `intent_id`, `strategy_id`, `client_order_id`, `reason` |
 | `RiskDecision` | `intent_id`, `verdict` (APPROVED / REDUCED / REJECTED), `approved_qty`, `reasons[]`, `checks[]` |
-| `Order` | `client_order_id`, `exchange_order_id?`, `intent_id`, `strategy_id`, `symbol`, `side`, `type`, `price`, `qty`, `filled_qty`, `avg_fill_price`, `status`, `reduce_only`, `post_only`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version` |
+| `Order` | `client_order_id`, `exchange_order_id?`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `status`, `filled_qty`, `avg_fill_price`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version`. Зв'язок з `intent_id` — відкрите питання Phase 5 |
 | `OrderUpdate` | нормалізований звіт біржі про ордер: `client_order_id`, `exchange_order_id`, `status`, `cum_filled_qty`, `avg_price`, `reject_reason`, `exchange_ts` |
 | `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `fee_asset`, `is_maker`, `exchange_ts` |
 | `Position` | `symbol`, `side` / знакова `qty`, `entry_price`, `mark_price`, `unrealized_pnl`, `realized_pnl`, `leverage`, `margin_mode`, `position_margin`, `maintenance_margin`, `liquidation_price?`, `updated_at` |
@@ -398,19 +398,28 @@ NEW ──► SUBMITTING ──► OPEN ──► PARTIALLY_FILLED ──► FIL
             └──────► UNKNOWN ──► (будь-який фактичний статус) | FAILED
 ```
 
+Схема ілюстративна; джерело правди — таблиця нижче і `app/domain/order_state.py`
+(`ALLOWED_TRANSITIONS`, тест `test_table_matches_contract_exactly`).
+
 ### Таблиця дозволених переходів
 
 | Із | До |
 |---|---|
 | NEW | SUBMITTING, FAILED |
-| SUBMITTING | OPEN, PARTIALLY_FILLED, FILLED, REJECTED, CANCELED, UNKNOWN, FAILED |
+| SUBMITTING | OPEN, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, FAILED, UNKNOWN |
+| OPEN | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED, UNKNOWN |
+| PARTIALLY_FILLED | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED, UNKNOWN |
+| CANCELING | CANCELING, FILLED, CANCELED, EXPIRED, UNKNOWN |
 | UNKNOWN | OPEN, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED, FAILED |
-| OPEN | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED |
-| PARTIALLY_FILLED | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED |
-| CANCELING | CANCELED, FILLED, PARTIALLY_FILLED (частина виконалась до скасування; залишаємось у процесі скасування), EXPIRED |
 | FILLED, CANCELED, REJECTED, EXPIRED, FAILED | — (фінальні) |
 
 Правила:
+- Переходи в той самий стан є тільки два: `PARTIALLY_FILLED → PARTIALLY_FILLED` і `CANCELING → CANCELING`. Вони несуть нові дані виконання і дозволені лише зі **строго більшим** кумулятивним `filled_qty`. Загального self-transition немає.
+- Часткове виконання під час очікування скасування: ордер **залишається в `CANCELING`** з більшим `filled_qty` (переходу `CANCELING → PARTIALLY_FILLED` немає). Гонка «скасування проти виконання» завершується `CANCELING → FILLED` або `CANCELING → CANCELED`.
+- `UNKNOWN` не фінальний. У нього можна потрапити з робочих станів (`SUBMITTING`, `OPEN`, `PARTIALLY_FILLED`, `CANCELING`), вихід — у фактичний статус за результатом перевірки (розділ 7.3). Сам резолвер — Phase 5.
+- Перший звіт біржі не зобов'язаний проходити через `OPEN`: `SUBMITTING → PARTIALLY_FILLED / FILLED / CANCELED` дозволені.
+- Для звичайних переходів `filled_qty` не зменшується (може лишитися тим самим). Час переходу не може бути раніше за `updated_at`. Кожен перехід збільшує `version` рівно на 1.
+- Дозволена дуга не означає, що будь-які дані допустимі: інваріанти «статус ↔ виконання» перевіряються окремо. `NEW`, `SUBMITTING`, `OPEN`, `REJECTED`, `FAILED` — `filled_qty = 0`; `PARTIALLY_FILLED` — `0 < filled_qty < qty`; `FILLED` — `filled_qty = qty`; `CANCELED`, `EXPIRED` — `filled_qty < qty`; `CANCELING`, `UNKNOWN` — від 0 до `qty`.
 - Недозволений перехід — це помилка стану, а не привід її проігнорувати: `BotEvent(error)` і запит статусу через REST.
 - `SUBMITTING → CANCELED` потрібен, бо post-only ордер, що перетнув би стакан, біржа може скасувати одразу (як саме Bybit повідомляє про це — перевірити).
 - `CANCELED` може мати `filled_qty > 0`. Портфель враховує частину, що виконалась.
