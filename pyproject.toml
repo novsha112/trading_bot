@@ -33,9 +33,22 @@ select = [
     "PT",    # flake8-pytest-style
     "ASYNC", # flake8-async
     "RUF",   # ruff-specific rules
+    "TID251", # banned APIs (see below)
 ]
 
+# Current time comes only from app.domain.clock.Clock, so the same logic runs on
+# simulated time in backtests.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.now".msg = "Use app.domain.clock.Clock.now()"
+"datetime.datetime.utcnow".msg = "Use app.domain.clock.Clock.now()"
+"datetime.datetime.today".msg = "Use app.domain.clock.Clock.now()"
+"datetime.date.today".msg = "Use app.domain.clock.Clock.now()"
+"time.time".msg = "Use app.domain.clock.Clock.now()"
+"time.time_ns".msg = "Use app.domain.clock.Clock.now()"
+
 [tool.ruff.lint.per-file-ignores]
+# The only place allowed to read the system time.
+"app/domain/clock.py" = ["TID251"]
 # Tests use assert and deliberately fake credentials.
 "tests/**" = ["S101", "S105", "S106"]
 
