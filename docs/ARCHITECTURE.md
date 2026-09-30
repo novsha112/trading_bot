@@ -1,0 +1,786 @@
+# Архітектура торгового бота
+
+> Статус: чернетка v0.1 (2026-09-30). Реалізації ще немає.
+> Основні правила проєкту — у `CLAUDE.md`. Якщо цей документ суперечить `CLAUDE.md`, пріоритет має `CLAUDE.md`, а документ треба виправити.
+> План реалізації — у `docs/ROADMAP.md`.
+
+---
+
+## 0. Обсяг v1 і базові принципи
+
+### Обсяг першої версії
+
+| Параметр | Значення v1 |
+|---|---|
+| Біржа | Bybit, API v5 |
+| Ринок | USDT perpetual futures (у Bybit v5 — `category=linear`, перевірити) |
+| Стратегія | Grid: Long / Short / Neutral |
+| Процес | один Python-процес, asyncio |
+| Акаунт | один виділений субакаунт Bybit тільки для бота |
+| Інстанси стратегії | один інстанс Grid на один символ |
+
+Моделі та інтерфейси одразу містять `strategy_id`, `symbol` і `exchange`, щоб пізніше додати кілька стратегій, символів і бірж без переписування ядра. Підтримувати кілька інстансів у v1 не будемо.
+
+### Принципи
+
+1. **Modular monolith.** Один процес, чіткі модулі, залежності тільки «зверху вниз». Без мікросервісів, брокерів повідомлень і Redis на старті.
+2. **Functional core, imperative shell.** Стратегія, Risk Manager, state machine ордерів, портфель і grid-математика — синхронний детермінований код без I/O. `async` тільки на межах: біржа, WebSocket, БД, нотифікації. Тоді один і той самий код легко тестувати і повторно використовувати в backtest.
+3. **Single writer.** Усі зміни торгового стану проходять через одну чергу подій і обробляються послідовно одним циклом (`TradingEngine`). Стратегія, ризик і портфель не змінюються паралельно з різних задач, тому не потрібні локи і немає гонок.
+4. **Біржа — джерело правди.** Локальний стан — це робочий кеш і журнал, а не істина (див. розділи 12–13).
+5. **Гроші в `Decimal`.** Ціни, кількості, суми, комісії — тільки `Decimal`. `float` заборонений у торговій логіці; у метриках бектесту (Sharpe тощо) допустимий.
+6. **Час тільки через `Clock`.** Усі часові мітки в UTC. Кожна ринкова подія несе `exchange_ts` (час біржі) і `received_ts` (час отримання). Логіка ніколи не викликає `datetime.now()` напряму, лише `Clock.now()`.
+7. **Нічого неявного.** Поведінка при виході ціни з діапазону, дії kill switch і реакція на розбіжності задаються явно в конфігурації, без «розумних дефолтів», які можуть торгувати.
+
+---
+
+## 1. Загальна архітектура
+
+```text
+┌──────────────────────────────── Джерела подій ────────────────────────────────┐
+│  MarketDataFeed (public WS / REST / replay)    PrivateStream (orders, fills,  │
+│                                                positions, wallet)             │
+└───────────────┬──────────────────────────────────────────┬────────────────────┘
+                │ MarketEvent                              │ OrderUpdate / Fill
+                ▼                                          ▼
+        ┌──────────────────────── Event Queue (asyncio.Queue) ─────────────────┐
+        └──────────────────────────────────┬───────────────────────────────────┘
+                                           ▼
+                                ┌────────────────────┐
+                                │   TradingEngine    │  single writer loop
+                                └─────────┬──────────┘
+          ┌───────────────────────────────┼───────────────────────────────┐
+          ▼                               ▼                               ▼
+   Portfolio.apply()             Strategy.on_event()             OrderManager.apply()
+   (positions, PnL)                      │
+                                         │ list[Intent]
+                                         ▼
+                                 RiskManager.evaluate()  ──► reject → RiskEvent
+                                         │ approved
+                                         ▼
+                                 ExecutionEngine.submit()
+                                         │ (async I/O task)
+                                         ▼
+                                 ExchangeAdapter  ──►  Bybit | SimulatedExchange
+                                         │
+                                         └── результат повертається як подія в Event Queue
+
+Паралельно: Persistence (журнал усього), Monitoring (health, метрики),
+Notifications (неблокувальні), KillSwitch (незалежний шлях до адаптера).
+```
+
+### Модулі та залежності
+
+```text
+app/
+├── domain/          моделі, enums, state machine ордера, Clock protocol, помилки. Без залежностей.
+├── config/          Pydantic Settings + YAML. Залежить від domain.
+├── exchanges/       protocols адаптерів + bybit/, simulated/, fake/. Залежить від domain.
+├── market_data/     фіди, stale-детектор, replay. Залежить від domain, exchanges (protocol).
+├── strategies/      base.py + grid/. Залежить ТІЛЬКИ від domain.
+├── risk/            RiskManager, ліміти, KillSwitch, TradingState, оцінка ліквідації. domain, portfolio.
+├── execution/       OrderManager, ExecutionEngine, генерація client order id. domain, exchanges.
+├── portfolio/       позиції, баланси, PnL з fills. domain.
+├── persistence/     БД, таблиці, репозиторії, міграції. domain.
+├── backtesting/     runner, завантаження історії, метрики, звіт.
+├── paper_trading/   зв'язка live market data + SimulatedExchange, збереження стану симуляції.
+├── monitoring/      health checks, метрики, статус.
+├── notifications/   Notifier protocol, Telegram, неблокувальний dispatcher.
+└── services/        TradingEngine, bootstrap (збирання залежностей під режим),
+                     recovery, reconciliation, preflight.
+```
+
+Жорсткі правила залежностей:
+- `strategies/` не імпортує `exchanges/`, `execution/`, `persistence/`, `config/`. Параметри стратегія отримує як готову доменну модель.
+- `domain/` не імпортує нічого з `app/`.
+- Тільки `execution/` і `KillSwitch` викликають торгові методи адаптера.
+- Тільки `services/bootstrap` знає, який режим активний і які реалізації підставити.
+
+Ці правила перевірятимемо автоматично тестом на імпорти (наприклад, `import-linter` або простим тестом через `ast`).
+
+---
+
+## 2. Відповідальність модулів
+
+| Модуль | Відповідає за | НЕ відповідає за |
+|---|---|---|
+| `domain` | Типи даних, інваріанти, таблицю переходів статусів ордера, округлення до tick/step | I/O, конфігурацію |
+| `config` | Завантаження та валідацію `.env` + YAML, режими, профілі | Бізнес-логіку |
+| `exchanges` | Перетворення доменних запитів в API біржі й назад; auth; rate limit; нормалізацію помилок | Рішення, що торгувати |
+| `market_data` | Підписки, reconnect, heartbeat, stale-детекцію, валідацію послідовності | Торгові рішення |
+| `strategies` | Генерацію `Intent` на основі ринку і власного стану | Виклики API, ризик-ліміти акаунта |
+| `risk` | Затвердження / відхилення / зменшення intents; ліміти; TradingState; KillSwitch | Генерацію торгових ідей |
+| `execution` | Життєвий цикл ордерів, ідемпотентність, submit/cancel, обробку невідомих результатів | Вибір ціни чи обсягу |
+| `portfolio` | Позиції, баланси, realized/unrealized PnL, комісії, funding | Відправку ордерів |
+| `persistence` | Збереження та читання стану і журналу подій | Бізнес-рішення |
+| `backtesting` | Прогін історії через ті самі Strategy/Risk/Execution; метрики | Окрему «бектестову» стратегію |
+| `paper_trading` | Live-дані + симуляція виконання | Окрему логіку стратегії |
+| `monitoring` | Health, метрики, статус | Торгові рішення |
+| `notifications` | Доставку повідомлень, яка ніколи не блокує торгівлю | Будь-що критичне для торгівлі |
+| `services` | Оркестрацію, запуск, відновлення, reconciliation, preflight | Деталі API біржі |
+
+---
+
+## 3. Потік даних
+
+### 3.1 Нормальний цикл
+
+```text
+1. MarketDataFeed отримує тікер / стакан / трейд  → MarketEvent → Event Queue
+2. TradingEngine бере подію:
+   a. MarketDataCache оновлюється (last, mark, bid/ask, data_age)
+   b. RiskManager перевіряє глобальні умови (stale data, TradingState)
+   c. Strategy.on_market(event, ctx) → list[Intent]
+3. Для кожного Intent:
+   a. RiskManager.evaluate(intent, portfolio, open_orders) → RiskDecision
+   b. APPROVED / REDUCED → ExecutionEngine.submit(intent)
+      REJECTED            → RiskEvent (журнал, лог; сповіщення, якщо критично)
+4. ExecutionEngine:
+   a. створює Order(NEW, client_order_id), персистить
+   b. переводить у SUBMITTING, персистить (write-ahead)
+   c. запускає async-задачу adapter.create_order(...)
+   d. результат задачі (ack / reject / timeout) → подія в Event Queue
+5. PrivateStream приносить OrderUpdate і Fill → Event Queue
+6. TradingEngine: OrderManager.apply(update), Portfolio.apply(fill),
+   Strategy.on_fill(fill) → нові Intents (наприклад, парний ордер сітки)
+```
+
+### 3.2 Signal проти Order Intent
+
+`CLAUDE.md` допускає, що стратегія генерує або Signal, або Order Intent. Для Grid окремий Signal нічого не додає: стратегія одразу знає, які лімітні ордери їй потрібні. Тому в v1 стратегія повертає **intents**:
+
+- `PlaceOrderIntent` — розмістити ордер;
+- `CancelOrderIntent` — скасувати ордер за `client_order_id`.
+
+Модель `Signal` (напрямок і сила сигналу без конкретних ордерів) додамо, коли з'являться directional-стратегії (Trend, Breakout). Між Signal і Intent тоді стоятиме position sizer. Зараз це було б зайвою абстракцією.
+
+### 3.3 Хто і що може змінювати в Intent
+
+| Хто | Може | Не може |
+|---|---|---|
+| Strategy | Задати ціну, кількість, сторону, `reduce_only`, `post_only`, тег рівня сітки | Звертатися до біржі |
+| RiskManager | Відхилити; **зменшити** кількість; додати `reduce_only` | Збільшити кількість, змінити ціну чи сторону |
+| ExecutionEngine | Нічого не змінює в суті ордера | Округлювати, змінювати ціну чи кількість |
+
+**Округлення до `tick_size` / `qty_step`** робить стратегія через доменні хелпери `InstrumentSpec`. Рівні сітки мусять бути детермінованими і однаковими після рестарту. RiskManager тільки **перевіряє** відповідність і відхиляє невідповідний intent. Тихого округлення на нижчих рівнях немає, бо воно ховає помилки розрахунку розміру.
+
+---
+
+## 4. Доменні моделі
+
+Усі моделі — `frozen` dataclasses або Pydantic-моделі. Гроші в `Decimal`, час — aware datetime в UTC.
+
+### Довідкові
+
+| Модель | Ключові поля |
+|---|---|
+| `InstrumentSpec` | `exchange`, `symbol`, `category`, `base`, `quote`, `settle`, `tick_size`, `qty_step`, `min_qty`, `max_qty`, `min_notional`, `max_leverage`, `funding_interval`, `status` |
+| `FeeSchedule` | `maker_rate`, `taker_rate`, `source` (api / config), `fetched_at` |
+| `RiskLimitTier` | `max_position_value`, `maintenance_margin_rate`, `max_leverage` (для оцінки ліквідації) |
+
+### Ринкові
+
+| Модель | Ключові поля |
+|---|---|
+| `Ticker` | `last`, `mark`, `index`, `best_bid`, `best_ask`, `funding_rate`, `next_funding_time`, `exchange_ts`, `received_ts` |
+| `OrderBookTop` | `bid`, `bid_qty`, `ask`, `ask_qty`, `update_id`, `seq`, timestamps |
+| `PublicTrade` | `price`, `qty`, `side`, `trade_id`, `exchange_ts` |
+| `Kline` | `open_time`, `close_time`, OHLC, `volume`, `is_closed` |
+| `FundingRate` | `rate`, `funding_time` |
+
+### Торгові
+
+| Модель | Ключові поля |
+|---|---|
+| `PlaceOrderIntent` | `intent_id`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `post_only`, `tag` (наприклад, `grid:L07:buy`), `created_at` |
+| `CancelOrderIntent` | `intent_id`, `strategy_id`, `client_order_id`, `reason` |
+| `RiskDecision` | `intent_id`, `verdict` (APPROVED / REDUCED / REJECTED), `approved_qty`, `reasons[]`, `checks[]` |
+| `Order` | `client_order_id`, `exchange_order_id?`, `intent_id`, `strategy_id`, `symbol`, `side`, `type`, `price`, `qty`, `filled_qty`, `avg_fill_price`, `status`, `reduce_only`, `post_only`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version` |
+| `OrderUpdate` | нормалізований звіт біржі про ордер: `client_order_id`, `exchange_order_id`, `status`, `cum_filled_qty`, `avg_price`, `reject_reason`, `exchange_ts` |
+| `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `fee_asset`, `is_maker`, `exchange_ts` |
+| `Position` | `symbol`, `side` / знакова `qty`, `entry_price`, `mark_price`, `unrealized_pnl`, `realized_pnl`, `leverage`, `margin_mode`, `position_margin`, `maintenance_margin`, `liquidation_price?`, `updated_at` |
+| `Balance` | `asset`, `wallet_balance`, `equity`, `available`, `margin_used`, `updated_at` |
+| `FundingPayment` | `symbol`, `amount` (знакова), `rate`, `position_qty`, `ts` |
+
+### Стратегія Grid
+
+| Модель | Ключові поля |
+|---|---|
+| `GridConfig` | `symbol`, `mode` (LONG / SHORT / NEUTRAL), `lower`, `upper`, `levels`, `spacing` (ARITHMETIC / GEOMETRIC), `order_qty` або `capital_allocation`, `leverage`, `out_of_range_policy`, `start_policy` |
+| `GridLevel` | `index`, `price`, `buy_client_order_id?`, `sell_client_order_id?`, `state` |
+| `GridState` | `grid_id`, `config_hash`, `levels[]`, `inventory_qty`, `completed_cycles`, `realized_grid_pnl`, `status` |
+| `GridProfitability` | `gross_per_cycle`, `fees_per_cycle`, `est_slippage`, `est_funding_per_day`, `net_per_cycle`, `breakeven_spacing` |
+
+### Системні
+
+| Модель | Призначення |
+|---|---|
+| `TradingState` | RUNNING / REDUCE_ONLY / PAUSED / HALTED (див. розділ 9) |
+| `BotEvent` | Журнал: старт/стоп, reconnect, помилки (категорія `error`), зміни стану |
+| `RiskEvent` | Відхилення intent, досягнення ліміту, спрацювання kill switch |
+| `ReconciliationEvent` | Знайдена розбіжність, дія, результат |
+| `Clock` (protocol) | `now()`, у backtest — симульований |
+
+---
+
+## 5. Exchange Adapter
+
+### 5.1 Розділення на три інтерфейси
+
+Публічні дані, приватна торгівля і приватний стрім мають різні вимоги (auth, rate limit, reconnect). Тому замість одного великого протоколу — три невеликі:
+
+```text
+PublicMarketDataClient      (без ключів)
+  get_instrument(symbol) -> InstrumentSpec
+  get_ticker(symbol) -> Ticker
+  get_klines(symbol, interval, start, end) -> list[Kline]
+  get_funding_history(symbol, start, end) -> list[FundingRate]
+  get_risk_limit_tiers(symbol) -> list[RiskLimitTier]
+  stream(symbols, channels) -> AsyncIterator[MarketEvent]
+
+TradingAdapter              (з ключами; лише execution і KillSwitch)
+  get_balance() -> list[Balance]
+  get_positions(symbol?) -> list[Position]
+  get_open_orders(symbol?) -> list[OrderUpdate]
+  get_order(client_order_id) -> OrderUpdate | None
+  get_fills(symbol, since) -> list[Fill]
+  get_fee_schedule(symbol) -> FeeSchedule
+  get_account_config() -> AccountConfig        # position mode, margin mode
+  get_api_key_info() -> ApiKeyInfo             # права, IP whitelist (якщо API дає)
+  set_leverage(symbol, leverage) -> None
+  create_order(OrderRequest) -> SubmitAck
+  cancel_order(symbol, client_order_id) -> CancelAck
+  cancel_all_orders(symbol) -> CancelAllAck
+
+PrivateStream               (з ключами)
+  stream() -> AsyncIterator[OrderUpdate | Fill | Position | Balance | StreamGap]
+```
+
+`CLAUDE.md` пропонує один `ExchangeAdapter`. Розділення на три протоколи — це уточнення, а не заміна: усі методи з `CLAUDE.md` є, і їх можна зібрати в один фасад, якщо так зручніше.
+
+### 5.2 Нормалізовані помилки
+
+Критично важливо розрізняти, **чи міг запит дійти до біржі**:
+
+| Помилка | Значення | Що робить execution |
+|---|---|---|
+| `ExchangeRejectedError` | Біржа однозначно відхилила запит (з кодом) | `REJECTED`, без retry |
+| `OutcomeUnknownError` | Запит міг бути виконаний (timeout після відправки, розрив, 5xx) | `UNKNOWN`, перевірити через `get_order` |
+| `NotSentError` | Доведено, що запит не пішов (наприклад, помилка валідації до мережі) | `FAILED` |
+| `RateLimitError` | Перевищено ліміт | backoff; для create — як `NotSentError`, лише якщо біржа однозначно відповіла кодом ліміту |
+| `AuthError` | Проблема з ключами чи правами | HALTED + сповіщення |
+| `TemporaryExchangeError` | Біржа тимчасово недоступна | backoff; для create — як `OutcomeUnknownError` |
+
+Якщо не можна довести, що запит не дійшов, помилка вважається `OutcomeUnknownError`.
+
+### 5.3 Політика retry
+
+| Операція | Retry | Примітка |
+|---|---|---|
+| Читання (GET) | так, exponential backoff + jitter, обмежена кількість спроб | безпечно |
+| `create_order` | **ні** | невизначеність → `UNKNOWN` → перевірка за `client_order_id`. Ніколи не повторювати сліпо |
+| `cancel_order` | так, обмежено | «order not found» → перевірити статус через `get_order` |
+| `cancel_all_orders` | так, обмежено | потім перевірити `get_open_orders` |
+| `set_leverage` | так | ідемпотентна операція |
+
+Rate limiter (token bucket) живе в адаптері, окремо для кожної групи ендпоінтів. Якщо біржа повертає заголовки зі станом лімітів, адаптер їх використовує (формат перевірити в документації).
+
+### 5.4 Реалізації
+
+| Реалізація | Призначення |
+|---|---|
+| `exchanges/bybit/` | Реальна біржа: mainnet і testnet (різні base URL) |
+| `exchanges/simulated/` | Реалістична модель виконання для backtest і paper |
+| `exchanges/fake/` | Тестовий дубль зі скриптованими збоями для unit/failure-тестів |
+
+Спільний **contract test suite** (однакові тести поведінки адаптера) проганяється проти `fake`, `simulated` і, вручну, проти Bybit testnet.
+
+### 5.5 Вибір бібліотеки для Bybit
+
+Рішення ще не прийняте, його приймаємо у фазі 2 після короткого spike (див. ROADMAP). Кандидати:
+
+- **pybit** — офіційний SDK Bybit. Потрібно перевірити, чи є нативний asyncio (є ризик, що HTTP синхронний, а WS працює на потоках).
+- **ccxt** (`ccxt.async_support`, WS через ccxt pro) — корисний для майбутніх Binance/OKX, але нормалізація може ховати Bybit-специфіку (`orderLinkId`, `positionIdx`, статуси).
+- **Власний тонкий клієнт** (httpx + websockets) лише для потрібних ~15 ендпоінтів v5: повний контроль над timeout/retry/помилками, але більше коду для підтримки.
+
+---
+
+## 6. Market Data
+
+### 6.1 Компоненти
+
+```text
+BybitPublicStream ──► MarketDataFeed ──► MarketDataCache ──► Event Queue
+        │                    │
+        │                    └── StaleDataMonitor (data_age, last_update, connection_status)
+        └── ReconnectPolicy (backoff) + Heartbeat (ping/pong)
+```
+
+### 6.2 Потоки для v1
+
+| Потік | Навіщо |
+|---|---|
+| Ticker (last, mark, funding) | Mark price для ризику й ліквідації, funding |
+| Orderbook top (L1) | Спред, очікувана ціна виконання, стан ринку |
+| Public trades | Paper-симуляція виконання лімітних ордерів |
+| Klines (REST) | Бектест, аналіз стартових умов |
+
+Private stream (ордери, виконання, позиції, гаманець) — окремий модуль в `exchanges/bybit/`, але подає події в ту саму Event Queue.
+
+### 6.3 Свіжість і коректність
+
+- Для кожного потоку та символу відстежуються `last_update` (received_ts), `data_age = clock.now() - last_update` і `connection_status` (CONNECTING / CONNECTED / STALE / DISCONNECTED).
+- Поріг застарілості налаштовується в конфігурації. Коли дані `STALE`, RiskManager блокує **нові ордери, що збільшують позицію**. Reduce-only і скасування дозволені.
+- Heartbeat: ping з інтервалом, який вимагає документація Bybit (перевірити). Якщо pong не приходить — reconnect.
+- Для стакана перевіряємо `update_id` / `seq`, якщо біржа їх надає. Пропуск або розрив послідовності → повторний snapshot. Точну семантику snapshot/delta в Bybit перевіряємо в документації.
+- Після reconnect **приватного** стріму події могли загубитися, тому це тригер для REST-reconciliation (розділ 13).
+- Події з `exchange_ts` у майбутньому (понад допустимий clock skew) або з різким розривом логуються і не використовуються для рішень.
+
+---
+
+## 7. Execution Engine
+
+### 7.1 Складові
+
+- `ClientOrderIdGenerator` — унікальний, персистентний, з префіксом бота. Формат приблизно `{bot_prefix}{strategy_short}{time_base36}{counter}`. Обмеження довжини і дозволені символи для `orderLinkId` перевірити в документації Bybit (очікувано до 36 символів). Префікс дає змогу відрізнити «наші» ордери від сторонніх.
+- `OrderManager` — синхронний: зберігає `Order`, застосовує переходи state machine, відкидає застарілі й дубльовані оновлення.
+- `ExecutionEngine` — асинхронна оболонка: запускає I/O-задачі й повертає їхні результати як події.
+
+### 7.2 Потік submit
+
+```text
+approved intent
+  → Order(status=NEW, client_order_id=gen()) → persist
+  → status=SUBMITTING → persist                 # write-ahead: після рестарту відомо, що запит міг піти
+  → async task: adapter.create_order(request)
+       ack          → зберегти exchange_order_id; статус лишається SUBMITTING,
+                      доки не прийде OrderUpdate (WS) або REST get_order
+       rejected     → REJECTED
+       unknown      → UNKNOWN → резолвер
+       not sent     → FAILED
+  → OrderUpdate з WS/REST → OPEN / PARTIALLY_FILLED / FILLED / CANCELED ...
+  → якщо за N секунд після ack немає підтвердження → REST get_order
+```
+
+REST-відповідь «ордер прийнято» **не** переводить ордер ні в `FILLED`, ні навіть в `OPEN`. Статус підтверджує тільки звіт про стан ордера.
+
+### 7.3 Резолвер `UNKNOWN`
+
+1. Запитати `get_order(client_order_id)` з backoff кілька разів протягом налаштованого вікна.
+2. Знайдено → перевести в фактичний статус.
+3. Не знайдено після вичерпання вікна → `FAILED` + `BotEvent(warning)`.
+4. Поки хоча б один ордер у стані `UNKNOWN`, стратегія **не** отримує дозволу на новий ордер для того самого рівня сітки. Ризик-перевірки рахують такий ордер як потенційно активний (експозиція).
+5. Якщо резолвер не може отримати відповідь від біржі — `PAUSED`.
+
+Повторної відправки з тим самим `client_order_id` у v1 немає. Нову спробу стратегія ініціює сама на наступному кроці, з новим ID, тільки після того як старий ордер у фінальному стані.
+
+### 7.4 Порядок оновлень
+
+- `cum_filled_qty` не може зменшуватися: оновлення з меншим значенням ігноруються як застарілі.
+- Fill дедуплікується за `exec_id` (також унікальний ключ у БД).
+- Fill може прийти раніше за OrderUpdate і навпаки. Портфель рахується з fills, статус ордера — з OrderUpdate. Розбіжність між `sum(fills.qty)` і `cum_filled_qty` після таймауту → перевірка через REST.
+
+---
+
+## 8. Життєвий цикл ордера (state machine)
+
+Базові стани з `CLAUDE.md` плюс два додаткові: `UNKNOWN` (невідомий результат відправки, розділ 7 `CLAUDE.md`) і `CANCELING` (запит на скасування надіслано, але не підтверджено).
+
+```text
+                  ┌──────────► FAILED (нічого не надіслано / підтверджено відсутність)
+                  │
+NEW ──► SUBMITTING ──► OPEN ──► PARTIALLY_FILLED ──► FILLED
+            │   │       │  │           │   │
+            │   │       │  └──► CANCELING ◄┘
+            │   │       │          │
+            │   │       ▼          ▼
+            │   │    CANCELED / EXPIRED
+            │   └──► REJECTED
+            └──────► UNKNOWN ──► (будь-який фактичний статус) | FAILED
+```
+
+### Таблиця дозволених переходів
+
+| Із | До |
+|---|---|
+| NEW | SUBMITTING, FAILED |
+| SUBMITTING | OPEN, PARTIALLY_FILLED, FILLED, REJECTED, CANCELED, UNKNOWN, FAILED |
+| UNKNOWN | OPEN, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED, FAILED |
+| OPEN | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED |
+| PARTIALLY_FILLED | PARTIALLY_FILLED, FILLED, CANCELING, CANCELED, EXPIRED |
+| CANCELING | CANCELED, FILLED, PARTIALLY_FILLED (частина виконалась до скасування; залишаємось у процесі скасування), EXPIRED |
+| FILLED, CANCELED, REJECTED, EXPIRED, FAILED | — (фінальні) |
+
+Правила:
+- Недозволений перехід — це помилка стану, а не привід її проігнорувати: `BotEvent(error)` і запит статусу через REST.
+- `SUBMITTING → CANCELED` потрібен, бо post-only ордер, що перетнув би стакан, біржа може скасувати одразу (як саме Bybit повідомляє про це — перевірити).
+- `CANCELED` може мати `filled_qty > 0`. Портфель враховує частину, що виконалась.
+- Кожен перехід записується в `order_events`.
+
+---
+
+## 9. Risk Manager
+
+### 9.1 Три рівні перевірок
+
+1. **Pre-trade (кожен intent).** Відповідність tick/step/min_qty/min_notional; максимальна кількість на ордер; максимальна позиція з урахуванням активних **і** `SUBMITTING`/`UNKNOWN` ордерів; максимальний capital allocation на стратегію; максимальна кількість одночасних ордерів; `max_loss_per_trade` (для Grid — втрата на рівні worst-case, див. 9.4); максимальне плече; достатність вільної маржі.
+2. **Portfolio (при кожній зміні стану).** Загальна експозиція, drawdown від піку equity, денний збиток, відстань до ліквідації.
+3. **Системні circuit breakers.** Застарілі дані, розрив private stream, серія API-помилок, частка відхилених ордерів, невирішена розбіжність reconciliation.
+
+### 9.2 TradingState
+
+| Стан | Нові ордери, що збільшують позицію | Reduce-only | Скасування | Вихід |
+|---|---|---|---|---|
+| RUNNING | так | так | так | — |
+| REDUCE_ONLY | ні | так | так | автоматично, коли умова зникла |
+| PAUSED | ні | ні (крім kill switch) | так | автоматично після успішної синхронізації або вручну |
+| HALTED | ні | тільки дії kill switch | так | **тільки вручну** |
+
+Для кожного типу порушення в конфігурації явно задається цільовий стан. Приклад:
+
+```yaml
+risk:
+  on_stale_data: REDUCE_ONLY
+  on_daily_loss_limit: HALTED
+  on_max_drawdown: HALTED
+  on_reconciliation_mismatch: PAUSED
+  on_liquidation_distance_breach: HALTED
+```
+
+### 9.3 Kill Switch
+
+- Незалежний компонент. Має прямий доступ до `TradingAdapter` в обхід Strategy.
+- Тригери: вручну (CLI-команда або файл-прапорець), критичні ліміти ризику, повторні критичні помилки.
+- Дії (налаштовуються): (1) заблокувати нові ордери — завжди; (2) `cancel_all_orders` — налаштовується, за замовчуванням так; (3) закрити позиції reduce-only ринковими ордерами — налаштовується окремо; (4) записати причину; (5) сповістити.
+- Стан kill switch персистентний: після рестарту бот залишається в `HALTED`, доки людина не зніме його вручну.
+
+### 9.4 Оцінка ліквідації
+
+- Власний оцінювач: ціна ліквідації для ізольованої позиції з урахуванням `maintenance_margin_rate` за tier ризик-ліміту, комісії на закриття та mark price.
+- Для Grid головна перевірка — **worst case**: яка позиція накопичиться, якщо ціна пройде всі рівні до межі діапазону, і де тоді ліквідація. Якщо оцінка ліквідації при worst-case позиції ближча до межі діапазону, ніж налаштований буфер → попередження або блокування старту.
+- У live значення `liquidation_price` від біржі має пріоритет, а власний оцінювач — для контролю і для backtest. Розбіжність понад поріг логується.
+- **Застереження:** у режимі cross margin (особливо на Unified Trading Account) ліквідація залежить від усього акаунта, а не від однієї позиції. Власна оцінка там ненадійна. Це один з аргументів за isolated margin у v1 (відкрите питання).
+
+---
+
+## 10. Portfolio і відстеження позицій
+
+- Позиція будується з **fills**: знакова кількість, середня ціна входу, realized PnL, комісії, funding. Облік за середньою ціною (не FIFO), бо perpetual-позиція на біржі має одну середню ціну входу. Точне правило Bybit для середньої при частковому зменшенні і перевороті позиції перевірити.
+- Unrealized PnL рахується від mark price.
+- Equity = wallet balance + unrealized PnL.
+- Облік окремо: `gross_pnl`, `fees`, `funding`, `net_pnl`.
+- Funding-платежі отримуються з біржі: через стрім виконань або історію транзакцій (тип записів і канал перевірити в документації).
+- Локальна позиція періодично і після reconnect звіряється з `get_positions()`. Розбіжність більша за `qty_step` вважається розбіжністю reconciliation (розділ 13).
+- Для Grid окремо ведеться **inventory сітки**: скільки позиції набрано незакритими рівнями. Зовні позиція одна, але стратегії потрібна розбивка по рівнях.
+
+---
+
+## 11. Persistence
+
+- **SQLAlchemy 2.x** (async) + **Alembic**. SQLite (`aiosqlite`) для розробки, backtest і paper; PostgreSQL (`asyncpg`) для testnet-довгих прогонів і production.
+- Репозиторії — тонкі класи по одному на агрегат. Ніякої бізнес-логіки в репозиторіях.
+- API-секрети в БД не зберігаються.
+
+### Таблиці
+
+| Таблиця | Зміст | Особливості |
+|---|---|---|
+| `orders` | Поточний стан ордерів | unique `client_order_id` |
+| `order_events` | Кожен перехід статусу | append-only |
+| `fills` | Виконання | unique `(exchange, exec_id)` — ідемпотентний insert |
+| `positions_snapshots` | Знімки позицій (локальні і біржові) | append-only |
+| `balance_snapshots` | Знімки балансу | append-only |
+| `funding_payments` | Funding | unique за ключем біржі |
+| `trades` | Завершені цикли (для Grid — пара buy→sell або sell→buy) | для метрик |
+| `strategy_state` | Серіалізований стан стратегії (JSON + `schema_version`) | одна актуальна версія + історія |
+| `grid_levels` | Стан рівнів сітки | FK на `strategy_state` |
+| `bot_events` | Старт, стоп, reconnect, помилки (`category=error`), зміни TradingState, хеш конфігурації | append-only |
+| `risk_events` | Відхилення, ліміти, kill switch | append-only |
+| `reconciliation_events` | Розбіжності та дії | append-only |
+| `kill_switch_state` | Поточний стан (латч) | один запис на бот |
+
+### Відмова БД
+
+Якщо запис у БД неможливий, бот не може гарантувати write-ahead для ордерів. Тому:
+- помилка запису перед відправкою ордера → ордер **не відправляється**;
+- серія помилок БД → `PAUSED` + сповіщення (сповіщення працюють без БД).
+
+---
+
+## 12. State Recovery
+
+Послідовність запуску (однакова для paper, testnet, live; у backtest спрощена):
+
+```text
+1. Завантажити і валідувати конфігурацію; записати config hash (без секретів).
+2. Preflight (розділ 16.3 для live; спрощений для testnet/paper).
+3. Перевірити kill_switch_state: якщо HALTED → лишатися в HALTED.
+4. Завантажити локальний стан: активні ордери, в т.ч. SUBMITTING/UNKNOWN, стан стратегії, останній exec_id/час.
+5. Підключити private stream і БУФЕРИЗУВАТИ події (ще не застосовувати).
+6. Отримати снапшот з біржі: open orders, positions, balances, fills з моменту останнього відомого.
+7. Reconciliation (розділ 13). Результат: OK або розбіжність.
+8. Застосувати пропущені fills → перебудувати портфель.
+9. Застосувати буфер подій зі стріму (з дедуплікацією).
+10. Відновити стратегію: restore_state(snapshot) + звірка з фактичними ордерами.
+11. Стратегія повертає «бажаний» набір ордерів; різниця з фактичним → intents через Risk.
+12. TradingState = RUNNING тільки якщо кроки 6–10 пройшли без невирішених розбіжностей.
+    Інакше PAUSED + сповіщення.
+```
+
+Стан стратегії в пам'яті, що лишився з минулого запуску, ніколи не використовується без звірки з біржею.
+
+---
+
+## 13. Exchange Reconciliation
+
+### Коли запускається
+
+- При старті (розділ 12).
+- Після reconnect private stream.
+- Періодично (інтервал у конфігурації).
+- Після резолву `UNKNOWN`, який закінчився `FAILED`.
+- Вручну (CLI).
+
+### Що порівнюється і як реагуємо
+
+| Ситуація | Автоматична дія | Стан |
+|---|---|---|
+| Локально OPEN, на біржі FILLED | Підтягнути fills, застосувати | RUNNING |
+| Локально OPEN, на біржі CANCELED | Оновити статус; стратегія вирішує, що робити з рівнем | RUNNING |
+| Локально активний, на біржі не знайдено ніде | `FAILED` + подія | RUNNING, якщо позиція сходиться; інакше PAUSED |
+| На біржі наш ордер (з префіксом), локально немає | Імпортувати в стан, подія warning | PAUSED до ручного підтвердження (у v1) |
+| На біржі сторонній ордер (без префікса) на нашому символі | Не чіпати, подія | PAUSED (субакаунт має бути виділеним) |
+| Позиція не збігається і розбіжність пояснюється пропущеними fills | Застосувати fills | RUNNING |
+| Позиція не збігається і розбіжність не пояснюється | Подія critical | PAUSED або HALTED (конфігурація) |
+| Баланс відрізняється понад поріг (після врахування fees/funding) | Подія | PAUSED |
+| Стан сітки не узгоджується з ордерами | Подія | PAUSED |
+
+Кожна перевірка пише `ReconciliationEvent` з обома версіями стану (локальною і біржовою). Навіть коли все збігається, пишеться короткий запис `OK` для аудиту.
+
+---
+
+## 14. Grid Strategy (місце в архітектурі)
+
+Детальний дизайн Grid — у фазі 7 ROADMAP. Тут фіксуємо архітектурні рішення.
+
+- Стратегія — синхронний клас з інтерфейсом:
+
+```text
+Strategy (protocol)
+  strategy_id
+  on_start(ctx) -> list[Intent]
+  on_market(event, ctx) -> list[Intent]
+  on_order_update(update, ctx) -> list[Intent]
+  on_fill(fill, ctx) -> list[Intent]
+  snapshot_state() -> StrategyStateSnapshot
+  restore_state(snapshot, ctx) -> None
+```
+
+  `ctx` — read-only view: instrument spec, fee schedule, власні активні ордери, власна позиція, останній ринковий стан, `clock.now()`. Адаптера в `ctx` немає.
+
+- Сітка = набір рівнів. Після fill buy на рівні `i` ставиться sell на рівні `i+1`; після fill sell на `i` — buy на `i-1`. Режим (LONG / SHORT / NEUTRAL) визначає **початковий стан** і прапорці `reduce_only`:
+  - **LONG:** buy нижче ціни відкривають і нарощують long; sell вище закривають (reduce-only).
+  - **SHORT:** дзеркально.
+  - **NEUTRAL:** buy нижче і sell вище; нетто-позиція коливається навколо нуля (в one-way position mode).
+- Pre-start аналіз (окремий чистий модуль, без стану): валідація параметрів проти `InstrumentSpec`, розрахунок прибутковості циклу (gross, fees, slippage, funding, net), положення ціни в діапазоні, worst-case позиція і ліквідація. Результат — звіт + вердикт OK / WARN / BLOCK.
+- `out_of_range_policy` для нижньої і верхньої межі задається **окремо і явно** (без значення за замовчуванням): `STOP_TRADING`, `KEEP_ORDERS`, `CANCEL_GRID`, `REBUILD_GRID`, `WAIT_FOR_RETURN`, `EMERGENCY_EXIT`. `REBUILD_GRID` у v1 не рекомендується: він «доганяє» тренд і фіксує збиток на inventory.
+
+---
+
+## 15. Backtesting
+
+### Схема
+
+```text
+HistoricalDataLoader ──► ReplayFeed (SimulatedClock) ──► Event Queue ──► TradingEngine
+                                                                             │
+                           Strategy / Risk / OrderManager / Portfolio  (ТІ САМІ)
+                                                                             │
+                                                            SimulatedExchange (fill model)
+```
+
+### Правила
+
+- Той самий `TradingEngine`, Strategy, RiskManager, OrderManager, Portfolio. Відрізняються тільки фід, `SimulatedExchange`, `SimulatedClock` і тимчасова БД.
+- **Look-ahead захист:**
+  - ReplayFeed видає події строго в порядку часу; `SimulatedClock` монотонний (assert);
+  - свічка доступна стратегії лише після її закриття (`close_time`);
+  - `SimulatedExchange` виконує ордер тільки на даних, що з'явилися **після** моменту його розміщення (+ опційна латентність).
+- **Модель виконання лімітних ордерів:**
+  - консервативно: fill, коли ціна **пройшла крізь** рівень, а не лише торкнулась (touch-fill — окрема опція, завжди позначається у звіті);
+  - на 1m свічках шлях ціни всередині бару невідомий. Якщо свічка перетинає кілька рівнів, використовується консервативне припущення: у межах одного бару **не** закриваються обидві сторони одного циклу, якщо це не випливає з порядку OHLC. Це обмеження явно вказується у звіті;
+  - для фінальної валідації бажані історичні трейди (tick data) замість свічок (джерело — відкрите питання);
+  - часткові fills: у v1 опція «обмеження частки обсягу бару»; без неї — повне виконання.
+- **Витрати:** maker/taker fee з конфігурації (параметри акаунта), slippage для ринкових ордерів (половина спреду + bps), funding за історичними ставками в моменти funding за інтервалом інструменту, помножений на позицію за mark/close ціною.
+- **Ліквідація:** за оцінювачем з розділу 9.4 на основі close/mark. Якщо ціна перетнула оцінку ліквідації — примусове закриття за ціною ліквідації з комісією, подія у звіті.
+- **Survivorship bias:** набір символів задається явно; у звіті вказується, що символ жив увесь період.
+
+### Результати
+
+Обов'язкові метрики з `CLAUDE.md`: total return, net / gross PnL, fees, funding, max drawdown, Sharpe, Sortino, win rate, profit factor, кількість трейдів, середній трейд, найбільші прибуток і збиток, експозиція, equity curve.
+
+Додатково для Grid:
+- кількість завершених циклів;
+- **inventory і нереалізований PnL на кінець періоду** (grid часто показує «прибуток» по циклах, який перекривається збитком на накопиченій позиції);
+- максимальна позиція, мінімальна відстань до ліквідації, час поза діапазоном.
+
+«Трейд» для Grid = завершений цикл buy→sell або sell→buy; незакриті рівні враховуються окремо.
+
+Аналіз стійкості (фаза 8): sensitivity-sweep параметрів, розбивка на ринкові режими, out-of-sample період.
+
+---
+
+## 16. Paper, Testnet, Live
+
+### 16.1 Paper trading
+
+- Ринкові дані — **mainnet** public WS (реальні ціни й ліквідність).
+- Виконання — той самий `SimulatedExchange`, що в backtest, але в real time: лімітний ордер виконується за потоком публічних трейдів (ціна пройшла крізь рівень).
+- Стан `SimulatedExchange` персиститься, щоб paper переживав рестарт і на ньому можна було тренувати recovery.
+- Мета — перевірити поведінку стратегії й ризику на живому ринку без грошей.
+
+### 16.2 Testnet
+
+- Bybit testnet: окремі base URL і **окремі** ключі.
+- Ринкові дані — **testnet** public WS (ордери виконуються проти testnet-стакану, тому й ціни мають бути звідти).
+- Ліквідність і ціни на testnet не відповідають mainnet. Testnet перевіряє **інтеграцію** (auth, формати, статуси, помилки, reconnect, recovery), а **не** прибутковість.
+- Альтернатива — Bybit Demo Trading (mainnet-ціни, віртуальні кошти). Підтримку в API і обмеження треба перевірити; це відкрите питання.
+
+### 16.3 Live
+
+- Потрібні одночасно: `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true` **і** успішний live preflight.
+- Live preflight (будь-яка помилка = старт заборонено):
+  - ключі присутні й валідні; права: торгівля є, **виведення вимкнене**; IP whitelist, якщо API повідомляє про це;
+  - біржа і mainnet endpoint відповідають режиму (mapping режим→URL зашитий у коді, а не в конфігу);
+  - акаунт очікуваного типу; position mode і margin mode як у конфігурації;
+  - символ торгується, `InstrumentSpec` отримано;
+  - плече на біржі = плече в конфігурації;
+  - доступний баланс ≥ capital allocation;
+  - ризик-ліміти задані й валідні; worst-case позиція і ліквідація в межах;
+  - kill switch не в HALTED;
+  - reconciliation пройшов без розбіжностей.
+- `capital_allocation` у конфігурації — жорстка межа: бот не використовує більше, навіть якщо на акаунті більше коштів.
+
+### 16.4 Що спільне, а що відрізняється між режимами
+
+| Компонент | Backtest | Paper | Testnet | Live |
+|---|---|---|---|---|
+| Domain models | спільні | спільні | спільні | спільні |
+| Strategy | спільна | спільна | спільна | спільна |
+| RiskManager + KillSwitch | спільні | спільні | спільні | спільні |
+| OrderManager / ExecutionEngine | спільні | спільні | спільні | спільні |
+| Portfolio | спільний | спільний | спільний | спільний |
+| TradingEngine loop | спільний | спільний | спільний | спільний |
+| Config schema | спільна | спільна | спільна | спільна |
+| Logging | спільне | спільне | спільне | спільне |
+| **Market data** | ReplayFeed (історія) | Bybit mainnet public WS | Bybit testnet public WS | Bybit mainnet public WS |
+| **Trading adapter** | SimulatedExchange | SimulatedExchange (real time) | BybitAdapter (testnet) | BybitAdapter (mainnet) |
+| **Private stream** | від SimulatedExchange | від SimulatedExchange | Bybit testnet private WS | Bybit mainnet private WS |
+| **Clock** | SimulatedClock | SystemClock | SystemClock | SystemClock |
+| **Persistence** | SQLite (тимчасова / in-memory) | SQLite | SQLite або PostgreSQL | PostgreSQL |
+| **Reconciliation** | не потрібна (симулятор узгоджений) | проти SimulatedExchange | реальна | реальна |
+| **Notifications** | вимкнені | опційно | увімкнені | увімкнені |
+| **Preflight** | валідація конфігурації | + доступність даних | + ключі, права, акаунт | повний live preflight |
+
+Уся різниця між режимами збирається в одному місці — `services/bootstrap`.
+
+---
+
+## 17. Конфігурація
+
+- **Секрети — тільки з env** (`pydantic.SecretStr`): `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `TELEGRAM_BOT_TOKEN`, `DATABASE_URL` (якщо з паролем).
+- **Режим:** `TRADING_MODE` = `backtest | paper | testnet | live`, `LIVE_TRADING_ENABLED`.
+- **Параметри — YAML:** `configs/development.yaml`, `paper.yaml`, `testnet.yaml`, `production.yaml`. У YAML: біржа, символ, стратегія, ризик, пороги stale-даних, reconciliation, нотифікації. У YAML ніколи немає секретів.
+- **Валідація:** Pydantic-схема з крос-перевірками (наприклад, `lower < upper`, `levels ≥ 2`, `leverage ≤ risk.max_leverage`, обидві `out_of_range_policy` задані, `TRADING_MODE=live` можливий лише з профілем `production`).
+- При старті в `bot_events` пишеться хеш конфігурації й сама конфігурація без секретів.
+- Base URL бірж для кожного режиму визначені в коді, а не в YAML. Так неможливо випадково спрямувати live-ключі на неправильний endpoint або testnet-режим на mainnet.
+
+---
+
+## 18. Логування
+
+- **structlog**, JSON у файл / stdout, людиночитний формат у dev.
+- Обов'язкові поля контексту: `mode`, `exchange`, `symbol`, `strategy_id`, а також `intent_id`, `client_order_id`, `exec_id` там, де застосовно. Так можна простежити ланцюжок intent → order → fill.
+- Логуються: сигнали/intents, рішення ризику, кожен перехід ордера, fills, зміни позиції, risk events, помилки біржі, reconnect, reconciliation, метрики продуктивності.
+- **Захист секретів:** процесор structlog, що маскує ключі за іменем поля (`key`, `secret`, `token`, `signature`, `password`, `authorization`) і за значенням відомих секретів. HTTP-заголовки й тіла підписаних запитів не логуються повністю. Тест: у логах немає значення секрету, навіть коли він потрапив у виняток.
+
+---
+
+## 19. Моніторинг
+
+v1 — мінімально, без зовнішньої інфраструктури:
+- `HealthMonitor` агрегує: статус WS (public/private), `data_age`, затримку API, частку помилок API, частку відхилених ордерів, TradingState, кількість відкритих ордерів.
+- Метрики портфеля: realized/unrealized PnL, drawdown, експозиція, використання маржі, відстань до ліквідації.
+- Періодичний знімок метрик у БД + рядок у лог.
+- CLI `status` читає останній стан.
+- Пізніше, за потреби, — Prometheus endpoint / Grafana. Не в v1.
+
+---
+
+## 20. Нотифікації
+
+- `Notifier` protocol + `TelegramNotifier`.
+- `NotificationDispatcher`: обмежена черга (bounded), окрема задача, таймаут на відправку, throttle і дедуплікація однакових повідомлень. Якщо черга повна, повідомлення відкидаються з записом у лог. **Помилка нотифікацій ніколи не впливає на торговий цикл.**
+- Події з `CLAUDE.md`: старт, стоп, fill, відкриття/закриття позиції, ризик-ліміт, kill switch, втрата з'єднання, розбіжність reconciliation, критична помилка.
+- Fills у Grid можуть бути частими, тому для них налаштовується агрегація (зведення раз на N хвилин).
+- У v1 Telegram — **тільки вихідний канал**. Команди з Telegram (включно з kill switch) не приймаються, бо це окрема поверхня атаки. Kill switch — через CLI / файл-прапорець на сервері.
+
+---
+
+## 21. Межі безпеки
+
+| Межа | Правило |
+|---|---|
+| Секрети | Тільки env / secret manager; `SecretStr`; не в YAML, БД, логах, винятках, експорті конфігурації |
+| Доступ до ключів | Ключі потрапляють лише в `exchanges/bybit` (auth). Решта коду отримує адаптер, а не ключі |
+| Права ключа | Торгівля — так; виведення — **ні** (перевіряється в preflight); IP whitelist — якщо доступний |
+| Акаунт | Виділений субакаунт з обмеженим балансом; основні кошти на іншому акаунті |
+| Торгові виклики | Тільки `ExecutionEngine` і `KillSwitch` мають `TradingAdapter` |
+| Режими | Mapping режим → endpoint у коді; live потребує двох прапорців і preflight |
+| Git | `.env`, дампи БД і логи в `.gitignore`; у репозиторії тільки `.env.example` з порожніми значеннями |
+| Вхідні канали керування | У v1 тільки CLI на сервері; жодних вхідних команд з месенджерів |
+
+---
+
+## 22. Що свідомо НЕ робимо у v1
+
+- Кілька бірж одночасно, крос-біржовий арбітраж.
+- Кілька інстансів стратегії та символів одночасно (моделі це дозволяють, оркестрація — ні).
+- Hedge position mode (див. відкриті питання).
+- Автоматичний `REBUILD_GRID`.
+- Зовнішні брокери повідомлень, мікросервіси, Kubernetes.
+- Вхідні команди з Telegram.
+- ML / оптимізація параметрів у live.
+
+---
+
+## 23. Непідтверджені припущення про Bybit API
+
+Нижче те, що потрібно **перевірити в актуальній документації Bybit v5** до реалізації відповідних фаз. Жоден з цих пунктів не вважається фактом:
+
+1. `category=linear` для USDT perpetual.
+2. `orderLinkId` як client order id: максимальна довжина, дозволені символи, чи біржа відхиляє дублікат, чи можна отримати ордер за `orderLinkId` після його закриття (і як довго).
+3. Семантика статусів ордера (`New`, `PartiallyFilled`, `Filled`, `Cancelled`, `Rejected`, `PartiallyFilledCanceled`, `Deactivated` тощо) і їх mapping на доменні.
+4. Поведінка post-only ордера, що перетинає стакан.
+5. Private WS: канали `order`, `execution`, `position`, `wallet`; чи приходять funding-записи через `execution`.
+6. Ping/heartbeat інтервал для WS; семантика snapshot/delta і `seq` у стакані.
+7. Rate limits для кожної групи ендпоінтів і заголовки зі станом ліміту.
+8. Ендпоінт з інформацією про API-ключ (права, IP whitelist).
+9. Ендпоінт ставок комісій акаунта.
+10. Unified Trading Account: доступність isolated margin, як біржа повертає `liqPrice` у cross/isolated.
+11. `positionIdx` і one-way / hedge mode.
+12. Testnet і Demo Trading: base URL, які ендпоінти підтримуються.
+13. Джерело історичних даних (klines через REST, архіви трейдів) та глибина історії funding.
+14. Інтервал funding для конкретного символу (може відрізнятися від 8 год).
+15. Наявність disconnect-protection механізму (автоскасування ордерів при втраті з'єднання) для perpetual.
+
+---
+
+## 24. Відкриті питання (потрібне рішення власника)
+
+1. Бібліотека для Bybit: pybit / ccxt / власний тонкий клієнт (рішення у фазі 2).
+2. Margin mode: isolated (рекомендовано для v1) чи cross.
+3. Position mode: one-way (рекомендовано) чи hedge.
+4. Старт Long/Short Grid: з пласкої позиції (рекомендовано для v1) чи з початковою позицією під рівні по інший бік ціни (класичний варіант).
+5. Дані для бектесту: 1m свічки (простіше) чи трейди (точніше для Grid).
+6. Testnet чи Demo Trading як етап перед live (або обидва).
+7. Kill switch за замовчуванням: закривати позиції чи лише скасовувати ордери.
