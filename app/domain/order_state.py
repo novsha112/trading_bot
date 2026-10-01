@@ -3,7 +3,8 @@
 The transition table is explicit. Two self-transitions exist, and only for new
 execution data: PARTIALLY_FILLED -> PARTIALLY_FILLED and CANCELING -> CANCELING,
 both requiring a strictly larger cumulative filled_qty. A partial fill that
-arrives while a cancel is pending keeps the order in CANCELING.
+arrives while a cancel is pending keeps the order in CANCELING; a fill that
+completes the order moves it to FILLED (CANCELING requires filled_qty < qty).
 
 An allowed arc does not make every data combination valid: the resulting Order
 still has to satisfy its status/fill invariants (e.g. FAILED requires no fill).

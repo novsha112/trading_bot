@@ -187,6 +187,24 @@ def test_c_cancel_success_after_partial_fill() -> None:
     assert (o.status, o.filled_qty, o.avg_fill_price) == (S.CANCELED, D("0.6"), PRICE)
 
 
+def test_b_cancel_race_full_fill_must_be_filled_not_canceling() -> None:
+    o = step(make_order(S.CANCELING, "0.3"), S.CANCELING, "0.6")
+    assert (o.qty, o.status, o.filled_qty) == (D("1.0"), S.CANCELING, D("0.6"))
+
+    with pytest.raises(DomainValidationError, match=r"^filled_qty \(1.0\) .* canceling"):
+        step(o, S.CANCELING, "1.0")
+
+    filled = step(o, S.FILLED, "1.0")
+    assert (filled.status, filled.filled_qty) == (S.FILLED, D("1.0"))
+
+
+def test_submitting_self_transition_stays_forbidden() -> None:
+    # An acknowledgement that only assigns exchange_order_id is not a status transition.
+    assert S.SUBMITTING not in ALLOWED_TRANSITIONS[S.SUBMITTING]
+    with pytest.raises(InvalidOrderTransition, match="submitting -> submitting"):
+        transition(make_order(S.SUBMITTING), S.SUBMITTING, at=T0, exchange_order_id="o-1")
+
+
 def test_d_unknown_resolution() -> None:
     assert step(step(make_order(S.OPEN), S.UNKNOWN), S.OPEN).status is S.OPEN
 

@@ -157,7 +157,7 @@ VALID_STATUS_FILLS = [
     (S.FILLED, "1"),
     (S.CANCELING, "0"),
     (S.CANCELING, "0.3"),
-    (S.CANCELING, "1.0"),
+    (S.CANCELING, "0.999"),
     (S.CANCELED, "0"),
     (S.CANCELED, "0.6"),
     (S.EXPIRED, "0"),
@@ -178,6 +178,7 @@ INVALID_STATUS_FILLS = [
     (S.FILLED, "0.999"),
     (S.CANCELED, "1.0"),  # fully executed order is FILLED, not CANCELED
     (S.EXPIRED, "1.0"),
+    (S.CANCELING, "1.0"),  # fully executed while canceling is FILLED
 ]
 
 

@@ -29,8 +29,11 @@ _ZERO_FILL_STATUSES: Final = frozenset(
         OrderStatus.FAILED,
     }
 )
-# Finished without full execution: a fully executed order is FILLED instead.
-_NOT_FULLY_FILLED_STATUSES: Final = frozenset({OrderStatus.CANCELED, OrderStatus.EXPIRED})
+# Not fully executed: once the cumulative fill reaches qty the order is FILLED,
+# including when a cancel request was pending (CANCELING -> FILLED).
+_NOT_FULLY_FILLED_STATUSES: Final = frozenset(
+    {OrderStatus.CANCELING, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+)
 
 
 def _require_avg_fill_price(filled_qty: Decimal, avg_fill_price: object) -> None:
@@ -53,7 +56,7 @@ def _require_status_fill(status: OrderStatus, filled_qty: Decimal, qty: Decimal)
         rule = "must be == qty"
     elif status in _NOT_FULLY_FILLED_STATUSES and filled_qty >= qty:
         rule = "must be < qty"
-    # CANCELING and UNKNOWN allow any fill from 0 through qty.
+    # UNKNOWN allows any fill from 0 through qty: its purpose is uncertainty.
     if rule is not None:
         raise DomainValidationError(
             f"filled_qty ({filled_qty}) is not allowed for status {status.value}: {rule}"
