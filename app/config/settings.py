@@ -125,8 +125,13 @@ def load_env_settings(*, env_file: Path | None = None) -> EnvSettings:
     try:
         return EnvSettings(_env_file=env_file)
     except ValidationError as exc:
-        details = "\n".join(
-            f"- {'.'.join(str(part) for part in error['loc']) or 'settings'}: {error['msg']}"
-            for error in exc.errors(include_input=False, include_url=False, include_context=False)
-        )
+        details = format_validation_errors(exc)
         raise ConfigError(f"Invalid environment configuration:\n{details}") from None
+
+
+def format_validation_errors(exc: ValidationError) -> str:
+    """Field locations and reasons of a Pydantic error, without any input values."""
+    return "\n".join(
+        f"- {'.'.join(str(part) for part in error['loc']) or 'root'}: {error['msg']}"
+        for error in exc.errors(include_input=False, include_url=False, include_context=False)
+    )

@@ -699,8 +699,10 @@ HistoricalDataLoader ──► ReplayFeed (SimulatedClock) ──► Event Queue
 
 - **Секрети — тільки з env** (`pydantic.SecretStr`): `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `TELEGRAM_BOT_TOKEN`, `DATABASE_URL` (якщо з паролем).
 - **Режим:** `TRADING_MODE` = `backtest | paper | testnet | live`, `LIVE_TRADING_ENABLED`.
-- **Параметри — YAML:** `configs/development.yaml`, `paper.yaml`, `testnet.yaml`, `production.yaml`. У YAML: біржа, символ, стратегія, ризик, пороги stale-даних, reconciliation, нотифікації. У YAML ніколи немає секретів.
-- **Валідація:** Pydantic-схема з крос-перевірками (наприклад, `lower < upper`, `levels ≥ 2`, `leverage ≤ risk.max_leverage`, обидві `out_of_range_policy` задані, `TRADING_MODE=live` можливий лише з профілем `production`).
+- **Параметри — YAML:** `configs/development.yaml`, `paper.yaml`, `testnet.yaml`; `production.yaml` з'явиться у Phase 13. Зараз у YAML: профіль, біржа, символ і параметри Grid; ризик, пороги stale-даних, reconciliation і нотифікації додаються у фазах, які їх використовують. У YAML ніколи немає секретів і обмежень інструмента (tick, step, мінімуми — від біржі).
+- **Завантаження YAML** (`app/config/loader.py`): похідний від `SafeLoader` loader без Python-тегів; дробові числа стають `Decimal` з тексту скаляра (без `float`), цілі — лише десятковий запис, дубльовані ключі й шістдесяткові числа — помилка. Помилки не містять вмісту файлу.
+- **Профіль ↔ режим:** `development` — `backtest`, `paper`; `paper` — `paper`; `testnet` — `testnet`. `profile.name` у файлі має збігатися з `CONFIG_PROFILE`. Без профілю `production` режим `live` неможливо сконфігурувати.
+- **Валідація:** Pydantic-схема з локальними перевірками (`lower_price > 0`, `upper_price > lower_price`, `levels ≥ 2`, `order_qty > 0`, `extra="forbid"`). Перевірки на кшталт `leverage ≤ risk.max_leverage` і обидві `out_of_range_policy` додаються разом із відповідними полями (Phase 6–7); `TRADING_MODE=live` можливий лише з профілем `production`.
 - При старті в `bot_events` пишеться хеш конфігурації й сама конфігурація без секретів.
 - Base URL бірж для кожного режиму визначені в коді, а не в YAML. Так неможливо випадково спрямувати live-ключі на неправильний endpoint або testnet-режим на mainnet.
 

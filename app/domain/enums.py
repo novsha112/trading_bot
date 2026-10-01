@@ -70,3 +70,18 @@ class PositionSide(StrEnum):
     LONG = "long"
     SHORT = "short"
     FLAT = "flat"
+
+
+class GridMode(StrEnum):
+    """Direction of a grid: which side builds the position."""
+
+    LONG = "long"
+    SHORT = "short"
+    NEUTRAL = "neutral"
+
+
+class GridSpacing(StrEnum):
+    """How grid levels are distributed between the lower and upper price."""
+
+    ARITHMETIC = "arithmetic"  # equal price difference between levels
+    GEOMETRIC = "geometric"  # equal price ratio between levels

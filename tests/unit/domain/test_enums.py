@@ -7,6 +7,8 @@ from enum import StrEnum
 import pytest
 
 from app.domain.enums import (
+    GridMode,
+    GridSpacing,
     OrderStatus,
     OrderType,
     PositionSide,
@@ -36,6 +38,8 @@ EXPECTED_VALUES: dict[type[StrEnum], set[str]] = {
     },
     RoundingDirection: {"down", "up"},
     PositionSide: {"long", "short", "flat"},
+    GridMode: {"long", "short", "neutral"},
+    GridSpacing: {"arithmetic", "geometric"},
 }
 
 

@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
     "structlog>=26.1.0",
 ]
 
@@ -76,4 +77,5 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.9",
+    "types-pyyaml>=6.0.12.20260906",
 ]

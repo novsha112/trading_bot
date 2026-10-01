@@ -1,0 +1,22 @@
+# Profile "testnet": allowed with TRADING_MODE=testnet.
+# Secrets never go here (see .env.example). Exchange constraints (tick size,
+# quantity step, minimums) come from the exchange at runtime, not from YAML.
+#
+# Grid values are placeholders for development: they are not validated against
+# the market, fees or risk and are not a recommendation.
+profile:
+  name: testnet
+
+exchange:
+  name: bybit
+  symbol: BTCUSDT
+
+strategy:
+  type: grid
+  grid:
+    lower_price: 60000
+    upper_price: 70000
+    levels: 10
+    spacing: arithmetic
+    mode: neutral
+    order_qty: 0.001

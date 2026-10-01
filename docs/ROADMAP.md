@@ -80,6 +80,8 @@
 - Крос-валідація конфігурації; `live` дозволений тільки з двома прапорцями й профілем `production`.
 - Mapping режим → base URL біржі в коді (значення URL беруться з документації у фазі 3/11; поки що — порожні заглушки з помилкою на використання).
 
+**Фактичний обсяг після review.** Моделі без поточного споживача відкладено (`events`, `RiskConfig`, `MarketDataConfig`, `NotificationConfig`, `out_of_range_policy`, `production.yaml` — у фазах, що їх використовують). Mapping режим → base URL перенесено в Exchange Adapter (Phase 3/11). Схема YAML у Phase 1: `profile`, `exchange` (`bybit`, symbol), `strategy.grid` (lower/upper price, levels, spacing, mode, order_qty).
+
 **Файли.** `app/domain/{enums,instrument,market,orders,order_state,fills,positions,balances,intents,events,errors,clock,rounding}.py`; `app/config/{settings,schema,loader}.py`; `configs/{development,paper,testnet,production}.yaml`.
 
 **Тести.**
