@@ -5,6 +5,8 @@ description = "Modular cryptocurrency trading bot (backtest, paper, testnet, liv
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
     "structlog>=26.1.0",
 ]
 
@@ -55,6 +57,7 @@ select = [
 [tool.mypy]
 python_version = "3.11"
 strict = true
+plugins = ["pydantic.mypy"]
 warn_unreachable = true
 files = ["app", "tests"]
 
