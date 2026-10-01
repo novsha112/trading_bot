@@ -140,12 +140,14 @@ def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
     realized = state.realized if state is not None else _ZERO
     price = Fraction(fill.price)
     fill_qty = Fraction(fill.qty)
-    signed = fill.qty if fill.side is Side.BUY else -fill.qty
+    # copy_negate / copy_abs are exact and context-free (plain -x / abs(x) would
+    # round to the process-global decimal context).
+    signed = fill.qty if fill.side is Side.BUY else fill.qty.copy_negate()
 
     if qty == 0 or (qty > 0) == (signed > 0):
         cost += price * fill_qty  # open or increase
     else:
-        open_abs = Fraction(abs(qty))
+        open_abs = Fraction(qty.copy_abs())
         closed = min(fill_qty, open_abs)
         basis = cost / open_abs
         pnl_per_unit = price - basis if qty > 0 else basis - price
@@ -175,7 +177,7 @@ def _to_position(state: _PositionState, mark: MarkQuote | None) -> Position:
     """Published position, valued at ``mark`` (if known) from the exact basis:
     long ``mark * qty - cost``, short ``cost - mark * |qty|``, flat 0."""
     is_flat = state.qty == 0
-    open_qty = Fraction(abs(state.qty))
+    open_qty = Fraction(state.qty.copy_abs())
     unrealized: Decimal | None
     if is_flat:
         unrealized = _ZERO_DECIMAL

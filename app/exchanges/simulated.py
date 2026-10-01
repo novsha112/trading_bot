@@ -354,7 +354,7 @@ def _reducible_qty(side: Side, position_qty: Decimal) -> Decimal:
     if side is Side.SELL and position_qty > 0:
         return position_qty
     if side is Side.BUY and position_qty < 0:
-        return -position_qty
+        return position_qty.copy_negate()  # exact; -x would use the global context
     return _ZERO
 
 
