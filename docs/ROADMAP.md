@@ -255,7 +255,7 @@
 
 **Мета.** Відтворюваний бектест тим самим кодом Strategy / Risk / Execution / Portfolio.
 
-**Стан.** Розпочато фундамент симуляції (раніше за порядком фаз, як ізольований компонент без залежностей від execution / risk): детермінований `SimulatedExchange` (`app/exchanges/simulated.py`) — лише lifecycle ордера (place LIMIT GTC / POST_ONLY → OPEN, cancel, get, open orders), ідемпотентність за `client_order_id`, час з `Clock`. Fills, matching, market-ордери, IOC / FOK, reduce-only, комісії, slippage, funding, баланси й позиції — ще ні. Модуль стане пакетом `simulated/`, коли з'являться matching / fees тощо. Backtest і paper trading **не** реалізовані.
+**Стан.** Розпочато фундамент симуляції (раніше за порядком фаз, як ізольований компонент без залежностей від execution / risk): детермінований `SimulatedExchange` (`app/exchanges/simulated.py`) — lifecycle ордера (place LIMIT GTC / POST_ONLY → OPEN, cancel, get, open orders), ідемпотентність за `client_order_id`, час з `Clock`, детерміновані повні fills LIMIT-ордерів за зовнішньою ціною виконання (`fill_crossed_limit_orders`, атомарний batch, комісія й роль ліквідності — `None`). Partial fills, market-ордери, IOC / FOK, reduce-only, комісії, slippage, funding, баланси й позиції — ще ні. Модуль стане пакетом `simulated/`, коли з'являться matching / fees тощо. Backtest і paper trading **не** реалізовані.
 
 **Що реалізуємо.**
 - `SimulatedExchange` (реалізує `TradingClient` + приватний стрім): matching лімітних і ринкових ордерів, post-only, reduce-only, комісії, slippage, funding, ліквідація, опційна латентність, опційні часткові fills.

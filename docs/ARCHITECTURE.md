@@ -363,7 +363,18 @@ Rate limiter (token bucket) живе в адаптері, окремо для к
 - `cancel_order`: OPEN → CANCELED (`exchange_ts` = момент скасування). Невідомий ордер чи вже фінальний → `ExchangeRejectedError` без змін стану, однаково при кожному повторі (відповідає контракту `TradingClient`: «already final or unknown»).
 - `get_order`: пошук за `symbol` + `client_order_id`; інший символ — інший простір → `None`. Якщо передано `exchange_order_id`, що суперечить ордеру, → `ExchangeRejectedError`, а не `None`: ордер існує, і `None` дозволив би reconciliation вирішити «не розміщено» з ризиком дубля.
 - `get_open_orders(symbol)`: лише активні ордери символу, порядок `(created_at, client_order_id)`.
-- Час — лише з injected `Clock` (у тестах `ManualClock`). `Ambiguous` ніколи не виникає (транспорту немає). Fills, matching, комісії, slippage, баланси й позиції ще не реалізовані.
+- **Виконання (simulation-only вхід, не в `TradingClient`, не market data):** `fill_crossed_limit_orders(*, symbol, execution_price) -> tuple[Fill, ...]`.
+  - `execution_price` — точний `Decimal`, скінченний, `> 0`; `symbol` — та сама перевірка, що в `get_open_orders`. Некоректний вхід → `ExchangeRequestValidationError` до будь-яких змін (стан, послідовності й годинник не зачіпаються).
+  - Перетин (лише OPEN-ордери цього символу): BUY — `execution_price <= limit`, SELL — `execution_price >= limit`; рівність виконує. CANCELED / FILLED і інші символи не беруть участі.
+  - Модель price improvement: `Fill.price = execution_price` (BUY limit 100 при 95 → fill за 95). Книги, bid/ask, глибини, spread, slippage і латентності немає — ціну виконання повністю задає викликач.
+  - Лише повне виконання: `FILLED`, `cum_filled_qty = qty`, `avg_fill_price = execution_price`. Partial fills немає; FILLED ордер більше не виконується, не скасовується (final-state rejection) і зникає з `get_open_orders`.
+  - Метадані: `fee=None`, `fee_asset=None`, `is_maker=None` — комісія не моделюється, роль ліквідності невідома (навіть для POST_ONLY: симулятор не перевіряє перетин у момент розміщення).
+  - `exec_id` — окрема послідовність екземпляра `SIM-EXEC-0000000001`, …, незалежна від id ордерів; виклики без fills і невалідні виклики номери не витрачають.
+  - Порядок batch: `(created_at, client_order_id)` — правило детермінованості симуляції, а не біржовий price-time priority. У цьому порядку призначаються `exec_id`, створюються fills і повертається tuple.
+  - Час: `clock.now()` читається рівно один раз на batch, що щось виконує (без перетинів — жодного разу); усі fills і `OrderUpdate` batch мають цей `exchange_ts`.
+  - Атомарність: спершу будуються всі `Fill` і нові записи ордерів (локально, без змін стану), потім одним кроком фіксуються ордери й послідовність `exec_id`. Помилка під час підготовки не лишає жодного FILLED ордера і не створює пропусків у `exec_id`.
+  - Ідемпотентність після fill: однаковий повтор `place_order` повертає оригінальний `OrderAck` без змін стану; інші умови → `ExchangeDuplicateOrderError`.
+- Час — лише з injected `Clock` (у тестах `ManualClock`). `Ambiguous` ніколи не виникає (транспорту немає). Partial fills, MARKET-виконання, комісії, slippage, баланси й позиції ще не реалізовані.
 - Правило архітектури: `exchanges.simulated` — implementation (ядро й Bybit не можуть його імпортувати); сам він може імпортувати лише stdlib, `app.domain`, `app.exchanges.models`, `app.exchanges.errors`.
 
 Цільові реалізації:
