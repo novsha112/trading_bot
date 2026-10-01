@@ -46,6 +46,7 @@ from app.domain.clock import Clock
 from app.domain.errors import DomainError
 from app.domain.validation import require_utc, utc_from_ms
 from app.exchanges.bybit.credentials import BybitCredentials
+from app.exchanges.bybit.types import JsonValue
 from app.exchanges.errors import (
     ExchangeAmbiguousResultError,
     ExchangeAuthenticationError,
@@ -92,7 +93,6 @@ _MAX_MESSAGE: Final = 120
 _REDACTED: Final = "[REDACTED]"
 
 QueryValue = str | int
-JsonValue = str | int | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 @dataclass(frozen=True, slots=True)

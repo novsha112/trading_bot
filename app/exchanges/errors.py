@@ -55,3 +55,13 @@ class ExchangeAmbiguousResultError(ExchangeError):
 class ExchangeResponseError(ExchangeError):
     """A read-only request got no valid answer (transport failure, server error,
     malformed or unexpected response). Never raised for mutating requests."""
+
+
+class ExchangeRequestValidationError(ExchangeNotSentError):
+    """A request was refused locally before any transport call: it cannot be
+    expressed in the exchange's documented format (unsupported field combination,
+    value outside the documented syntax).
+
+    Nothing was sent. Retrying the same request cannot succeed; the caller must
+    fix the request.
+    """

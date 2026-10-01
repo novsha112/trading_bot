@@ -12,6 +12,7 @@ from app.exchanges.errors import (
     ExchangeError,
     ExchangeNotSentError,
     ExchangeRejectedError,
+    ExchangeRequestValidationError,
     ExchangeResponseError,
 )
 
@@ -83,3 +84,10 @@ def test_response_error_is_read_only_and_not_ambiguous() -> None:
     assert not issubclass(ExchangeResponseError, ExchangeAmbiguousResultError)
     assert not issubclass(ExchangeResponseError, ExchangeRejectedError)
     assert "Never raised for mutating requests" in (ExchangeResponseError.__doc__ or "")
+
+
+def test_request_validation_error_is_a_local_not_sent_error() -> None:
+    # Refused before any transport call: never ambiguous, never an exchange answer.
+    assert issubclass(ExchangeRequestValidationError, ExchangeNotSentError)
+    for other in (ExchangeRejectedError, ExchangeAmbiguousResultError, ExchangeResponseError):
+        assert not issubclass(ExchangeRequestValidationError, other)

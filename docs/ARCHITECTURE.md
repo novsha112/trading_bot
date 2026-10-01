@@ -267,6 +267,7 @@ TradingClient      (з ключами; лише execution і KillSwitch)
 ```text
 ExchangeError
 ├── ExchangeNotSentError
+│   └── ExchangeRequestValidationError
 ├── ExchangeRejectedError
 │   └── ExchangeAuthenticationError
 └── ExchangeAmbiguousResultError
@@ -275,6 +276,7 @@ ExchangeError
 | Помилка | Значення | Повтор |
 |---|---|---|
 | `ExchangeNotSentError` | Відсутність відправки **доведено до входу в мережеву операцію з можливими побічними ефектами**: локальна перевірка, відмова локального rate limiter, очікування з'єднання з пулу. Для мутуючих запитів збій встановлення з'єднання сюди **не** належить (див. нижче); для читання — належить | Може повторити політика викликача |
+| `ExchangeRequestValidationError` | Підвид `NotSent`: запит відхилено локально **до будь-якого виклику транспорту**, бо його неможливо виразити в документованому форматі біржі (непідтримана комбінація полів, значення поза документованим синтаксисом) | Повтор того самого запиту безглуздий — виправити запит |
 | `ExchangeRejectedError` | Біржа відповіла й однозначно відмовила, нічого не прийнято (зокрема явна відмова через rate limit) | Не повторюється наосліп |
 | `ExchangeAuthenticationError` | Біржа відхилила автентифікацію чи права (не для відсутніх локальних ключів — це помилка конфігурації) | Ні; HALTED + сповіщення |
 | `ExchangeAmbiguousResultError` | Мутуючий запит міг бути прийнятий, підтвердженого результату немає (timeout чи розрив після відправки, або адаптер не може довести, що запит не пішов) | **Ніколи наосліп**: спершу reconciliation |
@@ -326,6 +328,15 @@ Rate limiter (token bucket) живе в адаптері, окремо для к
   - HTTP 2xx з валідною обгорткою: `retCode` 10003 / 10004 / 10005 / 10007 / 10010 / 33004 → `ExchangeAuthenticationError`; 10001 (помилка параметрів) і 10002 (час поза `recv_window`, захист від replay) → `ExchangeRejectedError`; 10000 / 10006 / 10016 / 429 і невідомі коди → `Ambiguous`; зламаний JSON чи обгортка → `Ambiguous`.
   - Після `Ambiguous` — reconciliation за `client_order_id`, ніколи сліпий повтор.
 - Класифікація GET (лише читання, без побічних ефектів, ніколи `Ambiguous`): збій з'єднання чи пулу → `NotSent`; HTTP 401 і auth-коди → `ExchangeAuthenticationError`; HTTP 400 / 404 і 10001 / 10002 → `ExchangeRejectedError`; усе інше → `ExchangeResponseError`.
+
+**Наявний: `app/exchanges/bybit/order_mapping.py` — `map_order_request(order: OrderRequest) -> dict[str, JsonValue]`** — чистий mapping у тіло `POST /v5/order/create` (офіційні docs, гілка `master`: `docs/v5/order/create-order.mdx`, `docs/v5/enum.mdx`). Без транспорту, мережі, логування й `httpx`; `TradingClient` / place / cancel / get ще не реалізовані.
+
+- Обсяг: USDT linear perpetual, one-way. Поля й порядок: `category="linear"`, `symbol`, `side` (`Buy`/`Sell`), `orderType` (`Limit`/`Market`), `qty`, `price` (лише для `Limit`), `timeInForce`, `reduceOnly` (JSON bool), `orderLinkId` (= `client_order_id`). Не відправляються: `positionIdx` (обов'язковий лише в hedge mode), TP/SL, trigger, SMP, MMP, slippage, `orderFilter`, broker, RPI.
+- `timeInForce`: `GTC` / `IOC` / `FOK` / `PostOnly` для `Limit` (завжди явно, без покладання на дефолт `GTC`). Для `Market` docs кажуть «Market order will always use IOC» — тому лише `IOC` (відправляється явно); `Market` + `GTC` / `FOK` / `PostOnly` неможливо виразити без мовчазної заміни біржею → `ExchangeRequestValidationError`. Bybit виконує market як IOC-limit із власним порогом slippage (поле `slippageTolerance` не використовуємо).
+- Decimal → канонічний рядок у простій нотації без контексту `decimal`: без експоненти, без `float`, без округлення, без хвостових нулів дробової частини (`1.500` → `"1.5"`, `1E+8` → `"100000000"`, `1E-8` → `"0.00000001"`); рівні значення дають однаковий текст. Лише точний тип `Decimal`, скінченний, `> 0`. Локальна межа безпеки (не ліміт Bybit): ≤ 64 символів у простій нотації — абсурдні порядки (`1E+999999999`) відхиляються без розгортання. Вирівнювання до `tickSize` / `qtyStep` — pre-trade перевірка, не mapping.
+- `orderLinkId`: `[A-Za-z0-9_-]{1,36}` за docs; ніколи не обрізається й не нормалізується. `symbol`: docs — «uppercase only», перевіряється `[A-Z0-9]+` без upper-case-нормалізації. Чи є символ саме USDT linear perpetual, mapping не знає — це гарантує `InstrumentSpec` з публічного адаптера на етапі pre-trade.
+- Поля `OrderRequest` перевіряються повторно (enum — саме член enum, а не рівний йому рядок `StrEnum`; `reduceOnly` — саме `bool`), бо mapping — остання межа перед підписом. Кожен виклик повертає новий `dict`, яким володіє викликач; транспорт одразу серіалізує й підписує його. Frozen DTO не вводився: незмінність після підпису забезпечує транспорт (тіло серіалізується один раз).
+- `JsonValue` винесено в `exchanges/bybit/types.py`, тож mapping не залежить від `private_rest`; тест архітектури має для `order_mapping` / `types` окремий allowlist (лише `app.domain`, `app.exchanges.models`, `app.exchanges.errors`, `app.exchanges.bybit.types`; без third-party).
 
 Цільові реалізації:
 

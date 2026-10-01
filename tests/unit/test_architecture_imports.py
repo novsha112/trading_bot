@@ -53,6 +53,23 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "exchanges": frozenset(),
     # Concrete adapter: the core contracts plus one HTTP client.
     "exchanges.bybit": frozenset({"httpx"}),
+    # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
+    "exchanges.bybit.order_mapping": frozenset(),
+    "exchanges.bybit.types": frozenset(),
+}
+
+# Modules that may import only these app modules (prefix match), stricter than their
+# package rule: pure request mapping never reaches the transport, credentials or config.
+MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
+    "exchanges.bybit.order_mapping": frozenset(
+        {
+            "app.domain",
+            "app.exchanges.models",
+            "app.exchanges.errors",
+            "app.exchanges.bybit.types",
+        }
+    ),
+    "exchanges.bybit.types": frozenset(),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -147,6 +164,11 @@ def find_violations(root: Path) -> list[str]:
                 # "import app" gives access to every package.
                 violations.append(f"{module}: imports '{name}' (top-level app package)")
                 continue
+            module_allowlist = MODULE_APP_ALLOWLIST.get(module.partition(".")[2])
+            if module_allowlist is not None and not any(
+                name == prefix or name.startswith(f"{prefix}.") for prefix in module_allowlist
+            ):
+                violations.append(f"{module}: imports '{name}' (not in the module allowlist)")
             target = name_parts[1]
             if target != package and target not in allowed:
                 violations.append(f"{module}: imports '{name}' (app.{package} -> app.{target})")
@@ -486,3 +508,75 @@ def test_bybit_adapter_allowed_imports(tmp_path: Path) -> None:
     )
 
     assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("exchanges/bybit/order_mapping.py", "import httpx\n", "'httpx' (third-party"),
+        ("exchanges/bybit/order_mapping.py", "import pydantic\n", "'pydantic' (third-party"),
+        ("exchanges/bybit/order_mapping.py", "import structlog\n", "'structlog' (third-party"),
+        (
+            "exchanges/bybit/order_mapping.py",
+            "from app.exchanges.bybit.private_rest import JsonValue\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/bybit/order_mapping.py",
+            "from .private_rest import BybitPrivateRestTransport\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/bybit/order_mapping.py",
+            "from .credentials import BybitCredentials\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/bybit/order_mapping.py",
+            "from app.exchanges.protocols import TradingClient\n",
+            "module allowlist",
+        ),
+        ("exchanges/bybit/types.py", "import httpx\n", "'httpx' (third-party"),
+        ("exchanges/bybit/types.py", "from app.domain.enums import Side\n", "module allowlist"),
+    ],
+)
+def test_pure_mapping_module_violations(
+    tmp_path: Path, relative: str, source: str, expected: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+def test_pure_mapping_module_config_import_reported(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(root, "exchanges/bybit/order_mapping.py", "from app.config.settings import X\n")
+
+    violations = find_violations(root)
+
+    assert any("module allowlist" in v for v in violations), violations
+    assert any("-> app.config" in v for v in violations), violations
+
+
+def test_pure_mapping_module_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/bybit/order_mapping.py",
+        "import re\nfrom decimal import Decimal\nfrom app.domain.enums import Side\n"
+        "from app.exchanges.models import OrderRequest\n"
+        "from app.exchanges.errors import ExchangeRequestValidationError\n"
+        "from .types import JsonValue\n",
+    )
+    _write(root, "exchanges/bybit/types.py", "from __future__ import annotations\n")
+
+    assert find_violations(root) == []
+
+
+def test_real_order_mapping_module_is_covered_by_the_allowlist() -> None:
+    assert (APP_ROOT / "exchanges" / "bybit" / "order_mapping.py").is_file()
+    assert (APP_ROOT / "exchanges" / "bybit" / "types.py").is_file()
