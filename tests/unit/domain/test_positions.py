@@ -56,7 +56,8 @@ def test_structure_frozen_slotted_keyword_only() -> None:
 def test_side_is_derived_from_signed_qty(
     qty: Decimal, entry: Decimal | None, side: PositionSide
 ) -> None:
-    assert position(qty=qty, entry_price=entry).side is side
+    unrealized = D("0") if qty == 0 else D("1")
+    assert position(qty=qty, entry_price=entry, unrealized_pnl=unrealized).side is side
 
 
 def test_side_is_not_a_stored_field() -> None:
@@ -67,7 +68,7 @@ def test_side_is_not_a_stored_field() -> None:
 
 def test_flat_position_with_entry_price_rejected() -> None:
     with pytest.raises(DomainValidationError, match=r"^entry_price must be None"):
-        position(qty=D("0"), entry_price=D("65000"))
+        position(qty=D("0"), entry_price=D("65000"), unrealized_pnl=D("0"))
 
 
 @pytest.mark.parametrize("qty", [D("0.01"), D("-0.01")])
@@ -120,3 +121,82 @@ def test_updated_at_must_be_utc(value: Any) -> None:
 def test_symbol_validated() -> None:
     with pytest.raises(DomainValidationError, match=r"^symbol "):
         position(symbol="")
+
+
+# --- unrealized PnL: known or unknown -----------------------------------------
+
+
+@pytest.mark.parametrize("qty", [D("0"), D("-0"), D("0.000")])
+def test_flat_requires_known_zero_unrealized(qty: Decimal) -> None:
+    p = position(qty=qty, entry_price=None, unrealized_pnl=D("0"))
+    assert p.unrealized_pnl == 0
+    assert p.side is PositionSide.FLAT
+
+
+@pytest.mark.parametrize("value", [None, D("0.01"), D("-0.01"), D("5")])
+def test_flat_rejects_unknown_or_nonzero_unrealized(value: Decimal | None) -> None:
+    with pytest.raises(DomainValidationError, match=r"^unrealized_pnl must be 0 for a flat"):
+        position(qty=D("0"), entry_price=None, unrealized_pnl=value)
+
+
+@pytest.mark.parametrize("qty", [D("0.01"), D("-0.01")])
+def test_open_position_may_have_unknown_unrealized(qty: Decimal) -> None:
+    p = position(qty=qty, unrealized_pnl=None)
+
+    assert p.unrealized_pnl is None
+    # Everything else about the position stays known.
+    assert p.qty == qty
+    assert p.entry_price == D("65000")
+    assert p.realized_pnl == D("-0.5")
+    assert p.updated_at == TS
+    assert p.side is (PositionSide.LONG if qty > 0 else PositionSide.SHORT)
+
+
+@pytest.mark.parametrize("qty", [D("0.01"), D("-0.01")])
+@pytest.mark.parametrize("value", [D("0"), D("12.5"), D("-12.5")])
+def test_open_position_known_unrealized_any_sign(qty: Decimal, value: Decimal) -> None:
+    assert position(qty=qty, unrealized_pnl=value).unrealized_pnl == value
+
+
+def test_zero_unrealized_is_not_unknown() -> None:
+    assert position(unrealized_pnl=D("0")) != position(unrealized_pnl=None)
+
+
+@pytest.mark.parametrize(
+    "value", [1.5, 0, 1, True, False, "0", D("NaN"), D("sNaN"), D("Infinity"), D("-Infinity")]
+)
+def test_known_unrealized_must_be_finite_decimal(value: Any) -> None:
+    with pytest.raises(DomainValidationError, match=r"^unrealized_pnl must be"):
+        position(unrealized_pnl=value)
+
+
+def test_unrealized_follows_the_domain_decimal_policy_for_subclasses() -> None:
+    # The domain validates Decimal with isinstance (as for realized_pnl), so a
+    # Decimal subclass is accepted for every numeric field alike.
+    class Sub(Decimal):
+        pass
+
+    assert position(unrealized_pnl=Sub("1"), realized_pnl=Sub("1")).unrealized_pnl == 1
+
+
+@pytest.mark.parametrize(
+    ("mark", "unrealized"),
+    [(None, D("10")), (D("65100"), None), (None, None), (D("65100"), D("1"))],
+)
+def test_mark_price_and_unrealized_are_independent(
+    mark: Decimal | None, unrealized: Decimal | None
+) -> None:
+    p = position(mark_price=mark, unrealized_pnl=unrealized)
+    assert (p.mark_price, p.unrealized_pnl) == (mark, unrealized)
+
+
+def test_unrealized_has_no_default() -> None:
+    values = {k: v for k, v in POSITION.items() if k != "unrealized_pnl"}
+    with pytest.raises(TypeError):
+        Position(**values)
+
+
+@pytest.mark.parametrize("value", [None, 1.5, D("NaN")])
+def test_realized_pnl_stays_required_and_finite(value: Any) -> None:
+    with pytest.raises(DomainValidationError, match=r"^realized_pnl must be"):
+        position(realized_pnl=value)

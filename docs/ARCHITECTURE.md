@@ -197,7 +197,7 @@ app/
 | `Order` | `client_order_id`, `exchange_order_id?`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `status`, `filled_qty`, `avg_fill_price`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version`. Зв'язок з `intent_id` — відкрите питання Phase 5 |
 | `OrderUpdate` | нормалізований звіт біржі про ордер: `client_order_id`, `exchange_order_id`, `status`, `cum_filled_qty`, `avg_price`, `reject_reason`, `exchange_ts` |
 | `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee?`, `fee_asset?`, `is_maker?`, `exchange_ts` (див. нижче про невідомі метадані) |
-| `Position` | `symbol`, `side` / знакова `qty`, `entry_price`, `mark_price`, `unrealized_pnl`, `realized_pnl`, `leverage`, `margin_mode`, `position_margin`, `maintenance_margin`, `liquidation_price?`, `updated_at` |
+| `Position` | `symbol`, `side` / знакова `qty`, `entry_price`, `mark_price`, `unrealized_pnl?`, `realized_pnl` (gross), `leverage`, `margin_mode`, `position_margin`, `maintenance_margin`, `liquidation_price?`, `updated_at` (див. нижче про невідомий unrealized PnL) |
 | `Balance` | `asset`, `wallet_balance`, `equity`, `available`, `margin_used`, `updated_at` |
 | `FundingPayment` | `symbol`, `amount` (знакова), `rate`, `position_qty`, `ts` |
 
@@ -208,6 +208,16 @@ app/
 - Поля обов'язкові при створенні (без defaults): джерело явно заявляє «невідомо».
 - Реальні адаптери зберігають фактичні `fee`, `fee_asset` і роль ліквідності, якщо біржа їх надає; `None` — лише для джерел, які цієї інформації справді не мають (наприклад, симулятор без моделі комісій і книги).
 - **Правило PnL:** будь-який розрахунок net PnL, сумарних комісій, fee-adjusted return чи прибутковості після комісій **fail closed** або явно позначає результат як incomplete, якщо хоча б один задіяний `Fill.fee is None`. `None` ніколи не трактується як нуль. (Portfolio / PnL ще не реалізовані.)
+
+**Невідомий unrealized PnL у `Position`.**
+
+- `unrealized_pnl: Decimal | None`, без default: джерело явно передає або оцінку, або `None` — «не обчислено / невідомо». `None` ніколи не трактується як нуль і не робить невідомою саму позицію: `qty`, сторона, `entry_price`, `realized_pnl` і `updated_at` лишаються відомими.
+- FLAT (`qty == 0`): `entry_price is None` і **рівно** `unrealized_pnl == 0` (без відкритої позиції нереалізований PnL справді нульовий); `None` чи ненульове значення — помилка.
+- OPEN: `entry_price > 0`; `unrealized_pnl` — `None` або скінченний `Decimal` будь-якого знаку, включно з нулем (відома нульова оцінка).
+- `mark_price` і `unrealized_pnl` незалежні: допустимі оцінка без mark price і mark price без оцінки; domain не вгадує походження даних.
+- `realized_pnl` — **gross** реалізований торговий PnL з різниці цін виконання, **до** комісій, funding, процентів і rebates; ці грошові потоки обліковуються окремо майбутніми шарами accounting / portfolio. Відповідність конкретного поля Bybit цій семантиці не стверджується — її перевірять за офіційною документацією перед реалізацією live account adapter.
+- **Правило оцінки:** розрахунок, якому потрібна поточна оцінка відкритої позиції (equity, сумарний unrealized, drawdown, поточна прибутковість з урахуванням комісій, ризик-перевірки, що залежать від unrealized / equity), при `unrealized_pnl is None` **fail closed** або явно повертає incomplete / unknown результат. Загального заборонного правила для exposure немає: метрика fail closed лише тоді, коли для її конкретної формули бракує потрібних даних (наприклад, exposure з `qty` і ціни не потребує `unrealized_pnl`). Ці розрахунки ще не реалізовані.
+- Рішення для майбутнього simulation API: `get_position(symbol) -> Position | None`, де `None` — по символу ще не було fills / стану позиції; так `updated_at` не вигадується. Після першого fill `updated_at = fill.exchange_ts`.
 
 ### Стратегія Grid
 
