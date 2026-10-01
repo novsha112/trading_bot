@@ -31,6 +31,11 @@ from app.exchanges.errors import (
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
 from app.exchanges.protocols import TradingClient
 from app.exchanges.simulated import SimulatedExchange
+from app.exchanges.simulated_fees import (
+    LiquidityRole,
+    SimulatedFeePolicy,
+    TradingFeeSchedule,
+)
 
 D = Decimal
 T0 = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
@@ -2565,3 +2570,175 @@ async def test_failure_in_position_preparation_after_earlier_order(
     assert await snapshot(exchange, "a", "b") == before
     fills = await fill_at(exchange, "110")
     assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("4")), ("b", D("4"))]
+
+
+# === trading fees ===============================================================
+
+
+def fee_exchange(
+    role: LiquidityRole = LiquidityRole.TAKER,
+    *,
+    maker: str = "-0.0001",
+    taker: str = "0.001",
+    clock: Any = None,
+) -> SimulatedExchange:
+    policy = SimulatedFeePolicy(
+        schedule=TradingFeeSchedule(maker_rate=D(maker), taker_rate=D(taker), fee_asset="USDT"),
+        liquidity_role=role,
+    )
+    return SimulatedExchange(clock=clock or ManualClock(T0), instruments=SPECS, fees=policy)
+
+
+@pytest.mark.asyncio
+async def test_no_fee_mode_keeps_unknown_fee_metadata(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100")))
+
+    (fill,) = await fill_at(exchange, "100")
+
+    assert (fill.fee, fill.fee_asset, fill.is_maker) == (None, None, None)
+
+
+def test_fees_argument_must_be_a_policy(clock: ManualClock) -> None:
+    with pytest.raises(TypeError, match="SimulatedFeePolicy"):
+        SimulatedExchange(clock=clock, instruments=SPECS, fees="0.001")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "fee", "is_maker"),
+    [(LiquidityRole.TAKER, D("0.5"), False), (LiquidityRole.MAKER, D("-0.05"), True)],
+)
+async def test_fill_carries_fee_for_the_configured_role(
+    role: LiquidityRole, fee: Decimal, is_maker: bool
+) -> None:
+    exchange = fee_exchange(role)
+    await exchange.place_order(request(price=D("100"), qty=D("5")))
+
+    (fill,) = await fill_at(exchange, "100")
+
+    assert (fill.fee, fill.fee_asset, fill.is_maker) == (fee, "USDT", is_maker)
+
+
+@pytest.mark.asyncio
+async def test_post_only_does_not_imply_maker() -> None:
+    exchange = fee_exchange(LiquidityRole.TAKER)
+    await exchange.place_order(request(price=D("100"), time_in_force=TimeInForce.POST_ONLY))
+
+    (fill,) = await fill_at(exchange, "100")
+
+    assert fill.is_maker is False  # the configured assumption, not a book reconstruction
+
+
+@pytest.mark.asyncio
+async def test_partial_fills_each_pay_their_own_fee() -> None:
+    exchange = fee_exchange()
+    await exchange.place_order(request(price=D("110"), qty=D("10")))
+
+    f1 = await partial(exchange, "100", "2")
+    f2 = await partial(exchange, "110", "3")
+    f3 = await partial(exchange, "90", "5")
+
+    assert [f.fee for f in (*f1, *f2, *f3)] == [D("0.2"), D("0.33"), D("0.45")]
+    update = await update_of(exchange)
+    assert (update.status, update.cum_filled_qty) == (OrderStatus.FILLED, D("10"))
+
+
+@pytest.mark.asyncio
+async def test_zero_fee_is_known_and_distinct_from_unknown() -> None:
+    exchange = fee_exchange(taker="0")
+    await exchange.place_order(request(price=D("100")))
+
+    (fill,) = await fill_at(exchange, "100")
+
+    assert fill.fee == 0
+    assert fill.fee is not None
+    assert fill.fee_asset == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_fee_and_auto_cancel_without_fee() -> None:
+    exchange = fee_exchange()
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "10", "110"))
+
+    fills = await fill_at(exchange, "110")
+
+    assert [(f.client_order_id, f.qty, f.fee) for f in fills] == [("ro", D("5"), D("0.55"))]
+    assert (await update_of(exchange, "ro")).status is OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_position_realized_pnl_stays_gross_with_fees() -> None:
+    exchange = fee_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("10"), price=D("110"))
+    )
+
+    (close,) = await fill_at(exchange, "110")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.realized_pnl) == (D("0"), D("100"))  # not 100 - fees
+    assert close.fee == D("1.1")
+
+
+@pytest.mark.asyncio
+async def test_fee_scenario_is_deterministic() -> None:
+    async def run() -> tuple[object, ...]:
+        exchange = fee_exchange(LiquidityRole.MAKER)
+        await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("3")))
+        await exchange.place_order(
+            request(client_order_id="b", side=Side.SELL, price=D("90"), qty=D("2"))
+        )
+        fills = [*await partial(exchange, "95", "4"), *await fill_at(exchange, "91")]
+        return tuple(fills), await position_of(exchange)
+
+    assert await run() == await run()
+
+
+@pytest.mark.asyncio
+async def test_failed_fee_calculation_leaves_everything_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = fee_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "4", "110"))
+    await exchange.place_order(
+        request(client_order_id="b", side=Side.SELL, qty=D("2"), price=D("110"))
+    )
+    await exchange.place_order(ro("c", Side.SELL, "20", "110"))
+    before = await snapshot(exchange, "a", "b", "c")
+    real_fee = SimulatedFeePolicy.fill_fee
+    calls: list[Decimal] = []
+
+    def failing_third(self: SimulatedFeePolicy, *, price: Decimal, qty: Decimal) -> Any:
+        calls.append(qty)
+        if len(calls) == 3:
+            raise ArithmeticError("injected fee failure")
+        return real_fee(self, price=price, qty=qty)
+
+    monkeypatch.setattr(SimulatedFeePolicy, "fill_fee", failing_third)
+    with pytest.raises(ArithmeticError, match="injected"):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert calls == [D("4"), D("2"), D("4")]
+    assert await snapshot(exchange, "a", "b", "c") == before
+    fills = await fill_at(exchange, "110")
+    assert [(f.client_order_id, f.qty, f.fee) for f in fills] == [
+        ("a", D("4"), D("0.44")),
+        ("b", D("2"), D("0.22")),
+        ("c", D("4"), D("0.44")),
+    ]
+    assert (await update_of(exchange, "c")).status is OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_retry_and_refill_do_not_create_fees() -> None:
+    exchange = fee_exchange()
+    original = await exchange.place_order(request(price=D("100")))
+    (fill,) = await fill_at(exchange, "100")
+
+    assert await exchange.place_order(request(price=D("100"))) == original
+    assert await fill_at(exchange, "100") == []
+    assert fill.fee == D("0.0001")

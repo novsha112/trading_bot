@@ -31,8 +31,8 @@ Current scope:
   execution price is not checked against ``tick_size``: it is an external
   observation, not a new order price. ``Fill.qty`` is the quantity of that execution. There
   is no order book, bid/ask, depth, spread, slippage or latency: the caller fully
-  determines price and liquidity. Fee, fee asset and liquidity role are unknown
-  (``None``), never invented; POST_ONLY is not claimed to be maker.
+  determines price and liquidity. Fee data and liquidity role come only from an
+  explicit fee policy (below); POST_ONLY alone is never claimed to be maker.
 * Average fill price = exact cumulative notional / cumulative qty, divided with an
   explicit context (``AVERAGE_PRICE_PRECISION`` significant digits,
   ROUND_HALF_EVEN), independent of the global decimal context; the first fill's
@@ -50,7 +50,12 @@ Current scope:
   position. A crossed reduce-only order that can no longer reduce (position flat
   or on the other side, before or after its fill) is CANCELED with its fills kept;
   such a cancel uses no execution id and no budget.
-* No fees, balances, leverage or margin. Requests whose outcome cannot be
+* Fees are opt-in: ``fees=SimulatedFeePolicy(schedule, liquidity_role)`` gives
+  every fill ``fee = execution price * fill qty * rate`` of the configured role
+  (``simulated_fees``), its fee asset and ``is_maker`` from that assumed role;
+  without it fee, fee asset and liquidity role stay None (unknown, not zero).
+  Fees are computed while preparing the batch. Position realized PnL stays gross.
+* No balances, leverage or margin. Requests whose outcome cannot be
   determined without them are refused (``ExchangeRejectedError``): MARKET (no
   execution price model), LIMIT IOC / FOK (never rest on the book, their outcome
   depends on matching).
@@ -121,6 +126,7 @@ from app.exchanges.errors import (
     ExchangeRequestValidationError,
 )
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
+from app.exchanges.simulated_fees import SimulatedFeePolicy
 from app.exchanges.simulated_positions import SimulatedPositionLedger
 
 EXCHANGE_ORDER_ID_PREFIX: Final = "SIM-"
@@ -239,9 +245,15 @@ def _build_fill(
     execution_price: Decimal,
     qty: Decimal,
     exchange_ts: datetime,
+    fees: SimulatedFeePolicy | None,
 ) -> Fill:
-    """One execution of ``qty`` of ``record``. Fee data and liquidity role are not
-    modeled."""
+    """One execution of ``qty`` of ``record``. Without a fee policy the fee, fee
+    asset and liquidity role are unknown (None), never zero."""
+    fee: Decimal | None = None
+    fee_asset: str | None = None
+    is_maker: bool | None = None
+    if fees is not None:
+        fee, fee_asset, is_maker = fees.fill_fee(price=execution_price, qty=qty)
     return Fill(
         exec_id=exec_id,
         exchange_order_id=record.exchange_order_id,
@@ -250,9 +262,9 @@ def _build_fill(
         side=record.request.side,
         price=execution_price,
         qty=qty,
-        fee=None,
-        fee_asset=None,
-        is_maker=None,
+        fee=fee,
+        fee_asset=fee_asset,
+        is_maker=is_maker,
         exchange_ts=exchange_ts,
     )
 
@@ -369,9 +381,25 @@ def _require_symbol(symbol: object) -> str:
 class SimulatedExchange:
     """In-memory ``TradingClient`` with deterministic ids and injected time."""
 
-    __slots__ = ("_clock", "_exec_sequence", "_instruments", "_orders", "_positions", "_sequence")
+    __slots__ = (
+        "_clock",
+        "_exec_sequence",
+        "_fees",
+        "_instruments",
+        "_orders",
+        "_positions",
+        "_sequence",
+    )
 
-    def __init__(self, *, clock: Clock, instruments: tuple[InstrumentSpec, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Clock,
+        instruments: tuple[InstrumentSpec, ...] = (),
+        fees: SimulatedFeePolicy | None = None,
+    ) -> None:
+        if fees is not None and not isinstance(fees, SimulatedFeePolicy):
+            raise TypeError("fees must be a SimulatedFeePolicy or None")
         registry: dict[str, InstrumentSpec] = {}
         for spec in tuple(instruments):
             if not isinstance(spec, InstrumentSpec):
@@ -386,6 +414,8 @@ class SimulatedExchange:
         self._sequence = 0
         self._exec_sequence = 0
         self._positions = SimulatedPositionLedger()
+        # Immutable for the lifetime of the simulator; None = fees not modeled.
+        self._fees = fees
 
     def __repr__(self) -> str:
         return f"SimulatedExchange(orders={len(self._orders)})"
@@ -555,6 +585,7 @@ class SimulatedExchange:
                     execution_price=execution_price,
                     qty=qty,
                     exchange_ts=batch_ts,
+                    fees=self._fees,
                 )
                 filled = _apply_fill(record, execution_price=execution_price, qty=qty, at=batch_ts)
                 positions.apply(fill)
