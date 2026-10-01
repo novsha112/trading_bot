@@ -173,20 +173,24 @@ def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
     )
 
 
+def _exact_unrealized(state: _PositionState, mark: MarkQuote | None) -> Fraction | None:
+    """The only valuation formula: exact unrealized PnL from the cost basis.
+    Long ``mark * qty - cost``, short ``cost - mark * |qty|``, flat 0; None when an
+    open position has no mark."""
+    if state.qty == 0:
+        return _ZERO
+    if mark is None:
+        return None
+    value = Fraction(mark.price) * Fraction(state.qty.copy_abs())
+    return value - state.entry_cost if state.qty > 0 else state.entry_cost - value
+
+
 def _to_position(state: _PositionState, mark: MarkQuote | None) -> Position:
-    """Published position, valued at ``mark`` (if known) from the exact basis:
-    long ``mark * qty - cost``, short ``cost - mark * |qty|``, flat 0."""
+    """Published position, valued at ``mark`` (if known) from the exact basis."""
     is_flat = state.qty == 0
     open_qty = Fraction(state.qty.copy_abs())
-    unrealized: Decimal | None
-    if is_flat:
-        unrealized = _ZERO_DECIMAL
-    elif mark is None:
-        unrealized = None
-    else:
-        value = Fraction(mark.price) * open_qty
-        exact = value - state.entry_cost if state.qty > 0 else state.entry_cost - value
-        unrealized = _publish(exact)
+    exact_unrealized = _exact_unrealized(state, mark)
+    unrealized = None if exact_unrealized is None else _publish(exact_unrealized)
     updated_at = state.last_fill_at
     if mark is not None and mark.at > updated_at:
         updated_at = mark.at
@@ -267,6 +271,18 @@ class SimulatedPositionLedger:
 
     def __repr__(self) -> str:
         return f"SimulatedPositionLedger(symbols={len(self._states)})"
+
+    def exact_unrealized_total(self, marks: Mapping[str, MarkQuote]) -> Fraction | None:
+        """Exact sum of unrealized PnL over all positions valued at ``marks``
+        (before any rounding). Flat positions count 0 and need no mark; None if any
+        open position has no mark (an unknown value is never read as zero)."""
+        total = _ZERO
+        for symbol, state in self._states.items():
+            value = _exact_unrealized(state, marks.get(symbol))
+            if value is None:
+                return None
+            total += value
+        return total
 
     def get_position(self, symbol: str, *, mark: MarkQuote | None = None) -> Position | None:
         """Current position, or None if no fill of ``symbol`` was ever applied."""

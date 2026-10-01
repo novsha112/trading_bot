@@ -290,3 +290,54 @@ def test_module_has_no_forbidden_dependencies() -> None:
         "qty",
     ):
         assert banned not in source, banned
+
+
+# --- exact cash and equity publication -----------------------------------------------
+
+
+def test_exact_cash_matches_components() -> None:
+    cash = ledger("100")
+    apply(cash, "a", realized=F(50, 3), fee=D("0.1"))
+
+    assert cash.exact_cash() == F(100) + F(50, 3) - F(1, 10)
+
+
+def test_equity_state_publishes_exact_sum() -> None:
+    state = simulated_accounting.equity_state(
+        asset="USDT", exact_cash=F(10000), exact_unrealized=F(60)
+    )
+
+    assert state == simulated_accounting.EquityState(
+        asset="USDT", cash=D("10000"), unrealized_pnl=D("60"), equity=D("10060")
+    )
+
+
+def test_equity_state_rounds_each_field_from_exact_values() -> None:
+    state = simulated_accounting.equity_state(
+        asset="USDT", exact_cash=F(1, 3), exact_unrealized=F(2, 3)
+    )
+
+    # Each field is rounded on its own; the exact sum 1 is published exactly.
+    assert state.cash == D("0.3333333333333333333333333333333333333333")
+    assert state.unrealized_pnl == D("0.6666666666666666666666666666666666666667")
+    assert state.equity == D("1")
+
+
+def test_equity_state_ignores_the_global_decimal_context() -> None:
+    def run() -> object:
+        return simulated_accounting.equity_state(
+            asset="USDT", exact_cash=F(123456789, 1000), exact_unrealized=F(-1, 7)
+        )
+
+    baseline = run()
+    with localcontext() as context:
+        context.prec = 2
+        low = run()
+
+    assert low == baseline
+
+
+def test_equity_state_has_no_available_or_margin() -> None:
+    fields = set(simulated_accounting.EquityState.__dataclass_fields__)
+
+    assert fields == {"asset", "cash", "unrealized_pnl", "equity"}

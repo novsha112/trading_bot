@@ -23,7 +23,7 @@ from app.domain.instrument import InstrumentSpec
 from app.domain.positions import Position
 from app.exchanges.models import OrderRef, OrderRequest
 from app.exchanges.simulated import SimulatedExchange
-from app.exchanges.simulated_accounting import SimulatedCashConfig
+from app.exchanges.simulated_accounting import CashState, EquityState, SimulatedCashConfig
 from app.exchanges.simulated_fees import LiquidityRole, SimulatedFeePolicy, TradingFeeSchedule
 from app.exchanges.simulated_positions import MarkQuote, SimulatedPositionLedger
 
@@ -336,3 +336,37 @@ async def test_simulation_does_not_modify_the_global_context() -> None:
     await exchange.get_cash_state()
 
     assert snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_equity_scenario_is_context_independent() -> None:
+    async def run() -> tuple[object, ...]:
+        exchange = new_exchange(cash=True)
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("101.37"))
+        await trade(exchange, order("a", Side.BUY, "3.333", "100"), "100")
+        await trade(exchange, order("b", Side.BUY, "7.777", "100.01"), "100.01")
+        await trade(exchange, order("c", Side.SELL, "5.555", "103.33"), "103.33")
+        await exchange.place_order(order("ro", Side.SELL, "9.999", "104.44", reduce_only=True))
+        await exchange.fill_crossed_limit_orders(
+            symbol="BTCUSDT", execution_price=D("104.44"), available_qty=D("3.333")
+        )
+        return (
+            await exchange.get_position(symbol="BTCUSDT"),
+            await exchange.get_cash_state(),
+            await exchange.get_equity_state(),
+        )
+
+    before = (getcontext().prec, getcontext().rounding, dict(getcontext().traps))
+    position, cash, equity = await in_both_contexts_async(run)
+    after = (getcontext().prec, getcontext().rounding, dict(getcontext().traps))
+
+    assert before == after
+    assert isinstance(position, Position)
+    assert position.qty == D("2.222")  # 3.333 + 7.777 - 5.555 - 3.333
+    assert isinstance(cash, CashState)
+    assert isinstance(equity, EquityState)
+    assert position.unrealized_pnl is not None
+    # All values here are terminating, so the published fields add up exactly.
+    assert cash.cash == D("10000") + position.realized_pnl - cash.trading_fees
+    assert equity.unrealized_pnl == position.unrealized_pnl
+    assert equity.equity == cash.cash + position.unrealized_pnl

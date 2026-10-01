@@ -662,3 +662,60 @@ def test_batch_position_uses_prepared_state_and_mark() -> None:
     assert (p.qty, p.unrealized_pnl) == (D("10"), D("100"))
     assert ledger.get_position("BTCUSDT") is None
     assert batch.position("ETHUSDT", mark=None) is None
+
+
+# --- exact unrealized aggregate --------------------------------------------------------
+
+
+def test_exact_unrealized_total_none_without_positions_is_zero() -> None:
+    from fractions import Fraction
+
+    assert SimulatedPositionLedger().exact_unrealized_total({}) == Fraction(0)
+
+
+def test_exact_unrealized_total_sums_exact_values() -> None:
+    from fractions import Fraction
+
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("2", "100"))
+    ledger.apply_fill(buy("1", "101"))  # basis 301/3
+    ledger.apply_fill(sell("1", "50", symbol="ETHUSDT"))
+
+    total = ledger.exact_unrealized_total({"BTCUSDT": mark("100"), "ETHUSDT": mark("60")})
+
+    # BTC: 300 - 301 = -1; ETH short: 50 - 60 = -10
+    assert total == Fraction(-11)
+
+
+def test_exact_unrealized_total_unknown_if_any_open_position_lacks_a_mark() -> None:
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100"))
+    ledger.apply_fill(sell("1", "50", symbol="ETHUSDT"))
+
+    assert ledger.exact_unrealized_total({"BTCUSDT": mark("110")}) is None
+
+
+def test_exact_unrealized_total_flat_needs_no_mark() -> None:
+    from fractions import Fraction
+
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100"))
+    ledger.apply_fill(sell("1", "120"))
+
+    assert ledger.exact_unrealized_total({}) == Fraction(0)
+
+
+def test_exact_unrealized_total_matches_published_values() -> None:
+    from fractions import Fraction
+
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("2", "100"))
+    ledger.apply_fill(buy("1", "110"))  # basis 310/3
+    quote = mark("105")
+
+    total = ledger.exact_unrealized_total({"BTCUSDT": quote})
+    p = ledger.get_position("BTCUSDT", mark=quote)
+
+    assert total == Fraction(5)
+    assert p is not None
+    assert p.unrealized_pnl == D("5")

@@ -50,6 +50,10 @@ Current scope:
   fills have separate time streams: a stale mark is rejected, a newer mark never
   makes a fill stale; ``Position.updated_at`` is the later of both. Marks never
   move cash.
+* Equity: ``get_equity_state()`` is a read model (never stored) of exact cash plus
+  the exact unrealized PnL of all positions at the stored marks; None without
+  cash accounting or while any open position has no mark. Domain ``Balance`` is
+  not used (no available / margin semantics).
 * Reduce-only (deterministic simulator policy, not a claim about any exchange):
   a new reduce-only order must reduce the current position (SELL a long, BUY a
   short), else ``ExchangeRejectedError``; its size may exceed the position. At
@@ -142,8 +146,10 @@ from app.exchanges.errors import (
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
 from app.exchanges.simulated_accounting import (
     CashState,
+    EquityState,
     SimulatedCashConfig,
     SimulatedCashLedger,
+    equity_state,
 )
 from app.exchanges.simulated_fees import SimulatedFeePolicy
 from app.exchanges.simulated_positions import MarkQuote, SimulatedPositionLedger
@@ -693,6 +699,25 @@ class SimulatedExchange:
         the accounting asset, or None when cash accounting is not configured. Cash
         is not equity (no unrealized PnL). Never reads the clock."""
         return None if self._cash is None else self._cash.state()
+
+    async def get_equity_state(self) -> EquityState | None:
+        """Simulation-only derived read model (not part of ``TradingClient``):
+        ``equity = exact cash + exact unrealized PnL of all positions`` at the
+        stored marks, rounded only when published.
+
+        None when cash accounting is off, or when any open position has no mark
+        (equity is unknown, never computed with a zero in its place). Flat
+        positions need no mark. Pure: no clock read, no state change."""
+        if self._cash is None:
+            return None
+        unrealized = self._positions.exact_unrealized_total(self._marks)
+        if unrealized is None:
+            return None
+        return equity_state(
+            asset=self._cash.config.asset,
+            exact_cash=self._cash.exact_cash(),
+            exact_unrealized=unrealized,
+        )
 
     async def get_position(self, *, symbol: str) -> Position | None:
         """Simulation-only read (not part of ``TradingClient``): the net position of

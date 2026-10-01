@@ -3412,3 +3412,327 @@ async def test_failed_revaluation_keeps_old_mark(
 
     assert await position_of(exchange) == before
     assert before.mark_price == D("105")
+
+
+# === equity read model ============================================================
+
+
+async def equity_parts(exchange: SimulatedExchange) -> tuple[Decimal, Decimal, Decimal] | None:
+    state = await exchange.get_equity_state()
+    return None if state is None else (state.cash, state.unrealized_pnl, state.equity)
+
+
+def no_fee_cash_exchange(clock: Any = None) -> SimulatedExchange:
+    return cash_exchange(taker="0", maker="0", clock=clock)
+
+
+@pytest.mark.asyncio
+async def test_no_cash_accounting_means_no_equity(exchange: SimulatedExchange) -> None:
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "1")
+
+    assert await exchange.get_equity_state() is None
+
+
+@pytest.mark.asyncio
+async def test_equity_without_positions_is_cash() -> None:
+    exchange = cash_exchange()
+
+    state = await exchange.get_equity_state()
+
+    assert state is not None
+    assert (state.asset, state.cash, state.unrealized_pnl, state.equity) == (
+        "USDT",
+        D("10000"),
+        D("0"),
+        D("10000"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_flat_positions_need_no_mark() -> None:
+    exchange = no_fee_cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("10"), price=D("110"))
+    )
+    await fill_at(exchange, "110")
+
+    assert await equity_parts(exchange) == (D("10100"), D("0"), D("10100"))
+
+
+@pytest.mark.asyncio
+async def test_open_position_without_mark_makes_equity_unknown() -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+
+    assert await exchange.get_equity_state() is None
+    assert await exchange.get_cash_state() is not None  # cash itself stays known
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "price", "unrealized"),
+    [
+        (Side.BUY, "110", "100"),
+        (Side.BUY, "90", "-100"),
+        (Side.BUY, "100", "0"),
+        (Side.SELL, "90", "100"),
+        (Side.SELL, "110", "-100"),
+        (Side.SELL, "100", "0"),
+    ],
+)
+async def test_equity_long_and_short(side: Side, price: str, unrealized: str) -> None:
+    exchange = no_fee_cash_exchange()
+    await open_position(exchange, side, "10")
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D(price))
+
+    assert await equity_parts(exchange) == (
+        D("10000"),
+        D(unrealized),
+        D("10000") + D(unrealized),
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_positions_all_marked_or_unknown() -> None:
+    exchange = no_fee_cash_exchange()
+    await open_position(exchange, Side.BUY, "10")  # BTC long @100
+    await exchange.place_order(
+        request(client_order_id="eth", symbol="ETHUSDT", side=Side.SELL, qty=D("2"), price=D("50"))
+    )
+    await exchange.fill_crossed_limit_orders(symbol="ETHUSDT", execution_price=D("50"))
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))  # +100
+
+    assert await exchange.get_equity_state() is None  # ETH has no mark
+
+    await exchange.set_mark_price(symbol="ETHUSDT", mark_price=D("70"))  # short: -40
+    assert await equity_parts(exchange) == (D("10000"), D("60"), D("10060"))
+
+
+@pytest.mark.asyncio
+async def test_mark_updates_move_equity_not_cash() -> None:
+    clock = ManualClock(T0)
+    exchange = cash_exchange(clock=clock)
+    await open_position(exchange, Side.BUY, "10")  # fee 1 -> cash 9999
+
+    results = []
+    for price in ("100", "110", "90"):
+        clock.advance(timedelta(seconds=1))
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D(price))
+        results.append(await equity_parts(exchange))
+
+    assert results == [
+        (D("9999"), D("0"), D("9999")),
+        (D("9999"), D("100"), D("10099")),
+        (D("9999"), D("-100"), D("9899")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_close_transfers_unrealized_to_cash() -> None:
+    exchange = no_fee_cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "10")
+    assert await equity_parts(exchange) == (D("10000"), D("100"), D("10100"))
+    await exchange.place_order(
+        request(client_order_id="s", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+
+    await fill_at(exchange, "110")
+
+    assert await equity_parts(exchange) == (D("10040"), D("60"), D("10100"))
+
+
+@pytest.mark.asyncio
+async def test_partial_close_with_fee_reduces_equity_by_the_fee_only() -> None:
+    exchange = cash_exchange()  # taker 0.001
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "10")  # fee 1
+    before = await equity_parts(exchange)
+    await exchange.place_order(
+        request(client_order_id="s", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+
+    (fill,) = await fill_at(exchange, "110")  # fee 0.44
+
+    after = await equity_parts(exchange)
+    assert before == (D("9999"), D("100"), D("10099"))
+    assert after == (D("10038.56"), D("60"), D("10098.56"))
+    assert before[2] - after[2] == fill.fee
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("close", "equity"), [("110", "10100"), ("105", "10050")])
+async def test_exact_close_at_or_away_from_mark(close: str, equity: str) -> None:
+    exchange = no_fee_cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "10")
+    assert (await equity_parts(exchange))[2] == D("10100")  # type: ignore[index]
+    await exchange.place_order(
+        request(client_order_id="c", side=Side.SELL, qty=D("10"), price=D(close))
+    )
+
+    await fill_at(exchange, close)
+
+    assert await equity_parts(exchange) == (D(equity), D("0"), D(equity))
+
+
+@pytest.mark.asyncio
+async def test_reversal_equity() -> None:
+    exchange = cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("105"))
+    await open_position(exchange, Side.BUY, "10")  # fee 1
+    await exchange.place_order(
+        request(client_order_id="rev", side=Side.SELL, qty=D("15"), price=D("110"))
+    )
+
+    await fill_at(exchange, "110")  # realized +100, fee 1.65, short 5 @110 -> +25
+
+    assert await equity_parts(exchange) == (D("10097.35"), D("25"), D("10122.35"))
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_partial_close_equity() -> None:
+    exchange = no_fee_cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("120"))
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("ro", Side.SELL, "4", "110"))
+
+    await fill_at(exchange, "110")  # +40 realized; 6 left at mark 120 -> +120
+
+    assert await equity_parts(exchange) == (D("10040"), D("120"), D("10160"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "maker", "taker", "expected"),
+    [
+        (LiquidityRole.TAKER, "0", "0", "10000"),  # zero fee
+        (LiquidityRole.TAKER, "0", "0.001", "9999"),  # fee
+        (LiquidityRole.MAKER, "-0.0001", "0.001", "10000.1"),  # rebate
+    ],
+)
+async def test_fees_and_rebates_reach_equity_through_cash(
+    role: LiquidityRole, maker: str, taker: str, expected: str
+) -> None:
+    exchange = cash_exchange(role=role, maker=maker, taker=taker)
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("100"))
+
+    await open_position(exchange, Side.BUY, "10")
+
+    assert await equity_parts(exchange) == (D(expected), D("0"), D(expected))
+
+
+@pytest.mark.asyncio
+async def test_equity_with_repeating_basis_is_exact() -> None:
+    exchange = no_fee_cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("120"))
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("2")))
+    await fill_at(exchange, "100")
+    await exchange.place_order(request(client_order_id="b", price=D("110"), qty=D("1")))
+    await fill_at(exchange, "110")  # basis 310/3
+    await exchange.place_order(
+        request(client_order_id="s", side=Side.SELL, qty=D("1"), price=D("120"))
+    )
+
+    await fill_at(exchange, "120")  # realized 50/3, remaining 2 @310/3 -> 100/3
+
+    state = await exchange.get_equity_state()
+    assert state is not None
+    assert state.equity == D("10050")  # exact 10000 + 50/3 + 100/3
+    assert state.cash == D("10016.66666666666666666666666666666666667")
+    assert state.unrealized_pnl == D("33.33333333333333333333333333333333333333")
+
+
+@pytest.mark.asyncio
+async def test_equity_ignores_the_global_decimal_context() -> None:
+    async def run() -> object:
+        exchange = cash_exchange()
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("101.37"))
+        await open_position(exchange, Side.BUY, "3.333")
+        return await exchange.get_equity_state()
+
+    baseline = await run()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = "ROUND_UP"
+        low = await run()
+
+    assert low == baseline
+
+
+@pytest.mark.asyncio
+async def test_equity_reads_are_pure() -> None:
+    clock = CountingClock(T0)
+    exchange = cash_exchange(clock=clock)
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("105"))
+    await open_position(exchange, Side.BUY, "10")
+    before = (
+        await exchange.get_cash_state(),
+        await position_of(exchange),
+        exchange._marks.copy(),
+        exchange._sequence,
+        exchange._exec_sequence,
+    )
+    clock.calls = 0
+
+    first = await exchange.get_equity_state()
+    second = await exchange.get_equity_state()
+
+    assert first == second
+    assert clock.calls == 0
+    assert (
+        await exchange.get_cash_state(),
+        await position_of(exchange),
+        exchange._marks.copy(),
+        exchange._sequence,
+        exchange._exec_sequence,
+    ) == before
+
+
+@pytest.mark.asyncio
+async def test_failed_fill_batch_preserves_equity(monkeypatch: pytest.MonkeyPatch) -> None:
+    exchange = cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "4", "110"))
+    await exchange.place_order(ro("b", Side.SELL, "20", "110"))
+    before = await exchange.get_equity_state()
+    real_fee = SimulatedFeePolicy.fill_fee
+    calls: list[Decimal] = []
+
+    def failing_second(self: SimulatedFeePolicy, *, price: Decimal, qty: Decimal) -> Any:
+        calls.append(qty)
+        if len(calls) == 2:
+            raise ArithmeticError("injected")
+        return real_fee(self, price=price, qty=qty)
+
+    monkeypatch.setattr(SimulatedFeePolicy, "fill_fee", failing_second)
+    with pytest.raises(ArithmeticError):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert await exchange.get_equity_state() == before
+
+
+@pytest.mark.asyncio
+async def test_failed_mark_update_preserves_equity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.exchanges import simulated_positions
+
+    clock = ManualClock(T0)
+    exchange = cash_exchange(clock=clock)
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("105"))
+    await open_position(exchange, Side.BUY, "10")
+    before = await exchange.get_equity_state()
+    clock.advance(timedelta(seconds=1))
+
+    def failing(state: Any, mark: Any) -> Any:
+        raise ArithmeticError("injected")
+
+    monkeypatch.setattr(simulated_positions, "_to_position", failing)
+    with pytest.raises(ArithmeticError):
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("90"))
+    monkeypatch.undo()
+
+    assert await exchange.get_equity_state() == before

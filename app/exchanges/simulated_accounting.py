@@ -2,7 +2,9 @@
 
 Derivatives-style model: cash moves only by realized trading PnL and trading fees.
 Opening or increasing a position does not move notional cash; there is no
-mark-to-market, unrealized PnL, equity, funding, margin, deposits or withdrawals.
+mark-to-market, unrealized PnL, funding, margin, deposits or withdrawals in cash.
+``EquityState`` (``cash + unrealized``) is a separate read model published from
+exact components supplied by the caller; this module never values positions.
 
     cash = starting_cash + gross_realized_pnl - trading_fees
 
@@ -73,6 +75,31 @@ class CashState:
     trading_fees: Decimal
     """Cumulative fees; negative fees (rebates) reduce it."""
     cash: Decimal
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EquityState:
+    """Derived account value read model: ``equity = cash + unrealized_pnl``.
+
+    Built at read time from the exact cash and the exact unrealized total of all
+    positions; never stored. Each field is rounded on its own from exact values, so
+    the published fields may differ from their sum in the last digit while the
+    underlying equation is exact. No available balance or margin semantics."""
+
+    asset: str
+    cash: Decimal
+    unrealized_pnl: Decimal
+    equity: Decimal
+
+
+def equity_state(*, asset: str, exact_cash: Fraction, exact_unrealized: Fraction) -> EquityState:
+    """Publish an equity read model from exact components (rounding only)."""
+    return EquityState(
+        asset=asset,
+        cash=_publish(exact_cash),
+        unrealized_pnl=_publish(exact_unrealized),
+        equity=_publish(exact_cash + exact_unrealized),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,16 +206,21 @@ class SimulatedCashLedger:
     def __repr__(self) -> str:
         return f"SimulatedCashLedger(asset={self.config.asset!r}, executions={len(self._entries)})"
 
+    def exact_cash(self) -> Fraction:
+        """Exact ``starting_cash + gross realized PnL - fees`` (before rounding)."""
+        return (
+            Fraction(self.config.starting_cash)
+            + self._totals.realized
+            - Fraction(self._totals.fees)
+        )
+
     def state(self) -> CashState:
-        starting = self.config.starting_cash
-        realized = self._totals.realized
-        fees = self._totals.fees
         return CashState(
             asset=self.config.asset,
-            starting_cash=starting,
-            gross_realized_pnl=_publish(realized),
-            trading_fees=fees,
-            cash=_publish(Fraction(starting) + realized - Fraction(fees)),
+            starting_cash=self.config.starting_cash,
+            gross_realized_pnl=_publish(self._totals.realized),
+            trading_fees=self._totals.fees,
+            cash=_publish(self.exact_cash()),
         )
 
     def begin_batch(self) -> CashBatch:
