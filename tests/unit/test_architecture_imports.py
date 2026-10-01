@@ -3,11 +3,19 @@
 Each top-level package under ``app/`` may import only the ``app`` packages listed
 for it. Packages marked ``None`` have no import restriction defined yet. A new
 top-level package must be added here explicitly, otherwise the test fails.
+
+Packages in ``STDLIB_ONLY_PACKAGES`` may additionally import nothing outside the
+Python standard library (``sys.stdlib_module_names``) besides allowed ``app`` modules.
+
+Imports are read with ``ast`` (modules are never executed). Relative imports are
+resolved against the importing module; one that would climb above the top-level
+package cannot be resolved and is reported (fail closed).
 """
 
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +41,9 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "services": None,
 }
 
+# The domain is the shared language of the system: no frameworks, SDKs or I/O libraries.
+STDLIB_ONLY_PACKAGES: frozenset[str] = frozenset({"domain"})
+
 
 def _module_name(path: Path, root: Path) -> str:
     parts = list(path.relative_to(root.parent).with_suffix("").parts)
@@ -41,15 +52,25 @@ def _module_name(path: Path, root: Path) -> str:
     return ".".join(parts)
 
 
-def _imported_modules(source: str, module: str, is_package: bool) -> set[str]:
-    """Absolute names of all modules imported by the source, relative imports resolved."""
+def _imported_modules(source: str, module: str, is_package: bool) -> tuple[set[str], list[str]]:
+    """Absolute names of all modules imported by the source, relative imports resolved.
+
+    Returns the resolved names and the relative imports that cannot be resolved.
+    """
     package_parts = module.split(".") if is_package else module.split(".")[:-1]
     imported: set[str] = set()
+    unresolved: list[str] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
+                # Level 1 is the current package, each further dot one parent up.
+                # Python rejects climbing above the top-level package; slicing with a
+                # negative bound would silently wrap around instead, so fail closed.
+                if node.level > len(package_parts):
+                    unresolved.append("." * node.level + (node.module or ""))
+                    continue
                 base_parts = package_parts[: len(package_parts) - node.level + 1]
                 base = ".".join([*base_parts, node.module] if node.module else base_parts)
             else:
@@ -59,7 +80,7 @@ def _imported_modules(source: str, module: str, is_package: bool) -> set[str]:
             else:
                 # "from app import strategies" imports a subpackage, not a name.
                 imported.update(f"{base}.{alias.name}" for alias in node.names)
-    return imported
+    return imported, unresolved
 
 
 def find_violations(root: Path) -> list[str]:
@@ -76,12 +97,21 @@ def find_violations(root: Path) -> list[str]:
         allowed = ALLOWED_APP_IMPORTS[package]
         if allowed is None:
             continue
-        imports = _imported_modules(
+        imports, unresolved = _imported_modules(
             path.read_text(encoding="utf-8"), module, is_package=path.name == "__init__.py"
+        )
+        violations.extend(
+            f"{module}: unresolvable relative import '{target}' (beyond top-level package)"
+            for target in unresolved
         )
         for name in sorted(imports):
             name_parts = name.split(".")
             if name_parts[0] != root.name:
+                if package in STDLIB_ONLY_PACKAGES and name_parts[0] not in sys.stdlib_module_names:
+                    violations.append(
+                        f"{module}: imports '{name}' "
+                        f"(third-party; app.{package} allows only the standard library)"
+                    )
                 continue
             if len(name_parts) == 1:
                 # "import app" gives access to every package.
@@ -162,3 +192,78 @@ def test_top_level_app_import_is_forbidden_for_restricted_packages(tmp_path: Pat
     _write(root, "strategies/grid.py", "import app\n")
 
     assert len(find_violations(root)) == 1
+
+
+# --- Domain: standard library only -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("domain/models.py", "import pydantic\n", "'pydantic' (third-party"),
+        (
+            "domain/models.py",
+            "from pydantic import BaseModel\n",
+            "'pydantic.BaseModel' (third-party",
+        ),
+        ("domain/models.py", "import pydantic_settings\n", "'pydantic_settings' (third-party"),
+        ("domain/models.py", "import structlog\n", "'structlog' (third-party"),
+        ("domain/models.py", "import yaml.constructor\n", "'yaml.constructor' (third-party"),
+        ("domain/models.py", "from pybit.unified_trading import HTTP\n", "'pybit"),
+        ("domain/models.py", "import typing_extensions\n", "'typing_extensions' (third-party"),
+        ("domain/models.py", "def f() -> None:\n    import httpx\n", "'httpx' (third-party"),
+        (
+            "domain/models.py",
+            "from app.monitoring import logging\n",
+            "app.domain -> app.monitoring",
+        ),
+        ("domain/models.py", "import app.config\n", "app.domain -> app.config"),
+        ("domain/models.py", "from ..monitoring import configure_logging\n", "-> app.monitoring"),
+        ("domain/sub/models.py", "from ...config import x\n", "-> app.config"),
+        # Too many dots: beyond the top-level package, cannot be resolved.
+        ("domain/models.py", "from ...app.monitoring import x\n", "unresolvable relative import"),
+        ("domain/sub/models.py", "from .....pydantic import x\n", "unresolvable relative import"),
+        ("domain/__init__.py", "from ... import x\n", "unresolvable relative import"),
+    ],
+)
+def test_domain_violations_detected(
+    tmp_path: Path, relative: str, source: str, expected: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        ("domain/models.py", "import datetime\n"),
+        ("domain/models.py", "from decimal import Decimal\n"),
+        ("domain/models.py", "from __future__ import annotations\n"),
+        ("domain/models.py", "import xml.etree.ElementTree\nfrom collections.abc import Mapping\n"),
+        ("domain/models.py", "from .enums import Side\n"),
+        ("domain/models.py", "from . import enums\n"),
+        ("domain/models.py", "from ..domain.enums import Side\n"),
+        ("domain/models.py", "from app.domain.enums import Side\n"),
+        ("domain/models.py", "import app.domain.enums\n"),
+        ("domain/sub/models.py", "from ..validation import require_text\n"),
+        ("domain/__init__.py", "from .enums import Side\n"),
+    ],
+)
+def test_domain_allowed_imports_pass(tmp_path: Path, relative: str, source: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    assert find_violations(root) == []
+
+
+def test_third_party_rule_applies_only_to_restricted_packages(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(root, "monitoring/logging.py", "import structlog\n")
+    _write(root, "config/settings.py", "from pydantic import BaseModel\n")
+
+    assert find_violations(root) == []
