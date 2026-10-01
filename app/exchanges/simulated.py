@@ -8,14 +8,23 @@ exactly as against a real exchange.
 Current scope:
 * LIMIT GTC / POST_ONLY orders are accepted and rest OPEN until filled or canceled.
 * Fills come only from an explicit simulation input,
-  ``fill_crossed_limit_orders(symbol, execution_price)`` (not part of
-  ``TradingClient``, not market data): every OPEN order of that symbol with
-  BUY ``execution_price <= limit`` or SELL ``execution_price >= limit`` is filled
-  completely at ``execution_price`` (price-improvement model). There is no order
-  book, bid/ask, depth, spread, slippage or latency: the caller fully determines
-  the execution price. Fee, fee asset and liquidity role are unknown (``None``),
-  never invented; POST_ONLY is not claimed to be maker.
-* No partial fills, fees, balances or positions. Requests whose outcome cannot be
+  ``fill_crossed_limit_orders(symbol, execution_price, available_qty=None)`` (not
+  part of ``TradingClient``, not market data): every OPEN / PARTIALLY_FILLED order
+  of that symbol with BUY ``execution_price <= limit`` or SELL
+  ``execution_price >= limit`` executes at ``execution_price`` (price-improvement
+  model). ``available_qty=None`` fills each crossed order's remaining quantity;
+  otherwise it is the total quantity for the whole batch, allocated in
+  (created_at, client_order_id) order: ``min(remaining, still available)``, one
+  fill per order per call. ``Fill.qty`` is the quantity of that execution. There
+  is no order book, bid/ask, depth, spread, slippage or latency: the caller fully
+  determines price and liquidity. Fee, fee asset and liquidity role are unknown
+  (``None``), never invented; POST_ONLY is not claimed to be maker.
+* Average fill price = exact cumulative notional / cumulative qty, divided with an
+  explicit context (``AVERAGE_PRICE_PRECISION`` significant digits,
+  ROUND_HALF_EVEN), independent of the global decimal context; the first fill's
+  average is its execution price. Quantities and notionals are exact (fail closed
+  if they need more than ``_EXACT_PRECISION`` digits).
+* No fees, balances or positions. Requests whose outcome cannot be
   determined without them are refused (``ExchangeRejectedError``): MARKET (no
   execution price model), LIMIT IOC / FOK (never rest on the book, their outcome
   depends on matching), ``reduce_only`` (no position model).
@@ -26,18 +35,22 @@ Semantics:
   any state of the order; different terms raise ``ExchangeDuplicateOrderError``.
 * Exchange order ids are opaque strings from a per-instance monotonic sequence,
   assigned only to accepted orders.
-* ``cancel_order``: OPEN -> CANCELED. Unknown order or an already final order ->
+* ``cancel_order``: OPEN / PARTIALLY_FILLED -> CANCELED, keeping the filled
+  quantity and average. Unknown order or an already final order ->
   ``ExchangeRejectedError`` without any state change (deterministic on repeats).
 * ``get_order``: lookup by symbol + ``client_order_id``; another symbol is a
   different namespace -> ``None``. A given ``exchange_order_id`` that contradicts the
   order -> ``ExchangeRejectedError`` (never ``None``: the order exists).
-* ``get_open_orders``: active orders of one symbol, by (created_at, client_order_id).
+* ``get_open_orders``: active (OPEN, PARTIALLY_FILLED) orders of one symbol, by
+  (created_at, client_order_id).
 * Fill batches: crossed orders are processed in (created_at, client_order_id)
   order (a simulation determinism rule, not exchange price-time priority) with
   consecutive execution ids from a per-instance sequence. The clock is read once
   per batch that fills anything; all fills and order updates of the batch carry
   that time. A batch is all-or-nothing: every fill and new order record is built
-  first, then the state and the execution sequence are committed together.
+  first, then the state and the execution sequence are committed together. A
+  record violating the status / fill invariants raises before anything is
+  committed and is never repaired.
 * All timestamps come from the injected ``Clock``. Nothing is ever ambiguous: there
   is no transport.
 
@@ -48,7 +61,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
-from decimal import Decimal
+from decimal import (
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    DecimalException,
+    DivisionByZero,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+)
 from typing import Final
 
 from app.domain.clock import Clock
@@ -66,9 +88,29 @@ from app.exchanges.models import OrderAck, OrderRef, OrderRequest
 
 EXCHANGE_ORDER_ID_PREFIX: Final = "SIM-"
 EXEC_ID_PREFIX: Final = "SIM-EXEC-"
-_ACTIVE_STATUSES: Final = frozenset({OrderStatus.OPEN})
+_ACTIVE_STATUSES: Final = frozenset({OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED})
 _RESTING_TIME_IN_FORCE: Final = frozenset({TimeInForce.GTC, TimeInForce.POST_ONLY})
 _ZERO: Final = Decimal(0)
+# Quantities and notionals are computed exactly; a value needing more digits than
+# this fails closed instead of being rounded.
+_EXACT_PRECISION: Final = 80
+# Average fill price: significant digits, ROUND_HALF_EVEN (only a repeating
+# quotient is ever rounded; the notional it is computed from stays exact).
+AVERAGE_PRICE_PRECISION: Final = 40
+
+
+def _exact_context() -> Context:
+    return Context(
+        prec=_EXACT_PRECISION, traps=[InvalidOperation, DivisionByZero, Overflow, Inexact]
+    )
+
+
+def _average_context() -> Context:
+    return Context(
+        prec=AVERAGE_PRICE_PRECISION,
+        rounding=ROUND_HALF_EVEN,
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -80,9 +122,50 @@ class _SimulatedOrder:
     exchange_order_id: str
     status: OrderStatus
     filled_qty: Decimal
+    """Cumulative executed quantity."""
     avg_fill_price: Decimal | None
+    """Weighted average execution price (``filled_notional / filled_qty``)."""
+    filled_notional: Decimal
+    """Exact sum of price * qty over all fills; source of the average, so rounding
+    of one average never carries into the next."""
     created_at: datetime
     updated_at: datetime
+
+    def __post_init__(self) -> None:
+        self.check_invariants()
+
+    def check_invariants(self) -> None:
+        """Exchange-side consistency of status and fill state (not a second state
+        machine: transitions are decided by the simulator)."""
+        qty = self.request.qty
+        filled = self.filled_qty
+        avg = self.avg_fill_price
+        has_fills = filled > 0
+        consistent = (
+            0 <= filled <= qty
+            and (avg is None) == (not has_fills)
+            and (avg is None or avg > 0)
+            and (self.filled_notional > 0) == has_fills
+            and self.filled_notional >= 0
+        )
+        if self.status is OrderStatus.OPEN:
+            consistent = consistent and not has_fills
+        elif self.status is OrderStatus.PARTIALLY_FILLED:
+            consistent = consistent and 0 < filled < qty
+        elif self.status is OrderStatus.FILLED:
+            consistent = consistent and filled == qty
+        elif self.status is OrderStatus.CANCELED:
+            consistent = consistent and filled < qty
+        else:
+            consistent = False
+        if not consistent:
+            raise RuntimeError(
+                f"simulated exchange: order state invariant violated for "
+                f"{self.request.client_order_id} ({self.status.value}, filled {filled} of {qty})"
+            )
+
+    def remaining_qty(self) -> Decimal:
+        return _exact_context().subtract(self.request.qty, self.filled_qty)
 
     def to_ack(self) -> OrderAck:
         return OrderAck(
@@ -113,9 +196,15 @@ def _crosses(record: _SimulatedOrder, execution_price: Decimal) -> bool:
 
 
 def _build_fill(
-    record: _SimulatedOrder, *, exec_id: str, execution_price: Decimal, exchange_ts: datetime
+    record: _SimulatedOrder,
+    *,
+    exec_id: str,
+    execution_price: Decimal,
+    qty: Decimal,
+    exchange_ts: datetime,
 ) -> Fill:
-    """Full fill of ``record``. Fee data and liquidity role are not modeled."""
+    """One execution of ``qty`` of ``record``. Fee data and liquidity role are not
+    modeled."""
     return Fill(
         exec_id=exec_id,
         exchange_order_id=record.exchange_order_id,
@@ -123,12 +212,41 @@ def _build_fill(
         symbol=record.request.symbol,
         side=record.request.side,
         price=execution_price,
-        qty=record.request.qty,
+        qty=qty,
         fee=None,
         fee_asset=None,
         is_maker=None,
         exchange_ts=exchange_ts,
     )
+
+
+def _apply_fill(
+    record: _SimulatedOrder, *, execution_price: Decimal, qty: Decimal, at: datetime
+) -> _SimulatedOrder:
+    """The record after one execution of ``qty`` (0 < qty <= remaining)."""
+    exact = _exact_context()
+    filled = exact.add(record.filled_qty, qty)
+    notional = exact.add(record.filled_notional, exact.multiply(execution_price, qty))
+    if record.filled_qty == 0:
+        average = execution_price
+    else:
+        average = _average_context().divide(notional, filled)
+    return replace(
+        record,
+        status=OrderStatus.FILLED if filled == record.request.qty else OrderStatus.PARTIALLY_FILLED,
+        filled_qty=filled,
+        avg_fill_price=average,
+        filled_notional=notional,
+        updated_at=at,
+    )
+
+
+def _require_positive_decimal(value: object, field: str) -> Decimal:
+    if type(value) is not Decimal or not value.is_finite() or value <= 0:
+        raise ExchangeRequestValidationError(
+            f"simulated exchange: {field} must be a finite Decimal > 0"
+        )
+    return value
 
 
 def _require_symbol(symbol: object) -> str:
@@ -204,6 +322,7 @@ class SimulatedExchange:
             status=OrderStatus.OPEN,
             filled_qty=_ZERO,
             avg_fill_price=None,
+            filled_notional=_ZERO,
             created_at=now,
             updated_at=now,
         )
@@ -242,20 +361,24 @@ class SimulatedExchange:
         return tuple(record.to_update() for record in active)
 
     async def fill_crossed_limit_orders(
-        self, *, symbol: str, execution_price: Decimal
+        self,
+        *,
+        symbol: str,
+        execution_price: Decimal,
+        available_qty: Decimal | None = None,
     ) -> tuple[Fill, ...]:
-        """Simulation input: fill every OPEN limit order of ``symbol`` crossed by
-        ``execution_price`` completely at that price. Returns the new fills in
-        processing order; an empty tuple when nothing crossed."""
+        """Simulation input: execute OPEN / PARTIALLY_FILLED limit orders of
+        ``symbol`` crossed by ``execution_price``, at that price.
+
+        ``available_qty=None``: unlimited, every crossed order fills its remaining
+        quantity. Otherwise the total quantity for the whole batch, allocated in
+        (created_at, client_order_id) order. At most one fill per order per call.
+        Returns the new fills in processing order; empty when nothing executed.
+        """
         _require_symbol(symbol)
-        if (
-            type(execution_price) is not Decimal
-            or not execution_price.is_finite()
-            or execution_price <= 0
-        ):
-            raise ExchangeRequestValidationError(
-                "simulated exchange: execution_price must be a finite Decimal > 0"
-            )
+        _require_positive_decimal(execution_price, "execution_price")
+        if available_qty is not None:
+            _require_positive_decimal(available_qty, "available_qty")
         crossed = sorted(
             (
                 record
@@ -266,36 +389,49 @@ class SimulatedExchange:
             ),
             key=lambda record: (record.created_at, record.request.client_order_id),
         )
-        if not crossed:
-            return ()
 
-        # Prepare the whole batch before touching any state.
-        batch_ts = self._now()
-        sequence = self._exec_sequence
-        fills: list[Fill] = []
-        filled_records: list[_SimulatedOrder] = []
-        for record in crossed:
-            sequence += 1
-            fills.append(
-                _build_fill(
-                    record,
-                    exec_id=f"{EXEC_ID_PREFIX}{sequence:010d}",
-                    execution_price=execution_price,
-                    exchange_ts=batch_ts,
+        # Prepare the whole batch (allocation, fills, new records) without touching
+        # any state; the clock is read only if something executes.
+        try:
+            allocations: list[tuple[_SimulatedOrder, Decimal]] = []
+            left = available_qty
+            for record in crossed:
+                record.check_invariants()  # never repair a corrupted record
+                if left is not None and left <= 0:
+                    break
+                remaining = record.remaining_qty()
+                qty = remaining if left is None else min(remaining, left)
+                allocations.append((record, qty))
+                if left is not None:
+                    left = _exact_context().subtract(left, qty)
+            if not allocations:
+                return ()
+
+            batch_ts = self._now()
+            sequence = self._exec_sequence
+            fills: list[Fill] = []
+            new_records: list[_SimulatedOrder] = []
+            for record, qty in allocations:
+                sequence += 1
+                fills.append(
+                    _build_fill(
+                        record,
+                        exec_id=f"{EXEC_ID_PREFIX}{sequence:010d}",
+                        execution_price=execution_price,
+                        qty=qty,
+                        exchange_ts=batch_ts,
+                    )
                 )
-            )
-            filled_records.append(
-                replace(
-                    record,
-                    status=OrderStatus.FILLED,
-                    filled_qty=record.request.qty,
-                    avg_fill_price=execution_price,
-                    updated_at=batch_ts,
+                new_records.append(
+                    _apply_fill(record, execution_price=execution_price, qty=qty, at=batch_ts)
                 )
-            )
+        except DecimalException:
+            raise ExchangeRequestValidationError(
+                "simulated exchange: fill quantities cannot be computed exactly"
+            ) from None
 
         # Commit.
-        for filled in filled_records:
-            self._orders[filled.request.client_order_id] = filled
+        for new_record in new_records:
+            self._orders[new_record.request.client_order_id] = new_record
         self._exec_sequence = sequence
         return tuple(fills)

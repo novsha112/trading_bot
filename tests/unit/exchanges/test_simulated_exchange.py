@@ -9,7 +9,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -1048,5 +1048,498 @@ async def test_same_fill_scenario_gives_identical_results() -> None:
         second = await exchange.fill_crossed_limit_orders(symbol="BTCUSDT", execution_price=D("79"))
         states = [await exchange.get_order(ref(c)) for c in ("a", "b", "c")]
         return first, second, states
+
+    assert await run() == await run()
+
+
+# === deterministic partial fills ==============================================
+
+
+async def partial(
+    exchange: SimulatedExchange, price: str, available: str, symbol: str = "BTCUSDT"
+) -> list[Fill]:
+    return list(
+        await exchange.fill_crossed_limit_orders(
+            symbol=symbol, execution_price=D(price), available_qty=D(available)
+        )
+    )
+
+
+async def update_of(
+    exchange: SimulatedExchange, client_order_id: str = "grid1-buy-0001"
+) -> OrderUpdate:
+    update = await exchange.get_order(ref(client_order_id))
+    assert update is not None
+    return update
+
+
+# --- single order lifecycle ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_partial_lifecycle_3_4_3(exchange: SimulatedExchange, clock: ManualClock) -> None:
+    ack = await exchange.place_order(request(price=D("100"), qty=D("10")))
+
+    clock.advance(timedelta(seconds=1))
+    first = await partial(exchange, "100", "3")
+    after_first = await update_of(exchange)
+    clock.advance(timedelta(seconds=1))
+    second = await partial(exchange, "100", "4")
+    after_second = await update_of(exchange)
+    clock.advance(timedelta(seconds=1))
+    third = await partial(exchange, "100", "100")
+    after_third = await update_of(exchange)
+
+    assert [f.qty for f in (*first, *second, *third)] == [D("3"), D("4"), D("3")]
+    assert [f.exec_id for f in (*first, *second, *third)] == [
+        "SIM-EXEC-0000000001",
+        "SIM-EXEC-0000000002",
+        "SIM-EXEC-0000000003",
+    ]
+    assert after_first == OrderUpdate(
+        client_order_id="grid1-buy-0001",
+        exchange_order_id=ack.exchange_order_id,
+        status=OrderStatus.PARTIALLY_FILLED,
+        cum_filled_qty=D("3"),
+        avg_fill_price=D("100"),
+        reject_reason=None,
+        exchange_ts=T0 + timedelta(seconds=1),
+    )
+    assert (after_second.status, after_second.cum_filled_qty) == (
+        OrderStatus.PARTIALLY_FILLED,
+        D("7"),
+    )
+    assert after_second.exchange_ts == T0 + timedelta(seconds=2)
+    assert (after_third.status, after_third.cum_filled_qty) == (OrderStatus.FILLED, D("10"))
+    assert after_third.exchange_ts == T0 + timedelta(seconds=3)
+    assert await partial(exchange, "100", "100") == []
+
+
+@pytest.mark.asyncio
+async def test_fill_qty_is_per_execution_and_price_is_execution_price(
+    exchange: SimulatedExchange,
+) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("10")))
+
+    (a,) = await partial(exchange, "99", "2.5")
+    (b,) = await partial(exchange, "98", "2.5")
+
+    assert (a.qty, a.price) == (D("2.5"), D("99"))
+    assert (b.qty, b.price) == (D("2.5"), D("98"))  # not the average
+    assert (a.fee, a.fee_asset, a.is_maker) == (None, None, None)
+    assert (b.fee, b.fee_asset, b.is_maker) == (None, None, None)
+
+
+# --- weighted average ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_weighted_average_across_partial_fills(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("10")))
+
+    await partial(exchange, "100", "3")  # 300
+    assert (await update_of(exchange)).avg_fill_price == D("100")
+    await partial(exchange, "95", "4")  # 380 -> 680 / 7
+    mid = (await update_of(exchange)).avg_fill_price
+    await partial(exchange, "90", "3")  # 270 -> 950 / 10
+    final = await update_of(exchange)
+
+    assert mid == D("97.14285714285714285714285714285714285714")  # 680/7, 40 digits
+    assert final.avg_fill_price == D("95")  # exact: computed from the exact notional
+    assert final.status is OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
+async def test_average_is_exact_when_finite(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("4")))
+
+    await partial(exchange, "99.5", "1")
+    await partial(exchange, "99.25", "3")
+
+    assert (await update_of(exchange)).avg_fill_price == D("99.3125")
+
+
+@pytest.mark.asyncio
+async def test_repeating_average_rounds_half_even_to_40_significant_digits(
+    exchange: SimulatedExchange,
+) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("3")))
+
+    await partial(exchange, "100", "1")
+    await partial(exchange, "100", "1")
+    await partial(exchange, "99", "1")  # 299 / 3 = 99.666...
+
+    avg = (await update_of(exchange)).avg_fill_price
+    assert avg == D("99.66666666666666666666666666666666666667")
+    assert avg is not None
+    assert len(avg.as_tuple().digits) == 40
+
+
+@pytest.mark.asyncio
+async def test_no_drift_from_chained_rounding(exchange: SimulatedExchange) -> None:
+    # Each intermediate average is rounded, but the next one comes from the exact
+    # notional: three thirds at 100, 100, 99 then 101 must give exactly 100.
+    await exchange.place_order(request(price=D("101"), qty=D("4")))
+
+    for price in ("100", "100", "99", "101"):
+        await partial(exchange, price, "1")
+
+    assert (await update_of(exchange)).avg_fill_price == D("100")
+
+
+@pytest.mark.asyncio
+async def test_global_decimal_context_does_not_change_results() -> None:
+    async def run() -> tuple[object, ...]:
+        exchange = SimulatedExchange(clock=ManualClock(T0))
+        await exchange.place_order(request(price=D("100"), qty=D("3")))
+        fills = [
+            *await partial(exchange, "100.123456789", "1"),
+            *await partial(exchange, "99.987654321", "1.5"),
+            *await partial(exchange, "99", "0.5"),
+        ]
+        return tuple(fills), await update_of(exchange)
+
+    baseline = await run()
+    with localcontext() as context:
+        context.prec = 3
+        context.rounding = "ROUND_DOWN"
+        under_tiny_context = await run()
+
+    assert under_tiny_context == baseline
+    assert str(baseline[1].avg_fill_price) == str(under_tiny_context[1].avg_fill_price)  # type: ignore[attr-defined]
+
+
+# --- multiple orders / allocation --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_allocation_follows_created_at_then_client_id(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+
+    fills = await partial(exchange, "100", "7")
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("5")), ("b", D("2"))]
+    assert (await update_of(exchange, "a")).status is OrderStatus.FILLED
+    b = await update_of(exchange, "b")
+    assert (b.status, b.cum_filled_qty) == (OrderStatus.PARTIALLY_FILLED, D("2"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        ("3", [("a", "3")]),  # less than the first remaining
+        ("5", [("a", "5")]),  # exactly the first remaining
+        ("9", [("a", "5"), ("b", "4")]),  # exactly the sum
+        ("50", [("a", "5"), ("b", "4")]),  # more than the sum
+    ],
+)
+async def test_available_qty_boundaries(
+    exchange: SimulatedExchange, available: str, expected: list[tuple[str, str]]
+) -> None:
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("4")))
+
+    fills = await partial(exchange, "100", available)
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [(c, D(q)) for c, q in expected]
+    assert [f.exec_id for f in fills] == [f"SIM-EXEC-{i:010d}" for i in range(1, len(expected) + 1)]
+
+
+@pytest.mark.asyncio
+async def test_partially_filled_order_keeps_its_place_and_crossing_rules(
+    exchange: SimulatedExchange,
+) -> None:
+    await exchange.place_order(request(client_order_id="buy", price=D("100"), qty=D("5")))
+    await exchange.place_order(
+        request(client_order_id="sell", side=Side.SELL, price=D("110"), qty=D("5"))
+    )
+    await partial(exchange, "100", "2")  # buy -> 2/5
+
+    assert await partial(exchange, "105", "100") == []  # crosses neither
+    fills = await partial(exchange, "110", "100")  # only the sell crosses
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("sell", D("5"))]
+    buy = await update_of(exchange, "buy")
+    assert (buy.status, buy.cum_filled_qty) == (OrderStatus.PARTIALLY_FILLED, D("2"))
+
+
+@pytest.mark.asyncio
+async def test_unlimited_mode_fills_remaining_of_partial(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("10")))
+    await partial(exchange, "100", "4")
+
+    (fill,) = await fill_at(exchange, "90")  # available_qty=None
+
+    assert fill.qty == D("6")
+    final = await update_of(exchange)
+    assert (final.status, final.cum_filled_qty, final.avg_fill_price) == (
+        OrderStatus.FILLED,
+        D("10"),
+        D("94"),  # (400 + 540) / 10
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_none_keeps_full_fill_behavior(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("4")))
+
+    fills = await exchange.fill_crossed_limit_orders(
+        symbol="BTCUSDT", execution_price=D("100"), available_qty=None
+    )
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("5")), ("b", D("4"))]
+
+
+# --- active orders / cancel ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_partially_filled_is_open(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="p", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="o", price=D("90"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="f", price=D("100"), qty=D("1")))
+    await partial(exchange, "100", "3")  # f? no: order is (created_at, id) -> f, p
+
+    open_orders = await exchange.get_open_orders(symbol="BTCUSDT")
+
+    assert [(u.client_order_id, u.status) for u in open_orders] == [
+        ("o", OrderStatus.OPEN),
+        ("p", OrderStatus.PARTIALLY_FILLED),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_partial_keeps_fill_history(
+    exchange: SimulatedExchange, clock: ManualClock
+) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("10")))
+    await partial(exchange, "99", "4")
+    clock.advance(timedelta(seconds=5))
+
+    await exchange.cancel_order(ref())
+    canceled = await update_of(exchange)
+
+    assert (canceled.status, canceled.cum_filled_qty, canceled.avg_fill_price) == (
+        OrderStatus.CANCELED,
+        D("4"),
+        D("99"),
+    )
+    assert canceled.exchange_ts == T0 + timedelta(seconds=5)
+    assert await partial(exchange, "50", "100") == []
+    assert await fill_at(exchange, "50") == []
+    assert await update_of(exchange) == canceled
+    assert await exchange.get_open_orders(symbol="BTCUSDT") == ()
+    with pytest.raises(ExchangeRejectedError, match="canceled"):
+        await exchange.cancel_order(ref())
+
+
+@pytest.mark.asyncio
+async def test_identical_retry_after_partial_returns_original_ack(
+    exchange: SimulatedExchange, clock: ManualClock
+) -> None:
+    original = await exchange.place_order(request(price=D("100"), qty=D("10")))
+    await partial(exchange, "100", "4")
+    before = await update_of(exchange)
+    clock.advance(timedelta(seconds=1))
+
+    assert await exchange.place_order(request(price=D("100"), qty=D("10"))) == original
+    assert await update_of(exchange) == before
+    with pytest.raises(ExchangeDuplicateOrderError):
+        await exchange.place_order(request(price=D("100"), qty=D("6")))
+    assert await update_of(exchange) == before
+
+
+# --- validation ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        D("0"),
+        D("-0"),
+        D("-1"),
+        D("NaN"),
+        D("sNaN"),
+        D("Infinity"),
+        D("-Infinity"),
+        1.5,
+        3,
+        True,
+        "3",
+    ],
+)
+async def test_invalid_available_qty_changes_nothing(value: object) -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock)
+    await exchange.place_order(request(price=D("100")))
+    clock.calls = 0
+
+    with pytest.raises(ExchangeRequestValidationError, match="available_qty"):
+        await exchange.fill_crossed_limit_orders(
+            symbol="BTCUSDT",
+            execution_price=D("100"),
+            available_qty=value,  # type: ignore[arg-type]
+        )
+
+    assert clock.calls == 0
+    assert await status_of(exchange, "grid1-buy-0001") is OrderStatus.OPEN
+    (fill,) = await fill_at(exchange, "100")
+    assert fill.exec_id == "SIM-EXEC-0000000001"
+
+
+@pytest.mark.asyncio
+async def test_decimal_subclass_available_qty_rejected(exchange: SimulatedExchange) -> None:
+    class Weird(Decimal):
+        pass
+
+    await exchange.place_order(request(price=D("100")))
+
+    with pytest.raises(ExchangeRequestValidationError, match="available_qty"):
+        await exchange.fill_crossed_limit_orders(
+            symbol="BTCUSDT", execution_price=D("100"), available_qty=Weird("1")
+        )
+
+
+# --- clock / atomicity / invariants -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_one_clock_read_per_partial_batch() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock)
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    clock.calls = 0
+
+    fills = await exchange.fill_crossed_limit_orders(
+        symbol="BTCUSDT", execution_price=D("100"), available_qty=D("7")
+    )
+    assert clock.calls == 1
+    assert len({f.exchange_ts for f in fills}) == 1
+    a = await update_of(exchange, "a")
+    b = await update_of(exchange, "b")
+    assert a.exchange_ts == b.exchange_ts == fills[0].exchange_ts
+
+    await exchange.fill_crossed_limit_orders(
+        symbol="BTCUSDT", execution_price=D("101"), available_qty=D("7")
+    )
+    assert clock.calls == 1  # nothing crossed
+
+
+@pytest.mark.asyncio
+async def test_failed_partial_batch_preparation_leaves_no_state(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="c", price=D("100"), qty=D("5")))
+    await partial(exchange, "100", "2")  # a -> 2/5, uses SIM-EXEC-1
+    before = [await update_of(exchange, c) for c in ("a", "b", "c")]
+    real_build = simulated._build_fill
+    calls: list[str] = []
+
+    def failing_third(record: Any, **kwargs: Any) -> Fill:
+        calls.append(record.request.client_order_id)
+        if len(calls) == 3:
+            raise RuntimeError("injected failure while preparing the third fill")
+        return real_build(record, **kwargs)
+
+    monkeypatch.setattr(simulated, "_build_fill", failing_third)
+    with pytest.raises(RuntimeError, match="injected"):
+        await partial(exchange, "100", "11")
+    monkeypatch.setattr(simulated, "_build_fill", real_build)
+
+    assert calls == ["a", "b", "c"]
+    assert [await update_of(exchange, c) for c in ("a", "b", "c")] == before
+    fills = await partial(exchange, "100", "11")
+    assert [(f.client_order_id, f.qty, f.exec_id) for f in fills] == [
+        ("a", D("3"), "SIM-EXEC-0000000002"),
+        ("b", D("5"), "SIM-EXEC-0000000003"),
+        ("c", D("3"), "SIM-EXEC-0000000004"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corrupted_internal_state_fails_before_commit(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    await partial(exchange, "100", "2")  # a -> PARTIALLY_FILLED 2/5
+    # Corrupt "a": partially filled with nothing remaining.
+    object.__setattr__(exchange._orders["a"], "filled_qty", D("5"))
+    b_before = await update_of(exchange, "b")
+
+    with pytest.raises(RuntimeError, match="invariant"):
+        await partial(exchange, "100", "100")
+
+    assert await update_of(exchange, "b") == b_before
+    assert exchange._orders["a"].filled_qty == D("5")  # not silently repaired
+
+
+def test_record_invariants_reject_inconsistent_states() -> None:
+    order = request(price=D("100"), qty=D("5"))
+    base: dict[str, Any] = {
+        "request": order,
+        "exchange_order_id": "SIM-1",
+        "created_at": T0,
+        "updated_at": T0,
+    }
+    bad = [
+        (OrderStatus.OPEN, D("1"), D("100"), D("100")),
+        (OrderStatus.OPEN, D("0"), D("100"), D("0")),
+        (OrderStatus.PARTIALLY_FILLED, D("0"), None, D("0")),
+        (OrderStatus.PARTIALLY_FILLED, D("5"), D("100"), D("500")),
+        (OrderStatus.PARTIALLY_FILLED, D("2"), None, D("200")),
+        (OrderStatus.FILLED, D("4"), D("100"), D("400")),
+        (OrderStatus.FILLED, D("5"), None, D("500")),
+        (OrderStatus.CANCELED, D("5"), D("100"), D("500")),
+        (OrderStatus.CANCELED, D("2"), None, D("200")),
+        (OrderStatus.CANCELED, D("0"), D("100"), D("0")),
+        (OrderStatus.PARTIALLY_FILLED, D("2"), D("100"), D("0")),
+    ]
+    for status, filled, avg, notional in bad:
+        with pytest.raises(RuntimeError, match="invariant"):
+            simulated._SimulatedOrder(
+                **base,
+                status=status,
+                filled_qty=filled,
+                avg_fill_price=avg,
+                filled_notional=notional,
+            )
+    for status, filled, avg, notional in [
+        (OrderStatus.OPEN, D("0"), None, D("0")),
+        (OrderStatus.PARTIALLY_FILLED, D("2"), D("100"), D("200")),
+        (OrderStatus.FILLED, D("5"), D("100"), D("500")),
+        (OrderStatus.CANCELED, D("0"), None, D("0")),
+        (OrderStatus.CANCELED, D("2"), D("100"), D("200")),
+    ]:
+        simulated._SimulatedOrder(
+            **base, status=status, filled_qty=filled, avg_fill_price=avg, filled_notional=notional
+        )
+
+
+# --- determinism --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_partial_scenario_gives_identical_results() -> None:
+    async def run() -> tuple[object, ...]:
+        clock = ManualClock(T0)
+        exchange = SimulatedExchange(clock=clock)
+        await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+        await exchange.place_order(
+            request(client_order_id="a", side=Side.SELL, price=D("90"), qty=D("3"))
+        )
+        clock.advance(timedelta(seconds=1))
+        first = await partial(exchange, "95", "4")
+        clock.advance(timedelta(seconds=1))
+        second = await partial(exchange, "93.3", "2.25")
+        clock.advance(timedelta(seconds=1))
+        third = await fill_at(exchange, "91")
+        states = [await exchange.get_order(ref(c)) for c in ("a", "b")]
+        return first, second, third, states
 
     assert await run() == await run()
