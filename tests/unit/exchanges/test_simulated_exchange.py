@@ -18,6 +18,7 @@ import pytest
 from app.domain.clock import ManualClock
 from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 from app.domain.fills import Fill
+from app.domain.instrument import InstrumentSpec
 from app.domain.orders import OrderUpdate
 from app.exchanges import simulated
 from app.exchanges.errors import (
@@ -46,6 +47,24 @@ LIMIT: dict[str, Any] = {
 }
 
 
+def spec(symbol: str = "BTCUSDT", **overrides: Any) -> InstrumentSpec:
+    values: dict[str, Any] = {
+        "symbol": symbol,
+        "base_asset": symbol.removesuffix("USDT"),
+        "quote_asset": "USDT",
+        "tick_size": D("0.1"),
+        "qty_step": D("0.001"),
+        "min_qty": D("0.001"),
+        "max_qty": D("1000000"),
+        "min_notional": D("0"),
+    }
+    return InstrumentSpec(**{**values, **overrides})
+
+
+# Permissive specs for lifecycle tests; instrument rules have their own tests.
+SPECS = (spec("BTCUSDT"), spec("ETHUSDT"), spec("SOLUSDT"))
+
+
 def request(**overrides: Any) -> OrderRequest:
     return OrderRequest(**{**LIMIT, **overrides})
 
@@ -67,7 +86,7 @@ def clock() -> ManualClock:
 
 @pytest.fixture
 def exchange(clock: ManualClock) -> SimulatedExchange:
-    return SimulatedExchange(clock=clock)
+    return SimulatedExchange(clock=clock, instruments=SPECS)
 
 
 # --- contract -----------------------------------------------------------------
@@ -75,7 +94,7 @@ def exchange(clock: ManualClock) -> SimulatedExchange:
 
 def test_implements_trading_client(clock: ManualClock) -> None:
     # mypy strict is the proof (structural Protocol, no runtime_checkable).
-    client: TradingClient = SimulatedExchange(clock=clock)
+    client: TradingClient = SimulatedExchange(clock=clock, instruments=SPECS)
     assert client is not None
 
 
@@ -154,7 +173,7 @@ async def test_two_different_orders_get_different_ids(exchange: SimulatedExchang
 @pytest.mark.asyncio
 async def test_same_scenario_on_two_instances_gives_identical_results() -> None:
     async def run() -> list[object]:
-        exchange = SimulatedExchange(clock=ManualClock(T0))
+        exchange = SimulatedExchange(clock=ManualClock(T0), instruments=SPECS)
         out: list[object] = []
         out.append(await exchange.place_order(request(client_order_id="a")))
         out.append(await exchange.place_order(request(client_order_id="b")))
@@ -168,8 +187,8 @@ async def test_same_scenario_on_two_instances_gives_identical_results() -> None:
 
 @pytest.mark.asyncio
 async def test_instances_do_not_share_state_or_sequence() -> None:
-    first = SimulatedExchange(clock=ManualClock(T0))
-    second = SimulatedExchange(clock=ManualClock(T0))
+    first = SimulatedExchange(clock=ManualClock(T0), instruments=SPECS)
+    second = SimulatedExchange(clock=ManualClock(T0), instruments=SPECS)
 
     await first.place_order(request(client_order_id="a"))
     await first.place_order(request(client_order_id="b"))
@@ -883,7 +902,7 @@ async def test_calls_without_fills_do_not_consume_exec_ids(exchange: SimulatedEx
 @pytest.mark.asyncio
 async def test_clock_read_once_per_batch_and_not_without_fills() -> None:
     clock = CountingClock(T0)
-    exchange = SimulatedExchange(clock=clock)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
     await exchange.place_order(request(client_order_id="a", price=D("100")))
     await exchange.place_order(request(client_order_id="b", price=D("100")))
     clock.calls = 0
@@ -1037,7 +1056,7 @@ async def test_identical_retry_after_fill_returns_original_ack(
 async def test_same_fill_scenario_gives_identical_results() -> None:
     async def run() -> tuple[object, ...]:
         clock = ManualClock(T0)
-        exchange = SimulatedExchange(clock=clock)
+        exchange = SimulatedExchange(clock=clock, instruments=SPECS)
         await exchange.place_order(request(client_order_id="b", price=D("100")))
         await exchange.place_order(request(client_order_id="a", side=Side.SELL, price=D("90")))
         clock.advance(timedelta(seconds=1))
@@ -1190,7 +1209,7 @@ async def test_no_drift_from_chained_rounding(exchange: SimulatedExchange) -> No
 @pytest.mark.asyncio
 async def test_global_decimal_context_does_not_change_results() -> None:
     async def run() -> tuple[object, ...]:
-        exchange = SimulatedExchange(clock=ManualClock(T0))
+        exchange = SimulatedExchange(clock=ManualClock(T0), instruments=SPECS)
         await exchange.place_order(request(price=D("100"), qty=D("3")))
         fills = [
             *await partial(exchange, "100.123456789", "1"),
@@ -1374,7 +1393,7 @@ async def test_identical_retry_after_partial_returns_original_ack(
 )
 async def test_invalid_available_qty_changes_nothing(value: object) -> None:
     clock = CountingClock(T0)
-    exchange = SimulatedExchange(clock=clock)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
     await exchange.place_order(request(price=D("100")))
     clock.calls = 0
 
@@ -1410,7 +1429,7 @@ async def test_decimal_subclass_available_qty_rejected(exchange: SimulatedExchan
 @pytest.mark.asyncio
 async def test_one_clock_read_per_partial_batch() -> None:
     clock = CountingClock(T0)
-    exchange = SimulatedExchange(clock=clock)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
     await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
     await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
     clock.calls = 0
@@ -1528,7 +1547,7 @@ def test_record_invariants_reject_inconsistent_states() -> None:
 async def test_same_partial_scenario_gives_identical_results() -> None:
     async def run() -> tuple[object, ...]:
         clock = ManualClock(T0)
-        exchange = SimulatedExchange(clock=clock)
+        exchange = SimulatedExchange(clock=clock, instruments=SPECS)
         await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
         await exchange.place_order(
             request(client_order_id="a", side=Side.SELL, price=D("90"), qty=D("3"))
@@ -1543,3 +1562,328 @@ async def test_same_partial_scenario_gives_identical_results() -> None:
         return first, second, third, states
 
     assert await run() == await run()
+
+
+# === instrument specs: pre-trade validation ===================================
+
+STRICT = spec(
+    "BTCUSDT",
+    tick_size=D("0.10"),
+    qty_step=D("0.1"),
+    min_qty=D("0.2"),
+    max_qty=D("50"),
+    min_notional=D("5"),
+)
+
+
+def strict_exchange(clock: Any = None) -> SimulatedExchange:
+    return SimulatedExchange(clock=clock or ManualClock(T0), instruments=(STRICT,))
+
+
+def strict_order(**overrides: Any) -> OrderRequest:
+    return request(**{"price": D("100.00"), "qty": D("1.0"), **overrides})
+
+
+# --- constructor --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_constructor_accepts_several_instruments(clock: ManualClock) -> None:
+    exchange = SimulatedExchange(clock=clock, instruments=(spec("BTCUSDT"), spec("ETHUSDT")))
+
+    await exchange.place_order(request(client_order_id="b"))
+    await exchange.place_order(request(client_order_id="e", symbol="ETHUSDT"))
+
+    assert repr(exchange) == "SimulatedExchange(orders=2)"
+
+
+def test_constructor_rejects_duplicate_symbols(clock: ManualClock) -> None:
+    with pytest.raises(ValueError, match="duplicate instrument BTCUSDT"):
+        SimulatedExchange(
+            clock=clock, instruments=(spec("BTCUSDT"), spec("BTCUSDT", tick_size=D("1")))
+        )
+
+
+@pytest.mark.parametrize("bad", [("BTCUSDT",), (None,), ({"symbol": "BTCUSDT"},)])
+def test_constructor_rejects_non_specs(clock: ManualClock, bad: tuple[Any, ...]) -> None:
+    with pytest.raises(TypeError, match="InstrumentSpec"):
+        SimulatedExchange(clock=clock, instruments=bad)
+
+
+@pytest.mark.asyncio
+async def test_caller_collection_mutation_does_not_change_registry(clock: ManualClock) -> None:
+    specs = [spec("BTCUSDT")]
+    exchange = SimulatedExchange(clock=clock, instruments=specs)  # type: ignore[arg-type]
+    specs.clear()
+    specs.append(spec("ETHUSDT"))
+
+    await exchange.place_order(request())
+    with pytest.raises(ExchangeRejectedError, match="unknown instrument"):
+        await exchange.place_order(request(client_order_id="e", symbol="ETHUSDT"))
+
+
+@pytest.mark.asyncio
+async def test_empty_registry_constructs_but_place_fails_closed(clock: ManualClock) -> None:
+    exchange = SimulatedExchange(clock=clock)
+
+    with pytest.raises(ExchangeRejectedError, match="unknown instrument BTCUSDT"):
+        await exchange.place_order(request())
+
+    assert repr(exchange) == "SimulatedExchange(orders=0)"
+
+
+# --- place_order rules --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "accepted"),
+    [
+        ({"price": D("100.00")}, True),
+        ({"price": D("100.10")}, True),
+        ({"price": D("100.1")}, True),
+        ({"price": D("100.05")}, False),  # tick misaligned
+        ({"qty": D("1.0")}, True),
+        ({"qty": D("1.05")}, False),  # step misaligned
+        ({"qty": D("0.2")}, True),  # exact min qty
+        ({"qty": D("0.1")}, False),  # below min qty
+        ({"qty": D("50")}, True),  # exact max qty
+        ({"qty": D("50.1")}, False),  # above max qty
+        ({"price": D("25.00"), "qty": D("0.2")}, True),  # notional exactly 5
+        ({"price": D("24.90"), "qty": D("0.2")}, False),  # notional 4.98
+        ({"time_in_force": TimeInForce.POST_ONLY}, True),
+    ],
+)
+async def test_instrument_rules(overrides: dict[str, Any], accepted: bool) -> None:
+    exchange = strict_exchange()
+    order = strict_order(**overrides)
+
+    if accepted:
+        ack = await exchange.place_order(order)
+        assert ack.exchange_order_id == "SIM-0000000001"
+    else:
+        with pytest.raises(ExchangeRejectedError):
+            await exchange.place_order(order)
+        assert await exchange.get_order(ref()) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"symbol": "ETHUSDT"}, "unknown instrument ETHUSDT"),
+        ({"price": D("100.05")}, "tick_size"),
+        ({"qty": D("1.05")}, "qty_step"),
+        ({"qty": D("0.1")}, "min_qty"),
+        ({"qty": D("50.1")}, "max_qty"),
+        ({"price": D("24.90"), "qty": D("0.2")}, "min_notional"),
+    ],
+)
+async def test_rejection_is_side_effect_free(overrides: dict[str, Any], reason: str) -> None:
+    clock = CountingClock(T0)
+    exchange = strict_exchange(clock)
+
+    with pytest.raises(ExchangeRejectedError, match=reason) as excinfo:
+        await exchange.place_order(strict_order(**overrides))
+
+    assert not isinstance(excinfo.value, ExchangeRequestValidationError)
+    assert clock.calls == 0
+    assert repr(exchange) == "SimulatedExchange(orders=0)"
+    ack = await exchange.place_order(strict_order(client_order_id="valid"))
+    assert ack.exchange_order_id == "SIM-0000000001"  # no id consumed
+
+
+@pytest.mark.asyncio
+async def test_rules_ignore_the_global_decimal_context() -> None:
+    cases: list[tuple[dict[str, Any], bool]] = [
+        ({"price": D("100.10"), "qty": D("1.2")}, True),
+        ({"price": D("100.05")}, False),
+        ({"qty": D("1.05")}, False),
+        ({"qty": D("50")}, True),
+        ({"qty": D("50.1")}, False),
+        ({"price": D("25.00"), "qty": D("0.2")}, True),
+        ({"price": D("24.90"), "qty": D("0.2")}, False),
+        ({"price": D("12345.60"), "qty": D("49.9")}, True),
+    ]
+
+    async def outcomes() -> list[bool]:
+        results = []
+        for i, (overrides, _) in enumerate(cases):
+            exchange = strict_exchange()
+            try:
+                await exchange.place_order(strict_order(client_order_id=f"c{i}", **overrides))
+                results.append(True)
+            except ExchangeRejectedError:
+                results.append(False)
+        return results
+
+    baseline = await outcomes()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = "ROUND_UP"
+        low_precision = await outcomes()
+
+    assert baseline == [accepted for _, accepted in cases]
+    assert low_precision == baseline
+
+
+# --- idempotency ordering -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_identical_retry_returns_ack_before_any_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = strict_exchange()
+    original = await exchange.place_order(strict_order())
+
+    def must_not_run(*_: Any, **__: Any) -> None:
+        raise AssertionError("instrument rules must not run for an existing client id")
+
+    monkeypatch.setattr(simulated, "_check_instrument_rules", must_not_run)
+
+    assert await exchange.place_order(strict_order()) == original
+    with pytest.raises(ExchangeDuplicateOrderError):
+        await exchange.place_order(strict_order(price=D("100.05")))  # changed + invalid
+
+
+@pytest.mark.asyncio
+async def test_rejected_client_id_can_be_reused_by_a_valid_request() -> None:
+    # A rejected order was never created, so its client id is not taken.
+    exchange = strict_exchange()
+    with pytest.raises(ExchangeRejectedError):
+        await exchange.place_order(strict_order(price=D("100.05")))
+
+    ack = await exchange.place_order(strict_order())
+
+    assert ack.client_order_id == "grid1-buy-0001"
+    assert ack.exchange_order_id == "SIM-0000000001"
+
+
+# --- fills respect qty_step -----------------------------------------------------
+
+
+async def strict_partial(exchange: SimulatedExchange, available: str) -> list[Fill]:
+    return list(
+        await exchange.fill_crossed_limit_orders(
+            symbol="BTCUSDT", execution_price=D("100"), available_qty=D(available)
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_fill_qty_rounds_down_to_step() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order())
+
+    (fill,) = await strict_partial(exchange, "0.15")
+
+    assert fill.qty == D("0.1")
+    update = await update_of(exchange)
+    assert (update.status, update.cum_filled_qty) == (OrderStatus.PARTIALLY_FILLED, D("0.1"))
+
+
+@pytest.mark.asyncio
+async def test_budget_below_step_creates_no_fill_and_no_exec_id() -> None:
+    clock = CountingClock(T0)
+    exchange = strict_exchange(clock)
+    await exchange.place_order(strict_order())
+    clock.calls = 0
+
+    assert await strict_partial(exchange, "0.09") == []
+
+    assert clock.calls == 0
+    assert (await update_of(exchange)).status is OrderStatus.OPEN
+    (fill,) = await strict_partial(exchange, "0.1")
+    assert fill.exec_id == "SIM-EXEC-0000000001"
+
+
+@pytest.mark.asyncio
+async def test_budget_across_orders_yields_only_step_multiples() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order(client_order_id="a", qty=D("0.2")))
+    await exchange.place_order(strict_order(client_order_id="b", qty=D("1.0")))
+    await exchange.place_order(strict_order(client_order_id="c", qty=D("1.0")))
+
+    fills = await strict_partial(exchange, "0.25")  # a: 0.2, b: 0.05 -> 0
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("0.2"))]
+    assert [f.exec_id for f in fills] == ["SIM-EXEC-0000000001"]
+    fills = await strict_partial(exchange, "0.35")  # b: 0.3, then 0.05 unused
+    assert [(f.client_order_id, f.qty) for f in fills] == [("b", D("0.3"))]
+
+
+@pytest.mark.asyncio
+async def test_final_remainder_closes_exactly_and_stays_aligned() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order(qty=D("1.0")))
+
+    quantities = []
+    for available in ("0.15", "0.37", "0.29", "5"):
+        quantities += [f.qty for f in await strict_partial(exchange, available)]
+        cum = (await update_of(exchange)).cum_filled_qty
+        assert is_multiple(cum, D("0.1"))
+
+    assert quantities == [D("0.1"), D("0.3"), D("0.2"), D("0.4")]
+    final = await update_of(exchange)
+    assert (final.status, final.cum_filled_qty) == (OrderStatus.FILLED, D("1.0"))
+
+
+def is_multiple(value: Decimal, step: Decimal) -> bool:
+    return value % step == 0
+
+
+@pytest.mark.asyncio
+async def test_unlimited_fill_after_partial_closes_remainder() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order(qty=D("1.0")))
+    await strict_partial(exchange, "0.45")  # 0.4
+
+    (fill,) = await exchange.fill_crossed_limit_orders(symbol="BTCUSDT", execution_price=D("100"))
+
+    assert fill.qty == D("0.6")
+    assert (await update_of(exchange)).status is OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
+async def test_execution_price_is_not_tick_enforced() -> None:
+    # The external execution price is a simulation input, not a new order price.
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order())
+
+    (fill,) = await exchange.fill_crossed_limit_orders(
+        symbol="BTCUSDT", execution_price=D("99.987")
+    )
+
+    assert fill.price == D("99.987")
+
+
+# --- invariants -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_misaligned_remaining_qty_is_an_invariant_failure() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order(client_order_id="a", qty=D("1.0")))
+    await exchange.place_order(strict_order(client_order_id="b", qty=D("1.0")))
+    await strict_partial(exchange, "0.1")  # a -> 0.1 / 1.0
+    object.__setattr__(exchange._orders["a"], "filled_qty", D("0.15"))
+    b_before = await update_of(exchange, "b")
+
+    with pytest.raises(RuntimeError, match="invariant"):
+        await strict_partial(exchange, "5")
+
+    assert await update_of(exchange, "b") == b_before
+    assert exchange._orders["a"].filled_qty == D("0.15")  # not repaired
+
+
+@pytest.mark.asyncio
+async def test_order_without_registered_instrument_is_an_invariant_failure() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order())
+    exchange._instruments.clear()  # simulate corrupted simulator state
+
+    with pytest.raises(RuntimeError, match="invariant"):
+        await strict_partial(exchange, "5")
+
+    assert (await update_of(exchange)).status is OrderStatus.OPEN

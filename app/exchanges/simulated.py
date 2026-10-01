@@ -6,7 +6,17 @@ authoritative exchange state of its own instance; callers reconcile against it
 exactly as against a real exchange.
 
 Current scope:
-* LIMIT GTC / POST_ONLY orders are accepted and rest OPEN until filled or canceled.
+* Instrument registry: ``SimulatedExchange(clock=..., instruments=(spec, ...))``,
+  copied privately and immutable for the simulator's lifetime; duplicate symbols
+  are a constructor error. An order for an unregistered symbol is rejected (fail
+  closed, also with an empty registry).
+* LIMIT GTC / POST_ONLY orders are accepted and rest OPEN until filled or canceled,
+  after pre-trade checks against their ``InstrumentSpec``: price a multiple of
+  ``tick_size``, qty a multiple of ``qty_step``, ``min_qty <= qty <= max_qty``,
+  exact ``price * qty >= min_notional`` (no fees, leverage or margin). Nothing is
+  corrected; a violation is ``ExchangeRejectedError`` with no side effect (no id,
+  no clock read, nothing stored). These checks run only for a new client order id:
+  an identical retry of an accepted order returns its ack first.
 * Fills come only from an explicit simulation input,
   ``fill_crossed_limit_orders(symbol, execution_price, available_qty=None)`` (not
   part of ``TradingClient``, not market data): every OPEN / PARTIALLY_FILLED order
@@ -14,8 +24,12 @@ Current scope:
   ``execution_price >= limit`` executes at ``execution_price`` (price-improvement
   model). ``available_qty=None`` fills each crossed order's remaining quantity;
   otherwise it is the total quantity for the whole batch, allocated in
-  (created_at, client_order_id) order: ``min(remaining, still available)``, one
-  fill per order per call. ``Fill.qty`` is the quantity of that execution. There
+  (created_at, client_order_id) order: ``min(remaining, still available)`` rounded
+  DOWN to ``qty_step`` (an order whose share rounds to zero gets no fill, and the
+  unused budget is not carried over), one fill per order per call. The remaining
+  quantity is always a step multiple, so the last fill closes it exactly. The
+  execution price is not checked against ``tick_size``: it is an external
+  observation, not a new order price. ``Fill.qty`` is the quantity of that execution. There
   is no order book, bid/ask, depth, spread, slippage or latency: the caller fully
   determines price and liquidity. Fee, fee asset and liquidity role are unknown
   (``None``), never invented; POST_ONLY is not claimed to be maker.
@@ -74,10 +88,18 @@ from decimal import (
 from typing import Final
 
 from app.domain.clock import Clock
-from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
+from app.domain.enums import OrderStatus, OrderType, RoundingDirection, Side, TimeInForce
 from app.domain.errors import DomainValidationError
 from app.domain.fills import Fill
+from app.domain.instrument import InstrumentSpec
 from app.domain.orders import OrderUpdate
+from app.domain.rounding import (
+    is_price_aligned,
+    is_qty_aligned,
+    meets_min_notional,
+    meets_min_qty,
+    round_qty,
+)
 from app.domain.validation import require_text, require_utc
 from app.exchanges.errors import (
     ExchangeDuplicateOrderError,
@@ -249,6 +271,63 @@ def _require_positive_decimal(value: object, field: str) -> Decimal:
     return value
 
 
+def _check_instrument_rules(order: OrderRequest, spec: InstrumentSpec) -> None:
+    """Pre-trade checks of a new LIMIT order against its instrument. Values are
+    never corrected; any violation rejects the order (``ExchangeRejectedError``).
+    The domain helpers compute exactly in a private context (global decimal
+    context neither read nor modified)."""
+    price = order.price
+    if price is None:  # only LIMIT orders reach this point
+        raise ExchangeRejectedError("simulated exchange: limit price required")
+    try:
+        problems = [
+            (is_price_aligned(price, spec), f"price {price} is not a multiple of tick_size"),
+            (is_qty_aligned(order.qty, spec), f"qty {order.qty} is not a multiple of qty_step"),
+            (meets_min_qty(order.qty, spec), f"qty {order.qty} is below min_qty {spec.min_qty}"),
+            (order.qty <= spec.max_qty, f"qty {order.qty} is above max_qty {spec.max_qty}"),
+            (
+                meets_min_notional(price, order.qty, spec),
+                f"notional is below min_notional {spec.min_notional}",
+            ),
+        ]
+    except DomainValidationError:
+        raise ExchangeRejectedError(
+            f"simulated exchange: order {order.client_order_id} cannot be validated exactly "
+            f"against {spec.symbol}"
+        ) from None
+    for passed, message in problems:
+        if not passed:
+            raise ExchangeRejectedError(
+                f"simulated exchange: order {order.client_order_id} rejected: {message}"
+            )
+
+
+def _fill_qty(record: _SimulatedOrder, spec: InstrumentSpec, left: Decimal | None) -> Decimal:
+    """Quantity of this order's fill: the whole remaining quantity, or the part of
+    the budget ``left`` rounded DOWN to ``qty_step`` (0 if less than one step)."""
+    remaining = record.remaining_qty()
+    try:
+        aligned = is_qty_aligned(remaining, spec)
+    except DomainValidationError:
+        aligned = False
+    if not aligned:
+        raise RuntimeError(
+            f"simulated exchange: order state invariant violated for "
+            f"{record.request.client_order_id}: remaining {remaining} is not a multiple "
+            f"of qty_step {spec.qty_step}"
+        )
+    if left is None or left >= remaining:
+        return remaining
+    if left < spec.qty_step:
+        return _ZERO
+    try:
+        return round_qty(left, spec, RoundingDirection.DOWN)
+    except DomainValidationError:
+        raise ExchangeRequestValidationError(
+            "simulated exchange: available_qty cannot be allocated exactly"
+        ) from None
+
+
 def _require_symbol(symbol: object) -> str:
     try:
         return require_text(symbol, "symbol")
@@ -259,10 +338,19 @@ def _require_symbol(symbol: object) -> str:
 class SimulatedExchange:
     """In-memory ``TradingClient`` with deterministic ids and injected time."""
 
-    __slots__ = ("_clock", "_exec_sequence", "_orders", "_sequence")
+    __slots__ = ("_clock", "_exec_sequence", "_instruments", "_orders", "_sequence")
 
-    def __init__(self, *, clock: Clock) -> None:
+    def __init__(self, *, clock: Clock, instruments: tuple[InstrumentSpec, ...] = ()) -> None:
+        registry: dict[str, InstrumentSpec] = {}
+        for spec in tuple(instruments):
+            if not isinstance(spec, InstrumentSpec):
+                raise TypeError("instruments must contain only InstrumentSpec")
+            if spec.symbol in registry:
+                raise ValueError(f"duplicate instrument {spec.symbol}")
+            registry[spec.symbol] = spec
         self._clock = clock
+        # Private copy, immutable for the lifetime of the simulator.
+        self._instruments = registry
         self._orders: dict[str, _SimulatedOrder] = {}
         self._sequence = 0
         self._exec_sequence = 0
@@ -315,6 +403,10 @@ class SimulatedExchange:
             raise ExchangeRejectedError(
                 "simulated exchange: reduce_only is unsupported (no position model)"
             )
+        spec = self._instruments.get(order.symbol)
+        if spec is None:
+            raise ExchangeRejectedError(f"simulated exchange: unknown instrument {order.symbol}")
+        _check_instrument_rules(order, spec)
         now = self._now()
         record = _SimulatedOrder(
             request=order,
@@ -392,15 +484,22 @@ class SimulatedExchange:
 
         # Prepare the whole batch (allocation, fills, new records) without touching
         # any state; the clock is read only if something executes.
+        if not crossed:
+            return ()
+        spec = self._instruments.get(symbol)
+        if spec is None:
+            raise RuntimeError(
+                f"simulated exchange: order state invariant violated: orders of "
+                f"{symbol} have no registered instrument"
+            )
         try:
             allocations: list[tuple[_SimulatedOrder, Decimal]] = []
             left = available_qty
             for record in crossed:
                 record.check_invariants()  # never repair a corrupted record
-                if left is not None and left <= 0:
-                    break
-                remaining = record.remaining_qty()
-                qty = remaining if left is None else min(remaining, left)
+                qty = _fill_qty(record, spec, left)
+                if qty == 0:
+                    break  # budget below one step: every later order gets 0 too
                 allocations.append((record, qty))
                 if left is not None:
                     left = _exact_context().subtract(left, qty)
