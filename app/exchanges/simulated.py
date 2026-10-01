@@ -38,7 +38,11 @@ Current scope:
   ROUND_HALF_EVEN), independent of the global decimal context; the first fill's
   average is its execution price. Quantities and notionals are exact (fail closed
   if they need more than ``_EXACT_PRECISION`` digits).
-* No fees, balances or positions. Requests whose outcome cannot be
+* Positions: every committed fill is applied to a one-way net position ledger
+  (``simulated_positions.SimulatedPositionLedger``), read through the
+  simulation-only ``get_position(symbol)`` (None before the first fill). Gross
+  realized PnL only; no mark price, unrealized PnL unknown while open.
+* No fees, balances, leverage or margin. Requests whose outcome cannot be
   determined without them are refused (``ExchangeRejectedError``): MARKET (no
   execution price model), LIMIT IOC / FOK (never rest on the book, their outcome
   depends on matching), ``reduce_only`` (no position model).
@@ -62,7 +66,8 @@ Semantics:
   consecutive execution ids from a per-instance sequence. The clock is read once
   per batch that fills anything; all fills and order updates of the batch carry
   that time. A batch is all-or-nothing: every fill and new order record is built
-  first, then the state and the execution sequence are committed together. A
+  first, together with the resulting position state, then positions, orders and
+  the execution sequence are committed together. A
   record violating the status / fill invariants raises before anything is
   committed and is never repaired.
 * All timestamps come from the injected ``Clock``. Nothing is ever ambiguous: there
@@ -93,6 +98,7 @@ from app.domain.errors import DomainValidationError
 from app.domain.fills import Fill
 from app.domain.instrument import InstrumentSpec
 from app.domain.orders import OrderUpdate
+from app.domain.positions import Position
 from app.domain.rounding import (
     is_price_aligned,
     is_qty_aligned,
@@ -107,6 +113,7 @@ from app.exchanges.errors import (
     ExchangeRequestValidationError,
 )
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
+from app.exchanges.simulated_positions import SimulatedPositionLedger
 
 EXCHANGE_ORDER_ID_PREFIX: Final = "SIM-"
 EXEC_ID_PREFIX: Final = "SIM-EXEC-"
@@ -338,7 +345,7 @@ def _require_symbol(symbol: object) -> str:
 class SimulatedExchange:
     """In-memory ``TradingClient`` with deterministic ids and injected time."""
 
-    __slots__ = ("_clock", "_exec_sequence", "_instruments", "_orders", "_sequence")
+    __slots__ = ("_clock", "_exec_sequence", "_instruments", "_orders", "_positions", "_sequence")
 
     def __init__(self, *, clock: Clock, instruments: tuple[InstrumentSpec, ...] = ()) -> None:
         registry: dict[str, InstrumentSpec] = {}
@@ -354,6 +361,7 @@ class SimulatedExchange:
         self._orders: dict[str, _SimulatedOrder] = {}
         self._sequence = 0
         self._exec_sequence = 0
+        self._positions = SimulatedPositionLedger()
 
     def __repr__(self) -> str:
         return f"SimulatedExchange(orders={len(self._orders)})"
@@ -529,8 +537,17 @@ class SimulatedExchange:
                 "simulated exchange: fill quantities cannot be computed exactly"
             ) from None
 
-        # Commit.
+        # Position state of the whole batch, in fill order (still no mutation).
+        prepared_positions = self._positions.prepare(fills)
+
+        # Commit: positions, orders and the execution sequence together.
+        self._positions.commit(prepared_positions)
         for new_record in new_records:
             self._orders[new_record.request.client_order_id] = new_record
         self._exec_sequence = sequence
         return tuple(fills)
+
+    async def get_position(self, *, symbol: str) -> Position | None:
+        """Simulation-only read (not part of ``TradingClient``): the net position of
+        ``symbol``, or None if it never had a fill. Never reads the clock."""
+        return self._positions.get_position(_require_symbol(symbol))

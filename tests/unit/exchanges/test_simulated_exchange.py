@@ -1887,3 +1887,214 @@ async def test_order_without_registered_instrument_is_an_invariant_failure() -> 
         await strict_partial(exchange, "5")
 
     assert (await update_of(exchange)).status is OrderStatus.OPEN
+
+
+# === position accounting integration ==========================================
+
+
+async def position_of(exchange: SimulatedExchange, symbol: str = "BTCUSDT") -> Any:
+    return await exchange.get_position(symbol=symbol)
+
+
+@pytest.mark.asyncio
+async def test_no_position_before_fills(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100")))
+
+    assert await position_of(exchange) is None
+    assert await position_of(exchange, "UNKNOWNUSDT") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["", " BTCUSDT", None, 1])
+async def test_get_position_malformed_symbol(exchange: SimulatedExchange, symbol: object) -> None:
+    with pytest.raises(ExchangeRequestValidationError, match="symbol"):
+        await exchange.get_position(symbol=symbol)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_partial_fills_move_position_by_fill_qty(
+    exchange: SimulatedExchange, clock: ManualClock
+) -> None:
+    await exchange.place_order(request(price=D("100"), qty=D("10")))
+    clock.advance(timedelta(seconds=1))
+    await partial(exchange, "100", "3")
+    first = await position_of(exchange)
+    clock.advance(timedelta(seconds=1))
+    await partial(exchange, "94", "3")
+    second = await position_of(exchange)
+    clock.advance(timedelta(seconds=1))
+    await fill_at(exchange, "91")  # remaining 4
+    full = await position_of(exchange)
+
+    assert (first.qty, first.entry_price, first.updated_at) == (
+        D("3"),
+        D("100"),
+        T0 + timedelta(seconds=1),
+    )
+    assert (second.qty, second.entry_price) == (D("6"), D("97"))
+    assert (full.qty, full.entry_price, full.realized_pnl) == (D("10"), D("94.6"), D("0"))
+    assert full.updated_at == T0 + timedelta(seconds=3)
+    assert (full.mark_price, full.unrealized_pnl) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_sell_fills_close_and_reverse(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("10")))
+    await fill_at(exchange, "100")
+    await exchange.place_order(
+        request(client_order_id="s1", side=Side.SELL, price=D("110"), qty=D("4"))
+    )
+    await exchange.place_order(
+        request(client_order_id="s2", side=Side.SELL, price=D("120"), qty=D("6"))
+    )
+    await exchange.place_order(
+        request(client_order_id="s3", side=Side.SELL, price=D("130"), qty=D("5"))
+    )
+
+    await fill_at(exchange, "110")  # s1: partial close +40
+    partial_close = await position_of(exchange)
+    await fill_at(exchange, "120")  # s2: exact close +120
+    flat = await position_of(exchange)
+    await fill_at(exchange, "130")  # s3: opens short
+    short = await position_of(exchange)
+
+    assert (partial_close.qty, partial_close.entry_price, partial_close.realized_pnl) == (
+        D("6"),
+        D("100"),
+        D("40"),
+    )
+    assert (flat.qty, flat.entry_price, flat.realized_pnl, flat.unrealized_pnl) == (
+        D("0"),
+        None,
+        D("160"),
+        D("0"),
+    )
+    assert (short.qty, short.entry_price, short.realized_pnl) == (D("-5"), D("130"), D("160"))
+
+
+@pytest.mark.asyncio
+async def test_reversal_within_one_order(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("10")))
+    await fill_at(exchange, "100")
+    await exchange.place_order(
+        request(client_order_id="s", side=Side.SELL, price=D("110"), qty=D("15"))
+    )
+
+    await fill_at(exchange, "110")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.entry_price, p.realized_pnl) == (D("-5"), D("110"), D("100"))
+
+
+@pytest.mark.asyncio
+async def test_batch_fills_apply_in_batch_order(exchange: SimulatedExchange) -> None:
+    # Same created_at: "a" (SELL 8) is processed before "b" (BUY 5).
+    await exchange.place_order(
+        request(client_order_id="a", side=Side.SELL, price=D("90"), qty=D("8"))
+    )
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+
+    fills = await fill_at(exchange, "95")
+
+    assert [f.client_order_id for f in fills] == ["a", "b"]
+    p = await position_of(exchange)
+    # SELL 8 @95 opens short; BUY 5 @95 closes 5 at entry -> realized 0.
+    assert (p.qty, p.entry_price, p.realized_pnl) == (D("-3"), D("95"), D("0"))
+
+
+@pytest.mark.asyncio
+async def test_non_fills_do_not_touch_positions(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(client_order_id="canceled", price=D("100")))
+    await exchange.cancel_order(ref("canceled"))
+    await exchange.place_order(request(client_order_id="far", price=D("50")))
+    with pytest.raises(ExchangeRejectedError):
+        await exchange.place_order(request(client_order_id="bad", reduce_only=True))
+
+    await fill_at(exchange, "90")  # crosses only the canceled order
+
+    assert await position_of(exchange) is None
+
+
+@pytest.mark.asyncio
+async def test_budget_below_step_does_not_touch_positions() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order())
+
+    await strict_partial(exchange, "0.05")
+
+    assert await position_of(exchange) is None
+
+
+@pytest.mark.asyncio
+async def test_get_position_does_not_read_the_clock() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
+    await exchange.place_order(request(price=D("100")))
+    await fill_at(exchange, "100")
+    clock.calls = 0
+
+    p1 = await position_of(exchange)
+    p2 = await position_of(exchange)
+    await position_of(exchange, "ETHUSDT")
+
+    assert clock.calls == 0
+    assert p1 == p2
+
+
+@pytest.mark.asyncio
+async def test_failed_fill_preparation_leaves_positions_unchanged(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    await partial(exchange, "100", "2")
+    before = (await position_of(exchange), [await update_of(exchange, c) for c in "ab"])
+    real_build = simulated._build_fill
+    calls: list[str] = []
+
+    def failing_second(record: Any, **kwargs: Any) -> Fill:
+        calls.append(record.request.client_order_id)
+        if len(calls) == 2:
+            raise RuntimeError("injected fill failure")
+        return real_build(record, **kwargs)
+
+    monkeypatch.setattr(simulated, "_build_fill", failing_second)
+    with pytest.raises(RuntimeError, match="injected"):
+        await fill_at(exchange, "100")
+    monkeypatch.undo()
+
+    assert (await position_of(exchange), [await update_of(exchange, c) for c in "ab"]) == before
+    fills = await fill_at(exchange, "100")
+    assert [f.exec_id for f in fills] == ["SIM-EXEC-0000000002", "SIM-EXEC-0000000003"]
+
+
+@pytest.mark.asyncio
+async def test_failed_position_preparation_leaves_everything_unchanged(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.exchanges import simulated_positions
+
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("5")))
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("5")))
+    await partial(exchange, "100", "2")
+    before = (await position_of(exchange), [await update_of(exchange, c) for c in "ab"])
+    real_apply = simulated_positions._apply_fill
+    calls: list[str] = []
+
+    def failing_second(state: Any, fill: Fill) -> Any:
+        calls.append(fill.exec_id)
+        if len(calls) == 2:
+            raise simulated_positions.PositionAccountingError("injected position failure")
+        return real_apply(state, fill)
+
+    monkeypatch.setattr(simulated_positions, "_apply_fill", failing_second)
+    with pytest.raises(simulated_positions.PositionAccountingError, match="injected"):
+        await fill_at(exchange, "100")
+    monkeypatch.undo()
+
+    assert calls == ["SIM-EXEC-0000000002", "SIM-EXEC-0000000003"]
+    assert (await position_of(exchange), [await update_of(exchange, c) for c in "ab"]) == before
+    fills = await fill_at(exchange, "100")
+    assert [f.exec_id for f in fills] == ["SIM-EXEC-0000000002", "SIM-EXEC-0000000003"]
+    p = await position_of(exchange)
+    assert (p.qty, p.entry_price) == (D("10"), D("100"))

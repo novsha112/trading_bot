@@ -72,13 +72,26 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "exchanges.bybit.types": frozenset(),
     # Exchange-neutral simulator: domain plus the core exchange contracts only.
     "exchanges.simulated": frozenset(
-        {"app.domain", "app.exchanges.models", "app.exchanges.errors"}
+        {
+            "app.domain",
+            "app.exchanges.models",
+            "app.exchanges.errors",
+            "app.exchanges.simulated_positions",
+        }
     ),
+    # Position accounting: domain only (no exchange contracts, no instrument rules).
+    "exchanges.simulated_positions": frozenset({"app.domain"}),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
-# import (core contracts never depend on a concrete adapter).
-IMPLEMENTATION_SUBPACKAGES: frozenset[str] = frozenset({"exchanges.bybit", "exchanges.simulated"})
+# import (core contracts never depend on a concrete adapter), mapped to the only
+# other implementations allowed to use them.
+IMPLEMENTATION_SUBPACKAGES: dict[str, frozenset[str]] = {
+    "exchanges.bybit": frozenset(),
+    "exchanges.simulated": frozenset(),
+    # Position accounting is a building block of the simulator only.
+    "exchanges.simulated_positions": frozenset({"exchanges.simulated"}),
+}
 
 
 def _third_party_rule(module: str) -> frozenset[str] | None:
@@ -176,12 +189,15 @@ def find_violations(root: Path) -> list[str]:
             target = name_parts[1]
             if target != package and target not in allowed:
                 violations.append(f"{module}: imports '{name}' (app.{package} -> app.{target})")
-            for implementation in IMPLEMENTATION_SUBPACKAGES:
+            for implementation, importers in IMPLEMENTATION_SUBPACKAGES.items():
                 if implementation.split(".")[0] != package:
                     continue  # other packages are governed by ALLOWED_APP_IMPORTS
                 prefix = f"{root.name}.{implementation}"
                 imports_impl = name == prefix or name.startswith(f"{prefix}.")
-                inside_impl = module == prefix or module.startswith(f"{prefix}.")
+                inside_impl = any(
+                    module == owner or module.startswith(f"{owner}.")
+                    for owner in (prefix, *(f"{root.name}.{i}" for i in importers))
+                )
                 if imports_impl and not inside_impl:
                     violations.append(
                         f"{module}: imports '{name}' (core module -> implementation {prefix})"
@@ -638,6 +654,56 @@ def test_simulated_exchange_allowed_imports(tmp_path: Path) -> None:
         "from app.domain.orders import OrderUpdate\n"
         "from app.exchanges.errors import ExchangeRejectedError\n"
         "from .models import OrderAck\n",
+    )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("exchanges/protocols.py", "from .simulated_positions import X\n", "implementation"),
+        (
+            "exchanges/bybit/market_data.py",
+            "from app.exchanges.simulated_positions import X\n",
+            "implementation",
+        ),
+        ("exchanges/simulated_positions.py", "import httpx\n", "'httpx' (third-party"),
+        (
+            "exchanges/simulated_positions.py",
+            "from app.exchanges.models import OrderRequest\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/simulated_positions.py",
+            "from app.exchanges.simulated import SimulatedExchange\n",
+            "module allowlist",
+        ),
+        ("exchanges/simulated_positions.py", "from app.config import X\n", "-> app.config"),
+    ],
+)
+def test_position_ledger_violations(
+    tmp_path: Path, relative: str, source: str, expected: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_simulator_may_use_position_ledger(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/simulated.py",
+        "from app.exchanges.simulated_positions import SimulatedPositionLedger\n",
+    )
+    _write(
+        root,
+        "exchanges/simulated_positions.py",
+        "from fractions import Fraction\nfrom app.domain.fills import Fill\n",
     )
 
     assert find_violations(root) == []
