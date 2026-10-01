@@ -41,7 +41,15 @@ Current scope:
 * Positions: every committed fill is applied to a one-way net position ledger
   (``simulated_positions.SimulatedPositionLedger``), read through the
   simulation-only ``get_position(symbol)`` (None before the first fill). Gross
-  realized PnL only; no mark price, unrealized PnL unknown while open.
+  realized PnL only.
+* Mark-to-market: ``set_mark_price(symbol, mark_price)`` is an explicit simulation
+  input for a registered instrument (never inferred from executions, limits or
+  entries); the mark is stored per symbol, may precede the first fill and
+  survives flat. Positions are valued at the stored mark from the exact basis;
+  without a mark an open position's unrealized PnL is unknown (None). Marks and
+  fills have separate time streams: a stale mark is rejected, a newer mark never
+  makes a fill stale; ``Position.updated_at`` is the later of both. Marks never
+  move cash.
 * Reduce-only (deterministic simulator policy, not a claim about any exchange):
   a new reduce-only order must reduce the current position (SELL a long, BUY a
   short), else ``ExchangeRejectedError``; its size may exceed the position. At
@@ -138,7 +146,7 @@ from app.exchanges.simulated_accounting import (
     SimulatedCashLedger,
 )
 from app.exchanges.simulated_fees import SimulatedFeePolicy
-from app.exchanges.simulated_positions import SimulatedPositionLedger
+from app.exchanges.simulated_positions import MarkQuote, SimulatedPositionLedger
 
 EXCHANGE_ORDER_ID_PREFIX: Final = "SIM-"
 EXEC_ID_PREFIX: Final = "SIM-EXEC-"
@@ -398,6 +406,7 @@ class SimulatedExchange:
         "_exec_sequence",
         "_fees",
         "_instruments",
+        "_marks",
         "_orders",
         "_positions",
         "_sequence",
@@ -429,6 +438,8 @@ class SimulatedExchange:
         self._sequence = 0
         self._exec_sequence = 0
         self._positions = SimulatedPositionLedger()
+        # External mark prices (simulation input), independent of positions.
+        self._marks: dict[str, MarkQuote] = {}
         # Immutable for the lifetime of the simulator; None = fees not modeled.
         self._fees = fees
         if cash is not None:
@@ -650,6 +661,10 @@ class SimulatedExchange:
         if not new_records:
             return ()
 
+        # The published position (valued at the stored mark) must be computable
+        # before anything is committed.
+        positions.position(symbol, mark=self._marks.get(symbol))
+
         # Commit: positions, cash, orders and the execution sequence together.
         prepared_positions = positions.prepared()
         prepared_cash = None if cash is None else cash.prepared()
@@ -682,4 +697,28 @@ class SimulatedExchange:
     async def get_position(self, *, symbol: str) -> Position | None:
         """Simulation-only read (not part of ``TradingClient``): the net position of
         ``symbol``, or None if it never had a fill. Never reads the clock."""
-        return self._positions.get_position(_require_symbol(symbol))
+        symbol = _require_symbol(symbol)
+        return self._positions.get_position(symbol, mark=self._marks.get(symbol))
+
+    async def set_mark_price(self, *, symbol: str, mark_price: Decimal) -> Position | None:
+        """Simulation-only input (not part of ``TradingClient``, not inferred from
+        executions): the mark price of a registered instrument, observed now.
+
+        Revalues the position (exact basis) without changing quantities, basis,
+        realized PnL, cash, orders or ids. Returns the revalued position, or None if
+        the symbol has never had a fill (the mark is kept for later). A mark older
+        than the stored one is an invariant error; equal times are allowed."""
+        symbol = _require_symbol(symbol)
+        _require_positive_decimal(mark_price, "mark_price")
+        if symbol not in self._instruments:
+            raise ExchangeRejectedError(f"simulated exchange: unknown instrument {symbol}")
+        quote = MarkQuote(price=mark_price, at=self._now())
+        previous = self._marks.get(symbol)
+        if previous is not None and quote.at < previous.at:
+            raise RuntimeError(
+                f"simulated exchange: invariant violated: stale mark for {symbol} "
+                f"({quote.at.isoformat()} < {previous.at.isoformat()})"
+            )
+        revalued = self._positions.get_position(symbol, mark=quote)  # before commit
+        self._marks[symbol] = quote
+        return revalued

@@ -12,17 +12,24 @@ Model:
   short; any excess opens the other side at the fill's execution price.
 * ``realized_pnl`` is gross (execution prices only): fill fees and funding are
   never included. It is kept through flat and later positions.
-* No mark-to-market: an open position has ``mark_price=None`` and
-  ``unrealized_pnl=None`` (unknown); a flat one has ``unrealized_pnl=0``.
-* ``updated_at`` is the exchange time of the last applied fill; a fill older than
-  the symbol's current position is an error, equal times are allowed.
+* Mark-to-market is a read-time valuation with an externally supplied
+  ``MarkQuote``: unrealized PnL comes from the exact cost basis
+  (long ``mark * qty - cost``, short ``cost - mark * |qty|``), published like the
+  other values. Without a mark an open position has ``mark_price=None`` and
+  ``unrealized_pnl=None`` (unknown); a flat one always has ``unrealized_pnl=0``
+  and keeps a known mark price.
+* The fill stream has its own watermark (time of the last applied fill); a fill
+  older than it is an error, equal times are allowed. A published position's
+  ``updated_at`` is the later of that time and the mark time, so a newer mark
+  never makes a fill stale.
 * Idempotency by ``exec_id``: re-applying an identical fill changes nothing; the
   same id with a different payload is an identity conflict.
 
 Exactness: the entry cost and realized PnL are kept as exact rationals
 (``fractions.Fraction``), so closing part of a position with a non-terminating
 average basis (e.g. 310/3) leaves no rounding residue. Only the published
-``entry_price`` and ``realized_pnl`` are rounded, to ``POSITION_PRICE_PRECISION``
+``entry_price``, ``realized_pnl`` and ``unrealized_pnl`` are rounded, to
+``POSITION_PRICE_PRECISION``
 significant digits with ROUND_HALF_EVEN in an explicit context; the global
 decimal context is neither read nor modified. Quantities stay exact ``Decimal``.
 
@@ -37,7 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import (
     ROUND_HALF_EVEN,
     Context,
@@ -62,6 +69,22 @@ _ZERO_DECIMAL: Final = Decimal(0)
 _ZERO: Final = Fraction(0)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MarkQuote:
+    """An externally supplied mark price and the time it was observed. Valuation
+    input only: it never changes quantities, cost basis or realized PnL."""
+
+    price: Decimal
+    at: datetime
+
+    def __post_init__(self) -> None:
+        price = self.price
+        if type(price) is not Decimal or not price.is_finite() or price <= 0:
+            raise ValueError("mark price must be a finite Decimal > 0")
+        if not isinstance(self.at, datetime) or self.at.utcoffset() != timedelta(0):
+            raise ValueError("mark time 'at' must be a UTC datetime")
+
+
 class PositionAccountingError(RuntimeError):
     """Internal accounting invariant violated (stale or conflicting fill, corrupted
     state). Not an exchange answer; nothing was changed."""
@@ -76,7 +99,9 @@ class _PositionState:
     """Exact cost basis of the open quantity (>= 0; 0 when flat)."""
     realized: Fraction
     """Exact gross realized PnL."""
-    updated_at: datetime
+    last_fill_at: datetime
+    """Exchange time of the last applied fill: the watermark of the fill stream only
+    (mark updates never move it)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +130,10 @@ def _publish(value: Fraction) -> Decimal:
 
 def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
     """State after one fill (pure)."""
-    if state is not None and fill.exchange_ts < state.updated_at:
+    if state is not None and fill.exchange_ts < state.last_fill_at:
         raise PositionAccountingError(
             f"fill {fill.exec_id} is older than the {fill.symbol} position "
-            f"({fill.exchange_ts.isoformat()} < {state.updated_at.isoformat()})"
+            f"({fill.exchange_ts.isoformat()} < {state.last_fill_at.isoformat()})"
         )
     qty = state.qty if state is not None else _ZERO_DECIMAL
     cost = state.entry_cost if state is not None else _ZERO
@@ -142,20 +167,35 @@ def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
         qty=new_qty,
         entry_cost=cost,
         realized=realized,
-        updated_at=fill.exchange_ts,
+        last_fill_at=fill.exchange_ts,
     )
 
 
-def _to_position(state: _PositionState) -> Position:
+def _to_position(state: _PositionState, mark: MarkQuote | None) -> Position:
+    """Published position, valued at ``mark`` (if known) from the exact basis:
+    long ``mark * qty - cost``, short ``cost - mark * |qty|``, flat 0."""
     is_flat = state.qty == 0
+    open_qty = Fraction(abs(state.qty))
+    unrealized: Decimal | None
+    if is_flat:
+        unrealized = _ZERO_DECIMAL
+    elif mark is None:
+        unrealized = None
+    else:
+        value = Fraction(mark.price) * open_qty
+        exact = value - state.entry_cost if state.qty > 0 else state.entry_cost - value
+        unrealized = _publish(exact)
+    updated_at = state.last_fill_at
+    if mark is not None and mark.at > updated_at:
+        updated_at = mark.at
     return Position(
         symbol=state.symbol,
         qty=state.qty,
-        entry_price=None if is_flat else _publish(state.entry_cost / Fraction(abs(state.qty))),
-        mark_price=None,
-        unrealized_pnl=_ZERO_DECIMAL if is_flat else None,
+        entry_price=None if is_flat else _publish(state.entry_cost / open_qty),
+        mark_price=None if mark is None else mark.price,
+        unrealized_pnl=unrealized,
         realized_pnl=_publish(state.realized),
-        updated_at=state.updated_at,
+        updated_at=updated_at,
     )
 
 
@@ -199,6 +239,12 @@ class PositionBatch:
         self._applied[fill.exec_id] = fill
         return new_state.realized - (current.realized if current is not None else _ZERO)
 
+    def position(self, symbol: str, *, mark: MarkQuote | None) -> Position | None:
+        """The position as prepared so far, valued at ``mark`` (None if never
+        filled). Used to prove the published state is computable before commit."""
+        state = self._state(symbol)
+        return None if state is None else _to_position(state, mark)
+
     def prepared(self) -> PreparedPositions:
         return PreparedPositions(
             base_version=self._base_version,
@@ -220,10 +266,10 @@ class SimulatedPositionLedger:
     def __repr__(self) -> str:
         return f"SimulatedPositionLedger(symbols={len(self._states)})"
 
-    def get_position(self, symbol: str) -> Position | None:
+    def get_position(self, symbol: str, *, mark: MarkQuote | None = None) -> Position | None:
         """Current position, or None if no fill of ``symbol`` was ever applied."""
         state = self._states.get(symbol)
-        return None if state is None else _to_position(state)
+        return None if state is None else _to_position(state, mark)
 
     def begin_batch(self) -> PositionBatch:
         """A working copy for preparing several fills; reads see the batch's own

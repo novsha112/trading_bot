@@ -3025,3 +3025,390 @@ async def test_cash_scenario_is_deterministic() -> None:
         return await position_of(exchange), await exchange.get_cash_state()
 
     assert await run() == await run()
+
+
+# === mark-to-market ===============================================================
+
+
+class ScriptedClock:
+    """Returns the given times in order (may go backwards) to test stream ordering."""
+
+    def __init__(self, *seconds: int) -> None:
+        self.times = [T0 + timedelta(seconds=s) for s in seconds]
+        self.calls = 0
+
+    def now(self) -> datetime:
+        self.calls += 1
+        return self.times.pop(0)
+
+
+async def set_mark(exchange: SimulatedExchange, price: str, symbol: str = "BTCUSDT") -> Any:
+    return await exchange.set_mark_price(symbol=symbol, mark_price=D(price))
+
+
+@pytest.mark.asyncio
+async def test_mark_before_position_is_stored_and_applied_on_open(
+    exchange: SimulatedExchange, clock: ManualClock
+) -> None:
+    assert await set_mark(exchange, "110") is None
+    assert await position_of(exchange) is None  # no artificial position
+
+    clock.advance(timedelta(seconds=1))
+    await open_position(exchange, Side.BUY, "10")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.entry_price, p.mark_price, p.unrealized_pnl) == (
+        D("10"),
+        D("100"),
+        D("110"),
+        D("100"),
+    )
+    assert p.updated_at == T0 + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_no_mark_keeps_unknown_unrealized(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "10")
+
+    p = await position_of(exchange)
+    assert (p.mark_price, p.unrealized_pnl) == (None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "marks"),
+    [
+        (Side.BUY, [("90", "-100"), ("100", "0"), ("110", "100")]),
+        (Side.SELL, [("90", "100"), ("100", "0"), ("110", "-100")]),
+    ],
+)
+async def test_mark_updates_revalue_only(
+    exchange: SimulatedExchange, clock: ManualClock, side: Side, marks: list[tuple[str, str]]
+) -> None:
+    await open_position(exchange, side, "10")
+    before = await position_of(exchange)
+
+    for i, (price, unrealized) in enumerate(marks, start=1):
+        clock.advance(timedelta(seconds=1))
+        returned = await set_mark(exchange, price)
+        p = await position_of(exchange)
+        assert returned == p
+        assert (p.mark_price, p.unrealized_pnl) == (D(price), D(unrealized))
+        assert (p.qty, p.entry_price, p.realized_pnl) == (
+            before.qty,
+            before.entry_price,
+            before.realized_pnl,
+        )
+        assert p.updated_at == T0 + timedelta(seconds=i)
+    assert exchange._exec_sequence == 1
+    assert exchange._sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_validation_and_registry(exchange: SimulatedExchange) -> None:
+    for bad in (
+        D("0"),
+        D("-1"),
+        D("NaN"),
+        D("sNaN"),
+        D("Infinity"),
+        D("-Infinity"),
+        1,
+        1.5,
+        True,
+        "1",
+    ):
+        with pytest.raises(ExchangeRequestValidationError, match="mark_price"):
+            await exchange.set_mark_price(symbol="BTCUSDT", mark_price=bad)  # type: ignore[arg-type]
+    with pytest.raises(ExchangeRequestValidationError, match="symbol"):
+        await exchange.set_mark_price(symbol=" BTCUSDT", mark_price=D("1"))
+    with pytest.raises(ExchangeRejectedError, match="unknown instrument"):
+        await exchange.set_mark_price(symbol="DOGEUSDT", mark_price=D("1"))
+
+    class Sub(Decimal):
+        pass
+
+    with pytest.raises(ExchangeRequestValidationError, match="mark_price"):
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=Sub("1"))
+
+
+@pytest.mark.asyncio
+async def test_invalid_mark_does_not_read_clock() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
+
+    with pytest.raises(ExchangeRequestValidationError):
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("0"))
+    with pytest.raises(ExchangeRejectedError):
+        await exchange.set_mark_price(symbol="DOGEUSDT", mark_price=D("1"))
+
+    assert clock.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fill_after_mark_and_average_change_use_exact_basis(
+    exchange: SimulatedExchange,
+) -> None:
+    await set_mark(exchange, "120")
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("2")))
+    await fill_at(exchange, "100")
+    await exchange.place_order(request(client_order_id="b", price=D("110"), qty=D("1")))
+    await fill_at(exchange, "110")
+
+    p = await position_of(exchange)
+    assert p.unrealized_pnl == D("50")  # 360 - 310, from the exact basis
+
+
+@pytest.mark.asyncio
+async def test_partial_close_revalues_remaining(exchange: SimulatedExchange) -> None:
+    await set_mark(exchange, "110")
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="s", side=Side.SELL, qty=D("4"), price=D("105"))
+    )
+
+    await fill_at(exchange, "105")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.realized_pnl, p.mark_price, p.unrealized_pnl) == (
+        D("6"),
+        D("20"),
+        D("110"),
+        D("60"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_close_and_reopen_keep_mark(exchange: SimulatedExchange) -> None:
+    await set_mark(exchange, "105")
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("10"), price=D("100"))
+    )
+    await fill_at(exchange, "100")
+
+    flat = await position_of(exchange)
+    assert (flat.qty, flat.mark_price, flat.unrealized_pnl) == (D("0"), D("105"), D("0"))
+
+    await exchange.place_order(
+        request(client_order_id="reopen", side=Side.SELL, qty=D("2"), price=D("100"))
+    )
+    await fill_at(exchange, "100")
+    short = await position_of(exchange)
+    assert (short.qty, short.unrealized_pnl) == (D("-2"), D("-10"))
+
+
+@pytest.mark.asyncio
+async def test_reversal_revalues_new_side(exchange: SimulatedExchange) -> None:
+    await set_mark(exchange, "105")
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="rev", side=Side.SELL, qty=D("15"), price=D("110"))
+    )
+
+    await fill_at(exchange, "110")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.entry_price, p.realized_pnl, p.unrealized_pnl) == (
+        D("-5"),
+        D("110"),
+        D("100"),
+        D("25"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_fills_see_the_same_stored_mark(exchange: SimulatedExchange) -> None:
+    await set_mark(exchange, "100")
+    await exchange.place_order(request(client_order_id="a", price=D("96"), qty=D("1")))
+    await exchange.place_order(request(client_order_id="b", price=D("96"), qty=D("2")))
+
+    await fill_at(exchange, "95")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.mark_price, p.unrealized_pnl) == (D("3"), D("100"), D("15"))
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_with_mark_still_never_reverses(exchange: SimulatedExchange) -> None:
+    await set_mark(exchange, "120")
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "10", "110"))
+
+    await fill_at(exchange, "110")
+
+    p = await position_of(exchange)
+    assert (p.qty, p.mark_price, p.unrealized_pnl) == (D("0"), D("120"), D("0"))
+
+
+@pytest.mark.asyncio
+async def test_marks_do_not_touch_cash_fees_or_realized() -> None:
+    clock = ManualClock(T0)
+    exchange = cash_exchange(clock=clock)
+    await open_position(exchange, Side.BUY, "10")  # fee 1
+    cash_before = await exchange.get_cash_state()
+
+    for price in ("90", "130", "100.5"):
+        clock.advance(timedelta(seconds=1))
+        await set_mark(exchange, price)
+        assert await exchange.get_cash_state() == cash_before
+
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("10"), price=D("110"))
+    )
+    (close,) = await fill_at(exchange, "110")
+    assert close.fee == D("1.1")
+    assert await cash_parts(exchange) == (D("100"), D("2.1"), D("10097.9"))
+    p = await position_of(exchange)
+    assert (p.realized_pnl, p.unrealized_pnl, p.mark_price) == (D("100"), D("0"), D("100.5"))
+
+
+@pytest.mark.asyncio
+async def test_same_price_new_timestamp_is_a_new_event(
+    exchange: SimulatedExchange, clock: ManualClock
+) -> None:
+    await open_position(exchange, Side.BUY, "1")
+    first = await set_mark(exchange, "101")
+    again_same_time = await set_mark(exchange, "101")
+    clock.advance(timedelta(seconds=3))
+    later = await set_mark(exchange, "101")
+
+    assert again_same_time == first
+    assert later.updated_at == T0 + timedelta(seconds=3)
+    assert later.unrealized_pnl == first.unrealized_pnl
+
+
+@pytest.mark.asyncio
+async def test_mark_reads_do_not_use_clock() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("1"))
+    assert clock.calls == 1  # one read per mark update
+    await exchange.get_position(symbol="BTCUSDT")
+    assert clock.calls == 1
+
+
+# --- timestamp streams ----------------------------------------------------------------
+
+
+async def scripted_exchange(*seconds: int) -> SimulatedExchange:
+    exchange = SimulatedExchange(clock=ScriptedClock(*seconds), instruments=SPECS)
+    return exchange
+
+
+@pytest.mark.asyncio
+async def test_fill_then_mark_then_fill() -> None:  # A
+    exchange = await scripted_exchange(0, 1, 2, 3, 4)
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("1")))  # t0
+    await fill_at(exchange, "100")  # t1
+    await set_mark(exchange, "105")  # t2
+    await exchange.place_order(request(client_order_id="b", price=D("100"), qty=D("1")))  # t3
+    await fill_at(exchange, "100")  # t4
+
+    p = await position_of(exchange)
+    assert (p.qty, p.unrealized_pnl, p.updated_at) == (D("2"), D("10"), T0 + timedelta(seconds=4))
+
+
+@pytest.mark.asyncio
+async def test_newer_mark_does_not_make_an_older_fill_stale() -> None:  # B
+    exchange = await scripted_exchange(0, 9, 5)
+    await exchange.place_order(request(price=D("100"), qty=D("1")))  # t0
+    await set_mark(exchange, "105")  # t9
+
+    (fill,) = await fill_at(exchange, "100")  # t5 < mark t9: still a valid fill
+
+    assert fill.exchange_ts == T0 + timedelta(seconds=5)
+    p = await position_of(exchange)
+    assert (p.qty, p.unrealized_pnl) == (D("1"), D("5"))
+    assert p.updated_at == T0 + timedelta(seconds=9)  # latest of fill and mark
+
+
+@pytest.mark.asyncio
+async def test_older_fill_after_newer_fill_is_still_rejected() -> None:  # C
+    exchange = await scripted_exchange(0, 1, 5, 3)
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("1")))  # t0
+    await exchange.place_order(request(client_order_id="b", price=D("90"), qty=D("1")))  # t1
+    await fill_at(exchange, "100")  # t5: fills a
+    before = await snapshot(exchange, "a", "b")
+
+    with pytest.raises(RuntimeError, match="older"):
+        await fill_at(exchange, "90")  # t3: fill of b is older than t5
+
+    assert await snapshot(exchange, "a", "b") == before
+
+
+@pytest.mark.asyncio
+async def test_older_mark_is_rejected_without_mutation() -> None:  # D
+    exchange = await scripted_exchange(0, 1, 9, 4)
+    await exchange.place_order(request(price=D("100"), qty=D("1")))
+    await fill_at(exchange, "100")
+    await set_mark(exchange, "105")  # t9
+    before = await position_of(exchange)
+
+    with pytest.raises(RuntimeError, match="stale mark"):
+        await set_mark(exchange, "90")  # t4
+
+    assert await position_of(exchange) == before
+
+
+@pytest.mark.asyncio
+async def test_equal_timestamps_for_fills_and_marks() -> None:  # E, F
+    exchange = await scripted_exchange(0, 0, 5, 5, 5, 5)
+    await exchange.place_order(request(client_order_id="a", price=D("100"), qty=D("1")))
+    await exchange.place_order(request(client_order_id="b", price=D("90"), qty=D("1")))
+    await fill_at(exchange, "100")  # t5
+    await fill_at(exchange, "90")  # t5, equal: allowed
+    await set_mark(exchange, "95")  # t5
+    p = await set_mark(exchange, "96")  # t5, equal: allowed
+
+    assert (p.qty, p.mark_price, p.unrealized_pnl) == (D("2"), D("96"), D("2"))
+
+
+# --- atomicity ------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_valuation_in_fill_batch_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.exchanges import simulated_positions
+
+    exchange = cash_exchange()
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("110"))
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "20", "110"))
+    before = (await snapshot(exchange, "a"), await exchange.get_cash_state())
+
+    def failing(state: Any, mark: Any) -> Any:
+        raise ArithmeticError("injected valuation failure")
+
+    monkeypatch.setattr(simulated_positions, "_to_position", failing)
+    with pytest.raises(ArithmeticError, match="injected"):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert (await snapshot(exchange, "a"), await exchange.get_cash_state()) == before
+    assert (await update_of(exchange, "a")).status is OrderStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_failed_revaluation_keeps_old_mark(
+    exchange: SimulatedExchange, clock: ManualClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.exchanges import simulated_positions
+
+    await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("105"))
+    await open_position(exchange, Side.BUY, "10")
+    before = await position_of(exchange)
+    clock.advance(timedelta(seconds=1))
+
+    def failing(state: Any, mark: Any) -> Any:
+        raise ArithmeticError("injected revaluation failure")
+
+    monkeypatch.setattr(simulated_positions, "_to_position", failing)
+    with pytest.raises(ArithmeticError, match="injected"):
+        await exchange.set_mark_price(symbol="BTCUSDT", mark_price=D("90"))
+    monkeypatch.undo()
+
+    assert await position_of(exchange) == before
+    assert before.mark_price == D("105")

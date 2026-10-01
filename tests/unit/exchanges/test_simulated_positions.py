@@ -16,6 +16,7 @@ from app.domain.fills import Fill
 from app.domain.positions import Position
 from app.exchanges import simulated, simulated_positions
 from app.exchanges.simulated_positions import (
+    MarkQuote,
     PositionAccountingError,
     SimulatedPositionLedger,
 )
@@ -534,3 +535,130 @@ def test_delta_sum_equals_exact_realized() -> None:
     p = ledger.get_position("BTCUSDT")
     assert p is not None
     assert sum(d for d in deltas if d is not None) == p.realized_pnl == D("6.5")
+
+
+# --- valuation (mark-to-market) -------------------------------------------------------
+
+
+def mark(price: str, seconds: int = 0) -> MarkQuote:
+    return MarkQuote(price=D(price), at=T0 + timedelta(seconds=seconds))
+
+
+def valued(*fills: Fill, quote: MarkQuote) -> Position:
+    ledger = SimulatedPositionLedger()
+    for f in fills:
+        ledger.apply_fill(f)
+    p = ledger.get_position("BTCUSDT", mark=quote)
+    assert p is not None
+    return p
+
+
+@pytest.mark.parametrize(
+    ("side", "price", "expected"),
+    [
+        (Side.BUY, "90", "-100"),
+        (Side.BUY, "100", "0"),
+        (Side.BUY, "110", "100"),
+        (Side.SELL, "90", "100"),
+        (Side.SELL, "100", "0"),
+        (Side.SELL, "110", "-100"),
+    ],
+)
+def test_unrealized_long_and_short(side: Side, price: str, expected: str) -> None:
+    p = valued(fill(side, "10", "100"), quote=mark(price))
+
+    assert (p.mark_price, p.unrealized_pnl) == (D(price), D(expected))
+    assert p.unrealized_pnl is not None  # a known zero stays known
+
+
+def test_unrealized_uses_exact_basis_not_rounded_entry() -> None:
+    p = valued(buy("2", "100"), buy("1", "110"), quote=mark("120"))
+
+    # 3 * 120 - 310 = 50 exactly; the rounded entry (103.33...) would not give it.
+    assert p.unrealized_pnl == D("50")
+    assert p.entry_price == D("103.3333333333333333333333333333333333333")
+
+
+def test_unrealized_non_terminating_is_published_at_40_digits() -> None:
+    p = valued(buy("3", "100"), sell("1", "100"), quote=mark("100.5"))
+
+    # 2 * 100.5 - 2 * 100 = 1 exactly
+    assert p.unrealized_pnl == D("1")
+    q = valued(buy("2", "100"), buy("1", "101"), sell("2", "100"), quote=mark("100"))
+    # remaining 1 @ 301/3: 100 - 100.333... = -1/3
+    assert q.unrealized_pnl == D("-0.3333333333333333333333333333333333333333")
+
+
+def test_flat_keeps_mark_and_zero_unrealized() -> None:
+    p = valued(buy("1", "100"), sell("1", "110"), quote=mark("105"))
+
+    assert (p.qty, p.entry_price, p.mark_price, p.unrealized_pnl) == (
+        D("0"),
+        None,
+        D("105"),
+        D("0"),
+    )
+
+
+def test_updated_at_is_latest_of_fill_and_mark() -> None:
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100", ts=T0 + timedelta(seconds=5)))
+
+    later_mark = ledger.get_position("BTCUSDT", mark=mark("101", 9))
+    earlier_mark = ledger.get_position("BTCUSDT", mark=mark("101", 2))
+
+    assert later_mark is not None
+    assert earlier_mark is not None
+    assert later_mark.updated_at == T0 + timedelta(seconds=9)
+    assert earlier_mark.updated_at == T0 + timedelta(seconds=5)
+
+
+def test_mark_never_moves_the_fill_watermark() -> None:
+    # A newer mark must not make an older-than-mark fill look stale.
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100", ts=T0 + timedelta(seconds=1)))
+    ledger.get_position("BTCUSDT", mark=mark("101", 10))
+
+    p = ledger.apply_fill(buy("1", "100", ts=T0 + timedelta(seconds=2)))
+
+    assert p.qty == D("2")
+    with pytest.raises(PositionAccountingError, match="older"):
+        ledger.apply_fill(buy("1", "100", ts=T0 + timedelta(seconds=1, microseconds=-1)))
+
+
+def test_valuation_ignores_the_global_decimal_context() -> None:
+    def run() -> Position:
+        return valued(buy("2", "100.123"), buy("1", "110.7"), quote=mark("105.05"))
+
+    baseline = run()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = "ROUND_UP"
+        low = run()
+
+    assert low == baseline
+    assert str(low.unrealized_pnl) == str(baseline.unrealized_pnl)
+
+
+@pytest.mark.parametrize("price", [D("0"), D("-1"), D("NaN"), D("Infinity"), 1, 1.5, "1", None])
+def test_mark_quote_validation(price: object) -> None:
+    with pytest.raises(ValueError, match="mark"):
+        MarkQuote(price=price, at=T0)  # type: ignore[arg-type]
+
+
+def test_mark_quote_requires_utc_time() -> None:
+    with pytest.raises(ValueError, match="at"):
+        MarkQuote(price=D("1"), at=datetime(2026, 1, 15))  # noqa: DTZ001
+
+
+def test_batch_position_uses_prepared_state_and_mark() -> None:
+    ledger = SimulatedPositionLedger()
+    batch = ledger.begin_batch()
+    batch.apply(buy("10", "100"))
+
+    p = batch.position("BTCUSDT", mark=mark("110"))
+
+    assert p is not None
+    assert (p.qty, p.unrealized_pnl) == (D("10"), D("100"))
+    assert ledger.get_position("BTCUSDT") is None
+    assert batch.position("ETHUSDT", mark=None) is None
