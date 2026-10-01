@@ -100,6 +100,8 @@
 
 **Мета.** Інтерфейси біржі, нормалізовані помилки і тестовий дубль, на якому можна будувати execution без реальної біржі.
 
+**Стан.** Розпочато: async-контракти `MarketDataClient` / `AccountClient` / `TradingClient`, `OrderAck` і базові помилки (`Rejected` / `Unavailable` / `AmbiguousResult`) — у `app/exchanges/`. Retry, rate limiter, `FakeExchange`, contract suite і вибір бібліотеки — наступні кроки фази. Геометрія Grid (`app/strategies/grid/levels.py`) лишається раннім ізольованим компонентом; решта Grid Strategy чекає своїх залежностей (Phase 5–6).
+
 **Що реалізуємо.**
 - Протоколи `PublicMarketDataClient`, `TradingAdapter`, `PrivateStream`.
 - Ієрархія помилок: `ExchangeRejectedError`, `OutcomeUnknownError`, `NotSentError`, `RateLimitError`, `AuthError`, `TemporaryExchangeError`.

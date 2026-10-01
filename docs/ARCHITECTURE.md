@@ -224,6 +224,29 @@ app/
 
 ## 5. Exchange Adapter
 
+### 5.0 Поточні контракти (Phase 2, `app/exchanges/`)
+
+Реалізовано лише контракти, без жодного адаптера (Bybit ще немає):
+
+```text
+MarketDataClient   get_instrument(symbol) -> InstrumentSpec; get_ticker(symbol) -> Ticker
+AccountClient      get_balances() -> tuple[Balance, ...]; get_positions() -> tuple[Position, ...]
+TradingClient      place_order(order: Order) -> OrderAck
+                   cancel_order(order: Order) -> None
+                   get_order(*, symbol, client_order_id) -> OrderUpdate | None
+                   get_open_orders(*, symbol) -> tuple[OrderUpdate, ...]
+```
+
+- Усі методи `async`; протоколи структурні (`typing.Protocol`), відповідність перевіряє mypy.
+- Межа: через протоколи проходять лише доменні типи і `OrderAck`. Сирі відповіді, JSON, SDK-об'єкти й біржові назви (статуси, ідентифікатори) лишаються в адаптері, який перекладає їх явно.
+- `TradingClient` приймає доменний `Order`, а не intent: лише `Order` містить `client_order_id` (ключ ідемпотентності, згенерований і збережений execution до відправки) та відомий `exchange_order_id` для скасування. Адаптер ніколи не генерує власний ідентифікатор.
+- `OrderAck` (`client_order_id`, `exchange_order_id`, необов'язковий `exchange_ts`) — підтвердження прийняття запиту, **не статус**: ордер лишається `SUBMITTING`, доки `OrderUpdate` не підтвердить стан. Запис `exchange_order_id` — оновлення метаданих (Phase 5), не перехід state machine.
+- `cancel_order` повертає `None`: прийняття запиту на скасування не означає `CANCELED`; результат (у гонці й `FILLED`) приходить через `OrderUpdate`.
+- `get_order` повертає `None` лише тоді, коли біржа підтвердила, що такого ордера немає. Неможливість отримати відповідь — виняток, ніколи не `None` чи порожній результат.
+- Помилки (`app/exchanges/errors.py`): `ExchangeRejectedError` (однозначно відхилено, нічого не виконано; підклас `ExchangeAuthenticationError`), `ExchangeUnavailableError` (точно не виконано: не відправлено, явний rate limit), `ExchangeAmbiguousResultError` (мутуючий запит міг виконатися). Невизначений результат не наслідується від «безпечних» помилок і **ніколи не повторюється наосліп**: він запускає перевірку через `get_order` / reconciliation. Якщо адаптер не може довести, що запит не дійшов, він кидає `ExchangeAmbiguousResultError`.
+
+Підрозділи 5.1–5.2 нижче — цільовий повний дизайн; методи, яких ще немає в контрактах, додаються разом зі споживачами.
+
 ### 5.1 Розділення на три інтерфейси
 
 Публічні дані, приватна торгівля і приватний стрім мають різні вимоги (auth, rate limit, reconnect). Тому замість одного великого протоколу — три невеликі:

@@ -49,6 +49,9 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "config": frozenset({"pydantic", "pydantic_settings", "yaml"}),
     # Pure, deterministic algorithms on domain types: same code in backtest and live.
     "strategies": frozenset(),
+    # Exchange-neutral contracts; SDKs / HTTP / WS libraries are allowed only once a
+    # concrete adapter needs them, by an explicit change of this rule.
+    "exchanges": frozenset(),
 }
 
 
@@ -358,6 +361,49 @@ def test_strategy_allowed_imports(tmp_path: Path) -> None:
         "import itertools\nfrom decimal import Decimal, localcontext\n"
         "from app.domain.enums import GridSpacing\nfrom ...domain.validation import require_enum\n"
         "from . import helpers\n",
+    )
+
+    assert find_violations(root) == []
+
+
+# --- Exchanges: domain + standard library only (for now) ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from app.config.settings import EnvSettings\n", "app.exchanges -> app.config"),
+        ("from app.strategies.grid import levels\n", "app.exchanges -> app.strategies"),
+        ("from app.monitoring.logging import configure_logging\n", "-> app.monitoring"),
+        ("from app.execution import engine\n", "app.exchanges -> app.execution"),
+        ("from app.risk import manager\n", "app.exchanges -> app.risk"),
+        ("from app.persistence import db\n", "app.exchanges -> app.persistence"),
+        ("import pydantic\n", "'pydantic' (third-party"),
+        ("import yaml\n", "'yaml' (third-party"),
+        ("import structlog\n", "'structlog' (third-party"),
+        ("import httpx\n", "'httpx' (third-party"),
+        ("import websockets\n", "'websockets' (third-party"),
+        ("import ccxt\n", "'ccxt' (third-party"),
+        ("from pybit.unified_trading import HTTP\n", "'pybit"),
+    ],
+)
+def test_exchange_violations_detected(tmp_path: Path, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "exchanges/protocols.py", source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+def test_exchange_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/protocols.py",
+        "from typing import Protocol\nfrom app.domain.orders import Order\n"
+        "from .models import OrderAck\n",
     )
 
     assert find_violations(root) == []
