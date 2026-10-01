@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import tracemalloc
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
@@ -285,12 +286,22 @@ def test_decimal_subclass_rejected(field: str) -> None:
 
 
 @pytest.mark.parametrize("field", ["price", "qty"])
-@pytest.mark.parametrize("value", [D("1E+64"), D("1E-64"), D("1E+999999999")])
-def test_absurd_magnitudes_fail_closed_without_expanding(field: str, value: Decimal) -> None:
+@pytest.mark.parametrize("value", [D("1E+999999999"), D("1E-999999999"), D("123456789E+999999990")])
+def test_pathological_exponent_fails_before_materializing_text(field: str, value: Decimal) -> None:
     order = request(LIMIT, **{field: value})
 
-    with pytest.raises(ExchangeRequestValidationError, match=field):
-        map_order_request(order)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ExchangeRequestValidationError) as excinfo:
+            map_order_request(order)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # A plain-notation string would need ~1 GB; the check runs on as_tuple() only.
+    assert peak < 1_000_000
+    assert field in str(excinfo.value)
+    assert "decimal representation exceeds local safety limit" in str(excinfo.value)
 
 
 def test_market_price_present_fails_closed() -> None:
@@ -404,17 +415,30 @@ def test_symbol_sent_exactly(symbol: str) -> None:
     assert body["category"] == "linear"
 
 
-@pytest.mark.parametrize(
-    "symbol",
-    ["btcusdt", "BtcUSDT", "BTC-USDT", "BTC/USDT", "BTC_USDT", "BTCUSDT\n", "\uff22\uff34\uff23"],
-)
-def test_symbol_not_uppercase_alnum_fails_closed_without_normalizing(symbol: str) -> None:
-    # Docs: "uppercase only". The mapper never upper-cases or strips: a wrong
-    # symbol is a caller bug, not something to repair silently.
+@pytest.mark.parametrize("symbol", ["btcusdt", "BtcUSDT", "BTCUSDt", "ethusdt"])
+def test_lowercase_symbol_fails_closed_without_normalizing(symbol: str) -> None:
+    # Docs: "Symbol name, like BTCUSDT, uppercase only". The mapper never
+    # upper-cases: a wrong symbol is a caller bug, not something to repair silently.
+    order = request(symbol=symbol)
+
+    with pytest.raises(ExchangeRequestValidationError, match="symbol"):
+        map_order_request(order)
+
+
+@pytest.mark.parametrize("symbol", [" BTCUSDT", "BTCUSDT ", "BTCUSDT\n", "\tBTCUSDT"])
+def test_symbol_with_surrounding_whitespace_fails_closed(symbol: str) -> None:
     order = tampered(request(), symbol=symbol)
 
     with pytest.raises(ExchangeRequestValidationError, match="symbol"):
         map_order_request(order)
+
+
+@pytest.mark.parametrize("symbol", ["BTC-USDT", "BTC/USDT", "BTC_USDT", "BTC-26DEC25", "123"])
+def test_uppercase_symbol_with_punctuation_is_not_rejected_by_the_mapper(symbol: str) -> None:
+    # The docs define no character set for symbol, only "uppercase only". Whether
+    # the symbol exists and is a USDT linear perpetual is proven by InstrumentSpec /
+    # preflight, not guessed here.
+    assert map_order_request(request(symbol=symbol))["symbol"] == symbol
 
 
 @pytest.mark.parametrize("symbol", ["", None, 1])
@@ -513,25 +537,54 @@ def test_mapping_module_has_no_transport_or_logging_dependencies() -> None:
         assert not any(part in name for part in forbidden), name
 
 
+def test_safety_limit_is_a_documented_internal_bound() -> None:
+    assert order_mapping.MAX_DECIMAL_TEXT_LENGTH == 1024
+
+
+@pytest.mark.parametrize(
+    "value",
+    [D("1E+70"), D("1E-70"), D("1" * 64 + ".5"), D("9" * 200), D("0." + "0" * 300 + "1")],
+)
+def test_values_longer_than_64_characters_are_serialized(value: Decimal) -> None:
+    # 64 was never a Bybit rule; such values are only bounded by the local limit.
+    text = map_order_request(request(LIMIT, qty=value, price=value))["qty"]
+
+    assert isinstance(text, str)
+    assert len(text) > 64
+    assert "E" not in text
+    assert "e" not in text
+    assert D(text) == value
+
+
+LIMIT_LENGTH = 1024
+
+
 @pytest.mark.parametrize(
     ("value", "accepted"),
     [
-        (D("1E+63"), True),  # 64 characters
-        (D("1E+64"), False),  # 65 characters
-        (D("1E-62"), True),  # "0." + 61 zeros + "1" = 64 characters
-        (D("1E-63"), False),  # 65 characters
-        (D("1" * 63 + ".1"), False),  # 65 characters
-        (D("1" * 62 + ".1"), True),  # 64 characters
+        (D(f"1E+{LIMIT_LENGTH - 1}"), True),  # "1" + 1023 zeros = 1024 characters
+        (D(f"1E+{LIMIT_LENGTH}"), False),  # 1025 characters
+        (D(f"1E-{LIMIT_LENGTH - 2}"), True),  # "0." + 1021 zeros + "1" = 1024
+        (D(f"1E-{LIMIT_LENGTH - 1}"), False),  # 1025 characters
+        (D("1" * (LIMIT_LENGTH - 2) + ".1"), True),  # 1024 characters
+        (D("1" * (LIMIT_LENGTH - 1) + ".1"), False),  # 1025 characters
+        (D("7" * LIMIT_LENGTH), True),  # 1024 characters, integer
+        (D("7" * (LIMIT_LENGTH + 1)), False),  # 1025 characters, integer
     ],
 )
-def test_decimal_text_length_bound_is_exact(value: Decimal, accepted: bool) -> None:
-    order = request(LIMIT, qty=value)
+@pytest.mark.parametrize("field", ["price", "qty"])
+def test_local_safety_limit_boundary_is_exact(field: str, value: Decimal, accepted: bool) -> None:
+    order = request(LIMIT, **{field: value})
 
     if accepted:
-        text = map_order_request(order)["qty"]
+        text = map_order_request(order)[field]
         assert isinstance(text, str)
-        assert len(text) == 64
+        assert len(text) == LIMIT_LENGTH
         assert D(text) == value
     else:
-        with pytest.raises(ExchangeRequestValidationError, match="qty"):
+        with pytest.raises(ExchangeRequestValidationError) as excinfo:
             map_order_request(order)
+        message = str(excinfo.value)
+        assert field in message
+        assert "decimal representation exceeds local safety limit" in message
+        assert "Bybit limit" not in message

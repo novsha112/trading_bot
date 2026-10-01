@@ -3,7 +3,10 @@
 Official contract (bybit-exchange/docs, branch master: docs/v5/order/create-order.mdx,
 docs/v5/enum.mdx):
 * ``category``: ``linear`` (scope: USDT linear perpetuals, one-way mode);
-* ``symbol``: "uppercase only"; sent exactly as given, never normalized;
+* ``symbol``: "Symbol name, like BTCUSDT, uppercase only" (no character set is
+  documented): checked only for surrounding whitespace and ``symbol == symbol.upper()``,
+  sent exactly as given, never normalized. Existence and instrument type are
+  proven by ``InstrumentSpec`` / preflight, not guessed here;
 * ``side``: ``Buy`` / ``Sell``; ``orderType``: ``Limit`` / ``Market``;
 * ``qty`` / ``price``: strings; ``price`` only for limit orders ("Market order
   will ignore this field");
@@ -21,6 +24,8 @@ Decimals are written in canonical plain notation: no exponent, no float, no
 trailing fractional zeros, no rounding (``1.500`` -> ``"1.5"``, ``1E+8`` ->
 ``"100000000"``, ``1E-8`` -> ``"0.00000001"``). Equal values always give equal
 text. Alignment to tick size / qty step is a pre-trade check, not done here.
+The text length is bounded by ``MAX_DECIMAL_TEXT_LENGTH``, an internal
+resource-safety bound (not a Bybit API limit), checked before the text is built.
 
 Every call returns a new dict owned by the caller (the transport serializes and
 signs it immediately). Failures raise ``ExchangeRequestValidationError``: nothing
@@ -51,10 +56,11 @@ _LIMIT_TIME_IN_FORCE: Final[dict[TimeInForce, str]] = {
 _MARKET_TIME_IN_FORCE: Final[dict[TimeInForce, str]] = {TimeInForce.IOC: "IOC"}
 
 _ORDER_LINK_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,36}")
-_SYMBOL: Final = re.compile(r"[A-Z0-9]+")
-# Local safety bound, not a Bybit limit: real prices / quantities are far shorter.
-# Refuses absurd magnitudes (e.g. 1E+999999999) before expanding them to text.
-MAX_DECIMAL_TEXT_LENGTH: Final = 64
+# Internal resource-safety bound, not a Bybit API limit. Real prices and
+# quantities are orders of magnitude shorter; the bound only stops pathological
+# values (e.g. Decimal("1E+999999999")) from being expanded into huge strings.
+# Checked on Decimal.as_tuple() before any text is materialized.
+MAX_DECIMAL_TEXT_LENGTH: Final = 1024
 
 _E = TypeVar("_E", Side, OrderType, TimeInForce)
 
@@ -90,7 +96,10 @@ def _plain_decimal(value: object, field: str) -> str:
     else:
         length = 2 + -exponent
     if length > MAX_DECIMAL_TEXT_LENGTH:
-        raise _fail(f"{field} exceeds {MAX_DECIMAL_TEXT_LENGTH} characters in plain notation")
+        raise _fail(
+            f"{field}: decimal representation exceeds local safety limit "
+            f"({MAX_DECIMAL_TEXT_LENGTH} characters)"
+        )
     if exponent >= 0:
         return digits + "0" * exponent
     point = len(digits) + exponent
@@ -105,8 +114,13 @@ def map_order_request(order: OrderRequest) -> dict[str, JsonValue]:
         raise _fail("expected an OrderRequest")
 
     symbol = order.symbol
-    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
-        raise _fail("symbol must be uppercase letters and digits only")
+    if (
+        not isinstance(symbol, str)
+        or not symbol
+        or symbol != symbol.strip()
+        or symbol != symbol.upper()
+    ):
+        raise _fail("symbol must be non-empty, uppercase, without surrounding whitespace")
     link_id = order.client_order_id
     if not isinstance(link_id, str) or not _ORDER_LINK_ID.fullmatch(link_id):
         raise _fail("orderLinkId must be 1-36 characters of [A-Za-z0-9_-]")
