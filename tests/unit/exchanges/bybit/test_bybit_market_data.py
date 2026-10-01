@@ -227,20 +227,43 @@ async def test_instrument_mapping(recorder: Recorder, clock: ManualClock) -> Non
         tick_size=D("0.10"),
         qty_step=D("0.001"),
         min_qty=D("0.001"),
-        max_qty=D("500.000"),  # min(maxOrderQty, maxMktOrderQty)
+        max_qty=D("1190.000"),  # maxOrderQty (limit / post-only), not maxMktOrderQty
         min_notional=D("5"),
     )
     assert str(spec.tick_size) == "0.10"  # exact string-to-Decimal, no float detour
 
 
 @pytest.mark.asyncio
-async def test_instrument_max_qty_is_the_lower_limit(
-    recorder: Recorder, clock: ManualClock
+@pytest.mark.parametrize("market_max", ["25", "100", "300"])
+async def test_instrument_max_qty_is_max_order_qty(
+    recorder: Recorder, clock: ManualClock, market_max: str
 ) -> None:
+    # The market-order limit is a separate capability; it never narrows max_qty.
     item = with_instrument(
-        **{"lotSizeFilter.maxOrderQty": "100", "lotSizeFilter.maxMktOrderQty": "300"}
+        **{"lotSizeFilter.maxOrderQty": "100", "lotSizeFilter.maxMktOrderQty": market_max}
     )
     assert (await get_instrument(recorder, clock, envelope([item]))).max_qty == D("100")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "", 25, None])
+async def test_market_max_qty_still_validated(
+    recorder: Recorder, clock: ManualClock, value: Any
+) -> None:
+    item = with_instrument(**{"lotSizeFilter.maxMktOrderQty": value})
+    with pytest.raises(ExchangeResponseError, match="maxMktOrderQty"):
+        await get_instrument(recorder, clock, envelope([item]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [_DELETE, None, "false", 0])
+async def test_is_pre_listing_required_bool(
+    recorder: Recorder, clock: ManualClock, value: Any
+) -> None:
+    # Documented for every linear instrument (false for regular contracts): absence
+    # is a schema change, not "false".
+    with pytest.raises(ExchangeResponseError, match="isPreListing"):
+        await get_instrument(recorder, clock, envelope([with_instrument(isPreListing=value)]))
 
 
 @pytest.mark.asyncio
@@ -472,7 +495,9 @@ async def test_crossed_book_is_rejected_by_domain(recorder: Recorder, clock: Man
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["abc", "1.5", "-1", "1e12", 1768478400000, " 1768478400000"])
+@pytest.mark.parametrize(
+    "value", ["abc", "1.5", "-1", "-0", "1e12", 1768478400000, " 1768478400000"]
+)
 async def test_malformed_next_funding_time(
     recorder: Recorder, clock: ManualClock, value: Any
 ) -> None:
@@ -518,11 +543,12 @@ async def call(adapter: BybitMarketDataClient, getter: str) -> object:
             ExchangeRejectedError,
             "10001",
         ),
-        (
-            json_response(envelope([], retCode=10006, retMsg="Too many visits")),
-            ExchangeRejectedError,
-            "10006",
-        ),
+        (json_response(envelope([], retCode=10000)), ExchangeResponseError, "10000"),
+        (json_response(envelope([], retCode=10006)), ExchangeResponseError, "10006"),
+        (json_response(envelope([], retCode=10016)), ExchangeResponseError, "10016"),
+        (json_response(envelope([], retCode=429)), ExchangeResponseError, "retCode 429"),
+        (json_response(envelope([], retCode=99999)), ExchangeResponseError, "99999"),
+        (json_response(envelope([], retCode=-1)), ExchangeResponseError, "retCode -1"),
         (json_response({"retCode": "0", "retMsg": "OK"}), ExchangeResponseError, "retCode"),
         (json_response(envelope([], category="spot")), ExchangeResponseError, "category"),
         (json_response({**envelope([]), "result": []}), ExchangeResponseError, "result"),
@@ -541,9 +567,14 @@ async def call(adapter: BybitMarketDataClient, getter: str) -> object:
         (text_response("<html>Bad gateway</html>"), ExchangeResponseError, "not valid JSON"),
         (text_response('{"retCode": NaN}'), ExchangeResponseError, "not valid JSON"),
         (text_response(""), ExchangeResponseError, "not valid JSON"),
-        (json_response(envelope([]), 403), ExchangeRejectedError, "HTTP 403"),
-        (json_response(envelope([]), 429), ExchangeRejectedError, "HTTP 429"),
+        (json_response(envelope([]), 400), ExchangeRejectedError, "HTTP 400"),
         (json_response(envelope([]), 404), ExchangeRejectedError, "HTTP 404"),
+        (json_response(envelope([]), 401), ExchangeResponseError, "HTTP 401"),
+        (json_response(envelope([]), 403), ExchangeResponseError, "HTTP 403"),
+        (json_response(envelope([]), 408), ExchangeResponseError, "HTTP 408"),
+        (json_response(envelope([]), 429), ExchangeResponseError, "HTTP 429"),
+        (json_response(envelope([]), 302), ExchangeResponseError, "HTTP 302"),
+        (json_response(envelope([]), 418), ExchangeResponseError, "HTTP 418"),
         (json_response(envelope([]), 500), ExchangeResponseError, "HTTP 500"),
         (json_response(envelope([]), 503), ExchangeResponseError, "HTTP 503"),
     ],
@@ -659,3 +690,29 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("real network access in a unit test")
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", forbidden)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "", "000"])
+async def test_next_funding_time_without_value_is_none(
+    recorder: Recorder, clock: ManualClock, value: str
+) -> None:
+    # "0" is not converted to 1970-01-01.
+    ticker = await get_ticker(recorder, clock, envelope([with_ticker(nextFundingTime=value)]))
+    assert ticker.next_funding_at is None
+
+
+@pytest.mark.asyncio
+async def test_next_funding_time_valid_value_unchanged(
+    recorder: Recorder, clock: ManualClock
+) -> None:
+    item = with_ticker(nextFundingTime="1768478400001")
+    ticker = await get_ticker(recorder, clock, envelope([item]))
+    assert ticker.next_funding_at == datetime(2026, 1, 15, 12, 0, 0, 1000, tzinfo=UTC)
+
+
+def test_known_ret_codes_are_explicit() -> None:
+    from app.exchanges.bybit import market_data
+
+    assert frozenset({10001}) == market_data.REQUEST_ERROR_RET_CODES
+    assert frozenset({10000, 10006, 10016, 429}) == market_data.TRANSIENT_RET_CODES

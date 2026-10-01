@@ -4,7 +4,10 @@ Official contract (bybit-exchange/docs, docs/v5):
 * ``GET /v5/market/instruments-info?category=linear&symbol=...``
 * ``GET /v5/market/tickers?category=linear&symbol=...``
 * envelope: ``retCode`` (0 = success), ``retMsg``, ``result``, ``retExtInfo``,
-  ``time`` (server timestamp of the response, ms).
+  ``time`` (Bybit server response timestamp, ms; not a market-event timestamp).
+* error codes (docs/v5/error): only the codes whose meaning we rely on are listed
+  below; any other non-zero ``retCode`` is treated as "no valid answer", never as
+  a client mistake.
 
 v1 supports USDT-settled linear perpetuals only (``contractType=LinearPerpetual``,
 ``quoteCoin=settleCoin=USDT``, ``status=Trading``, not pre-listing); anything else
@@ -47,6 +50,22 @@ _TRADING_STATUS: Final = "Trading"
 _DECIMAL_TEXT: Final = re.compile(r"-?[0-9]+(?:\.[0-9]+)?\Z")
 _MILLIS_TEXT: Final = re.compile(r"[0-9]+\Z")
 _MAX_MESSAGE: Final = 120
+
+# retCode values whose meaning is "the request itself is wrong" (definitive).
+REQUEST_ERROR_RET_CODES: Final = frozenset({10001})  # Request parameter error
+# retCode values meaning "no normal result right now" (infrastructure / load).
+TRANSIENT_RET_CODES: Final = frozenset(
+    {
+        10000,  # Server Timeout
+        10006,  # Too many visits (API rate limit)
+        10016,  # Server error
+        429,  # High server load
+    }
+)
+# HTTP statuses that describe a malformed or unsupported request (docs/v5/error):
+# 400 bad request, 404 path not found. Everything else that is not 2xx (403 edge /
+# region / IP rate limit, 408, 429, 5xx, unknown) is "no valid answer".
+_REQUEST_ERROR_HTTP_STATUSES: Final = frozenset({400, 404})
 
 
 def _fail(message: str) -> NoReturn:
@@ -94,12 +113,25 @@ def _optional_decimal(obj: dict[str, Any], key: str) -> Decimal | None:
 
 
 def _optional_millis(obj: dict[str, Any], key: str) -> datetime | None:
+    # "" and "0" mean "no value"; 0 is never turned into 1970-01-01.
     value = _require(obj, key)
     if value == "":
         return None
     if not isinstance(value, str) or not _MILLIS_TEXT.match(value):
         _fail(f"field {key} is not a millisecond timestamp string")
-    return _utc(int(value), key)
+    millis = int(value)
+    if millis == 0:
+        return None
+    return _utc(millis, key)
+
+
+def _positive_decimal(obj: dict[str, Any], key: str) -> Decimal:
+    # For documented fields that are validated but not projected into a domain model
+    # (the domain cannot check them).
+    value = _decimal(obj, key)
+    if value <= 0:
+        _fail(f"field {key} must be > 0")
+    return value
 
 
 def _utc(ms: int, key: str) -> datetime:
@@ -147,10 +179,16 @@ class BybitMarketDataClient:
         tick_size = _decimal(price_filter, "tickSize")
         qty_step = _decimal(lot_filter, "qtyStep")
         min_qty = _decimal(lot_filter, "minOrderQty")
-        max_limit_qty = _decimal(lot_filter, "maxOrderQty")
-        max_market_qty = _decimal(lot_filter, "maxMktOrderQty")
+        max_qty = _decimal(lot_filter, "maxOrderQty")
+        # maxMktOrderQty is the separate limit for MARKET orders. It is part of the
+        # documented contract, so it is validated (a broken value means a broken
+        # response), but InstrumentSpec has no market-order limit yet: it is not
+        # projected until a consumer of market orders needs it.
+        _positive_decimal(lot_filter, "maxMktOrderQty")
         min_notional = _decimal(lot_filter, "minNotionalValue")
-        pre_listing = item.get("isPreListing", False)
+        # Documented for every linear instrument (false for regular contracts):
+        # a missing field is a schema change, not "false".
+        pre_listing = _require(item, "isPreListing")
         if not isinstance(pre_listing, bool):
             _fail("field isPreListing is not a boolean")
 
@@ -178,8 +216,8 @@ class BybitMarketDataClient:
                 tick_size=tick_size,
                 qty_step=qty_step,
                 min_qty=min_qty,
-                # One limit for every order type: the lower of limit and market maxima.
-                max_qty=min(max_limit_qty, max_market_qty),
+                # Maximum quantity of a limit / post-only order (maxOrderQty).
+                max_qty=max_qty,
                 min_notional=min_notional,
             )
         except DomainError as exc:
@@ -204,8 +242,8 @@ class BybitMarketDataClient:
                 best_ask=best_ask,
                 funding_rate=funding_rate,
                 next_funding_at=next_funding_at,
-                # The ticker item has no timestamp of its own; the envelope ``time`` is
-                # the server time of the response, i.e. "state as of" this moment.
+                # The ticker item has no timestamp of its own. This is the Bybit server
+                # response timestamp (envelope ``time``), not a market-event timestamp.
                 exchange_ts=response_time,
                 received_ts=received_ts,
             )
@@ -230,10 +268,10 @@ class BybitMarketDataClient:
         received_ts = self._clock.now()
 
         status = response.status_code
-        if 400 <= status < 500:
+        if status in _REQUEST_ERROR_HTTP_STATUSES:
             raise ExchangeRejectedError(f"Bybit: request refused with HTTP {status}")
         if not 200 <= status < 300:
-            _fail(f"unexpected HTTP {status}")
+            _fail(f"no valid answer, HTTP {status}")
 
         try:
             body = json.loads(
@@ -250,7 +288,12 @@ class BybitMarketDataClient:
         if ret_code != 0:
             ret_msg = body.get("retMsg")
             detail = ret_msg[:_MAX_MESSAGE].replace("\n", " ") if isinstance(ret_msg, str) else ""
-            raise ExchangeRejectedError(f"Bybit: retCode {ret_code}: {detail}")
+            if ret_code in REQUEST_ERROR_RET_CODES:
+                raise ExchangeRejectedError(f"Bybit: retCode {ret_code}: {detail}")
+            # Known transient codes and unknown codes alike: do not claim the caller
+            # made a wrong request when we do not know that.
+            kind = "transient" if ret_code in TRANSIENT_RET_CODES else "unrecognized"
+            _fail(f"{kind} retCode {ret_code}: {detail}")
 
         time_ms = _require(body, "time")
         if type(time_ms) is not int:
