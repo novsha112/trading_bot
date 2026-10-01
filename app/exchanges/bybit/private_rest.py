@@ -10,16 +10,21 @@ Official contract (bybit-exchange/docs, docs/v5/guide.mdx):
 The signed query string / JSON body is built once and sent byte-for-byte as
 signed. Business endpoints (orders, account) are not implemented here.
 
-Outcome classification:
-* ``get`` (read-only): never ambiguous; a missing or broken answer is an
-  ``ExchangeResponseError``.
-* ``post_mutating``: once the request may have reached the exchange, any outcome
-  that is not a documented definitive refusal is ``ExchangeAmbiguousResultError``
-  (reconcile, never re-send blindly).
-* Pre-send failures are ``ExchangeNotSentError`` only when provable: local
-  validation, or httpx ``ConnectError`` / ``ConnectTimeout`` / ``PoolTimeout``,
-  which httpcore 1.x raises only while establishing or acquiring a connection,
-  before any request byte is written.
+Outcome classification (duplicate-order prevention over saved reconciliations):
+* ``post_mutating``:
+  - ``ExchangeNotSentError`` only when not sending is proven before entering the
+    HTTP send path: local validation (path, body, serialization) or httpx
+    ``PoolTimeout`` (documented as waiting to acquire a pool connection).
+  - Any other transport failure (connect, read, write, protocol, proxy, unknown)
+    and any non-2xx HTTP status: ``ExchangeAmbiguousResultError``; an HTTP error
+    status is not a documented Bybit business outcome.
+  - HTTP 2xx with a valid envelope: documented auth codes -> authentication error,
+    10001 / 10002 -> rejected, everything else non-zero -> ambiguous; a malformed
+    body -> ambiguous.
+  After an ambiguous outcome the order is reconciled by client order id; it is
+  never re-sent blindly.
+* ``get`` (read-only, no side effects): never ambiguous; connection failures are
+  "not sent", a missing or broken answer is ``ExchangeResponseError``.
 """
 
 from __future__ import annotations
@@ -69,16 +74,20 @@ REQUEST_ERROR_RET_CODES: Final = frozenset({10001, 10002})
 # 429 high load, unknown codes) is "no definitive answer": a response error for
 # reads, ambiguous for mutating requests.
 
-# HTTP statuses that describe the request itself (docs/v5/error): 400 malformed,
-# 404 path not found -> refused; 401 -> authentication refused. Any other non-2xx
-# status is not a definitive refusal.
-_REQUEST_ERROR_HTTP: Final = frozenset({400, 404})
-_AUTH_HTTP: Final = frozenset({401})
+# For read-only GET only: HTTP statuses that describe the request itself
+# (docs/v5/error): 400 malformed, 404 path not found -> refused; 401 ->
+# authentication refused. Mutating POST treats every non-2xx as ambiguous.
+_READ_REQUEST_ERROR_HTTP: Final = frozenset({400, 404})
+_READ_AUTH_HTTP: Final = frozenset({401})
 
 _PATH: Final = re.compile(r"/v5(?:/[A-Za-z0-9_-]+)+\Z")
 _PARAM_NAME: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
-_PRE_SEND_ERRORS: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Read-only requests: no connection means nothing was read; no side effect either way.
+_READ_NOT_SENT_ERRORS: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Mutating requests: only waiting for a pool connection (public httpx semantics:
+# "Timed out waiting to acquire a connection from the pool") precedes any send.
+_MUTATING_NOT_SENT_ERRORS: Final = (httpx.PoolTimeout,)
 _MAX_MESSAGE: Final = 120
 _REDACTED: Final = "[REDACTED]"
 
@@ -256,19 +265,23 @@ class BybitPrivateRestTransport:
                 raise ExchangeAmbiguousResultError(f"{where}: outcome unknown, {reason}")
             raise ExchangeResponseError(f"{where}: {reason}")
 
+        not_sent_errors = _MUTATING_NOT_SENT_ERRORS if mutating else _READ_NOT_SENT_ERRORS
         try:
             response = await self._client.request(method, url, headers=headers, content=content)
-        except _PRE_SEND_ERRORS as exc:
+        except not_sent_errors as exc:
             raise ExchangeNotSentError(f"{where}: not sent ({type(exc).__name__})") from None
         except httpx.RequestError as exc:
             no_answer(f"no response ({type(exc).__name__})")
 
         status = response.status_code
-        if status in _AUTH_HTTP:
-            raise ExchangeAuthenticationError(f"{where}: authentication refused, HTTP {status}")
-        if status in _REQUEST_ERROR_HTTP:
-            raise ExchangeRejectedError(f"{where}: request refused, HTTP {status}")
         if not 200 <= status < 300:
+            if mutating:
+                # An HTTP error status is not a documented Bybit business outcome.
+                no_answer(f"HTTP {status}")
+            if status in _READ_AUTH_HTTP:
+                raise ExchangeAuthenticationError(f"{where}: authentication refused, HTTP {status}")
+            if status in _READ_REQUEST_ERROR_HTTP:
+                raise ExchangeRejectedError(f"{where}: request refused, HTTP {status}")
             no_answer(f"HTTP {status}")
 
         try:

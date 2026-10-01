@@ -429,20 +429,27 @@ async def test_get_error_classification(
 # --- Mutating POST error classification --------------------------------------------------
 
 POST_CASES: list[tuple[Handler, type[ExchangeError], str]] = [
-    # Provably not sent: the connection was never established / acquired.
-    (raising(httpx.ConnectError("refused")), ExchangeNotSentError, "not sent"),
-    (raising(httpx.ConnectTimeout("t")), ExchangeNotSentError, "not sent"),
+    # Waiting for a pool connection (public httpx semantics): before any request.
     (raising(httpx.PoolTimeout("t")), ExchangeNotSentError, "not sent"),
-    # Possibly sent: outcome unknown.
+    # Any other transport failure after entering the send path: outcome unknown.
+    (raising(httpx.ConnectError("refused")), ExchangeAmbiguousResultError, "ConnectError"),
+    (raising(httpx.ConnectTimeout("t")), ExchangeAmbiguousResultError, "ConnectTimeout"),
+    (raising(httpx.NetworkError("t")), ExchangeAmbiguousResultError, "NetworkError"),
+    (raising(httpx.TransportError("t")), ExchangeAmbiguousResultError, "TransportError"),
+    (raising(httpx.RequestError("t")), ExchangeAmbiguousResultError, "RequestError"),
     (raising(httpx.ReadTimeout("t")), ExchangeAmbiguousResultError, "ReadTimeout"),
     (raising(httpx.WriteTimeout("t")), ExchangeAmbiguousResultError, "WriteTimeout"),
     (raising(httpx.WriteError("t")), ExchangeAmbiguousResultError, "WriteError"),
     (raising(httpx.ReadError("t")), ExchangeAmbiguousResultError, "ReadError"),
     (raising(httpx.RemoteProtocolError("t")), ExchangeAmbiguousResultError, "RemoteProtocolError"),
     (raising(httpx.ProxyError("t")), ExchangeAmbiguousResultError, "ProxyError"),
-    (json_response(ok(), 400), ExchangeRejectedError, "HTTP 400"),
-    (json_response(ok(), 404), ExchangeRejectedError, "HTTP 404"),
-    (json_response(ok(), 401), ExchangeAuthenticationError, "HTTP 401"),
+    # Non-2xx HTTP without a documented Bybit business outcome: outcome unknown,
+    # even when the body happens to look like a Bybit envelope.
+    (json_response(ok(), 400), ExchangeAmbiguousResultError, "HTTP 400"),
+    (json_response(ok(), 404), ExchangeAmbiguousResultError, "HTTP 404"),
+    (json_response(ok(), 401), ExchangeAmbiguousResultError, "HTTP 401"),
+    (json_response(ok(retCode=10003), 401), ExchangeAmbiguousResultError, "HTTP 401"),
+    (json_response(ok(retCode=10001), 400), ExchangeAmbiguousResultError, "HTTP 400"),
     (json_response(ok(), 403), ExchangeAmbiguousResultError, "HTTP 403"),
     (json_response(ok(), 408), ExchangeAmbiguousResultError, "HTTP 408"),
     (json_response(ok(), 429), ExchangeAmbiguousResultError, "HTTP 429"),
@@ -522,12 +529,35 @@ async def test_transport_does_not_close_injected_client() -> None:
     await harness.client.aclose()
 
 
-def test_pre_send_classification_matches_installed_httpcore() -> None:
-    # Pre-send semantics were verified against httpcore 1.x (ConnectError/ConnectTimeout
-    # only while establishing a connection, PoolTimeout while waiting for one).
-    import httpcore
+@pytest.mark.asyncio
+async def test_mutating_local_failures_never_touch_the_network() -> None:
+    # Local validation happens before any HTTP call: provably not sent.
+    harness = Harness(json_response(ok()))
+    async with harness.client:
+        with pytest.raises(ExchangeNotSentError, match="path"):
+            await harness.transport.post_mutating("https://evil.example/v5/x", body={})
+        with pytest.raises(ExchangeNotSentError, match="unsupported JSON value"):
+            await harness.transport.post_mutating("/v5/order/create", body={"qty": 0.1})  # type: ignore[dict-item]
+        with pytest.raises(ExchangeNotSentError, match="unsupported JSON value"):
+            await harness.transport.post_mutating("/v5/order/create", body={"x": float("inf")})  # type: ignore[dict-item]
+    assert harness.requests == []
 
-    assert httpcore.__version__.startswith("1.")
+
+@pytest.mark.asyncio
+async def test_mutating_ambiguity_survives_connect_failures_with_valid_envelope_later() -> None:
+    # A connect failure is never upgraded to "not sent" for a mutating request.
+    with pytest.raises(ExchangeAmbiguousResultError) as info:
+        await do_post(raising(httpx.ConnectError("refused")))
+    assert "not sent" not in str(info.value)
+
+
+def test_no_dependency_on_transport_library_internals() -> None:
+    import inspect
+
+    from app.exchanges.bybit import private_rest
+
+    # The safety contract rests on public httpx exception types only.
+    assert "httpcore" not in inspect.getsource(private_rest)
 
 
 @pytest.fixture(autouse=True)
