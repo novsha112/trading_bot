@@ -9,6 +9,7 @@ import pytest
 from app.exchanges.errors import (
     ExchangeAmbiguousResultError,
     ExchangeAuthenticationError,
+    ExchangeDuplicateOrderError,
     ExchangeError,
     ExchangeNotSentError,
     ExchangeRejectedError,
@@ -91,3 +92,10 @@ def test_request_validation_error_is_a_local_not_sent_error() -> None:
     assert issubclass(ExchangeRequestValidationError, ExchangeNotSentError)
     for other in (ExchangeRejectedError, ExchangeAmbiguousResultError, ExchangeResponseError):
         assert not issubclass(ExchangeRequestValidationError, other)
+
+
+def test_duplicate_order_error_is_a_rejection() -> None:
+    # This request created nothing (rejected), yet the client id is taken.
+    assert issubclass(ExchangeDuplicateOrderError, ExchangeRejectedError)
+    for other in (ExchangeNotSentError, ExchangeAmbiguousResultError, ExchangeResponseError):
+        assert not issubclass(ExchangeDuplicateOrderError, other)

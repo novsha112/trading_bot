@@ -48,6 +48,16 @@ class ExchangeAuthenticationError(ExchangeRejectedError):
     """
 
 
+class ExchangeDuplicateOrderError(ExchangeRejectedError):
+    """A placement was refused because its ``client_order_id`` already belongs to an
+    existing order with different terms.
+
+    This request created nothing, but an order with that id DOES exist: the caller
+    must not conclude "never placed". Reconcile the existing order through
+    ``get_order`` and treat the mismatch as a local-state bug.
+    """
+
+
 class ExchangeAmbiguousResultError(ExchangeError):
     """A request may have been accepted by the exchange; the outcome is unknown."""
 

@@ -70,11 +70,15 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
         }
     ),
     "exchanges.bybit.types": frozenset(),
+    # Exchange-neutral simulator: domain plus the core exchange contracts only.
+    "exchanges.simulated": frozenset(
+        {"app.domain", "app.exchanges.models", "app.exchanges.errors"}
+    ),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
 # import (core contracts never depend on a concrete adapter).
-IMPLEMENTATION_SUBPACKAGES: frozenset[str] = frozenset({"exchanges.bybit"})
+IMPLEMENTATION_SUBPACKAGES: frozenset[str] = frozenset({"exchanges.bybit", "exchanges.simulated"})
 
 
 def _third_party_rule(module: str) -> frozenset[str] | None:
@@ -580,3 +584,60 @@ def test_pure_mapping_module_allowed_imports(tmp_path: Path) -> None:
 def test_real_order_mapping_module_is_covered_by_the_allowlist() -> None:
     assert (APP_ROOT / "exchanges" / "bybit" / "order_mapping.py").is_file()
     assert (APP_ROOT / "exchanges" / "bybit" / "types.py").is_file()
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import httpx\n", "'httpx' (third-party"),
+        ("import pydantic\n", "'pydantic' (third-party"),
+        ("from app.exchanges.bybit.order_mapping import X\n", "implementation"),
+        ("from .bybit import market_data\n", "implementation"),
+        ("from app.exchanges.protocols import TradingClient\n", "module allowlist"),
+        ("from app.config.settings import X\n", "-> app.config"),
+        ("from app.persistence import X\n", "-> app.persistence"),
+        ("from app.strategies.grid.levels import X\n", "-> app.strategies"),
+    ],
+)
+def test_simulated_exchange_violations(tmp_path: Path, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "exchanges/simulated.py", source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+    assert all(v.startswith("app.exchanges.simulated:") for v in violations), violations
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        ("exchanges/protocols.py", "from app.exchanges.simulated import SimulatedExchange\n"),
+        ("exchanges/errors.py", "from .simulated import SimulatedExchange\n"),
+        ("exchanges/bybit/market_data.py", "from ..simulated import SimulatedExchange\n"),
+    ],
+)
+def test_core_and_bybit_must_not_import_simulator(
+    tmp_path: Path, relative: str, source: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert "implementation app.exchanges.simulated" in violations[0]
+
+
+def test_simulated_exchange_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/simulated.py",
+        "from dataclasses import dataclass\nfrom app.domain.clock import Clock\n"
+        "from app.domain.orders import OrderUpdate\n"
+        "from app.exchanges.errors import ExchangeRejectedError\n"
+        "from .models import OrderAck\n",
+    )
+
+    assert find_violations(root) == []

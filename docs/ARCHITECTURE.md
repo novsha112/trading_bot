@@ -269,7 +269,8 @@ ExchangeError
 ├── ExchangeNotSentError
 │   └── ExchangeRequestValidationError
 ├── ExchangeRejectedError
-│   └── ExchangeAuthenticationError
+│   ├── ExchangeAuthenticationError
+│   └── ExchangeDuplicateOrderError
 └── ExchangeAmbiguousResultError
 ```
 
@@ -279,6 +280,7 @@ ExchangeError
 | `ExchangeRequestValidationError` | Підвид `NotSent`: запит відхилено локально **до будь-якого виклику транспорту**, бо його неможливо виразити в документованому форматі біржі (непідтримана комбінація полів, значення поза документованим синтаксисом) | Повтор того самого запиту безглуздий — виправити запит |
 | `ExchangeRejectedError` | Біржа відповіла й однозначно відмовила, нічого не прийнято (зокрема явна відмова через rate limit) | Не повторюється наосліп |
 | `ExchangeAuthenticationError` | Біржа відхилила автентифікацію чи права (не для відсутніх локальних ключів — це помилка конфігурації) | Ні; HALTED + сповіщення |
+| `ExchangeDuplicateOrderError` | Підвид `Rejected`: розміщення відхилено, бо `client_order_id` уже належить існуючому ордеру з іншими умовами. Цей запит нічого не створив, **але ордер з таким id існує** — не можна робити висновок «не розміщено»; звірити через `get_order`, розбіжність — баг локального стану | Ні |
 | `ExchangeAmbiguousResultError` | Мутуючий запит міг бути прийнятий, підтвердженого результату немає (timeout чи розрив після відправки, або адаптер не може довести, що запит не пішов) | **Ніколи наосліп**: спершу reconciliation |
 | `ExchangeResponseError` | **Лише для читання:** запит відправлено (або міг бути), але валідної відповіді немає (timeout, розрив, 5xx, зламаний чи неочікуваний JSON). Читання не має побічних ефектів, тому це не `Ambiguous`. Мутуючі запити його ніколи не кидають | Може повторити політика викликача |
 
@@ -338,12 +340,24 @@ Rate limiter (token bucket) живе в адаптері, окремо для к
 - Поля `OrderRequest` перевіряються повторно (enum — саме член enum, а не рівний йому рядок `StrEnum`; `reduceOnly` — саме `bool`), бо mapping — остання межа перед підписом. Кожен виклик повертає новий `dict`, яким володіє викликач; транспорт одразу серіалізує й підписує його. Frozen DTO не вводився: незмінність після підпису забезпечує транспорт (тіло серіалізується один раз).
 - `JsonValue` винесено в `exchanges/bybit/types.py`, тож mapping не залежить від `private_rest`; тест архітектури має для `order_mapping` / `types` окремий allowlist (лише `app.domain`, `app.exchanges.models`, `app.exchanges.errors`, `app.exchanges.bybit.types`; без third-party).
 
+**Наявний: `app/exchanges/simulated.py` — `SimulatedExchange(*, clock: Clock)`** — детермінований exchange-neutral `TradingClient` без мережі, ключів і Bybit. Є авторитетним біржовим станом свого екземпляра; викликачі звіряються з ним так само, як з реальною біржею.
+
+- Внутрішній стан — приватний frozen-запис `_SimulatedOrder` (прийнятий `OrderRequest`, `exchange_order_id`, біржовий статус, `created_at` / `updated_at`), а не доменний `Order`: локальний lifecycle (`SUBMITTING`, `UNKNOWN`, `strategy_id`, `version`) належить execution-шару, біржа його не знає.
+- `exchange_order_id` — непрозорий рядок із монотонної послідовності екземпляра (`SIM-0000000001`, …); номер видається лише прийнятим ордерам. Ширина не є частиною контракту. Жодних UUID і випадковості: однаковий сценарій → однаковий результат.
+- `place_order`: LIMIT GTC / POST_ONLY → OPEN. Fail closed (`ExchangeRejectedError`, нічого не створено): MARKET (немає моделі ціни виконання), LIMIT IOC / FOK (ніколи не лежать у книзі — результат залежить від matching), `reduce_only` (немає моделі позицій).
+- Ідемпотентність: `client_order_id` унікальний у межах екземпляра (для всіх символів). Повтор із рівними за значенням умовами (Decimal порівнюється за значенням) повертає оригінальний `OrderAck` (той самий id і `exchange_ts`) у будь-якому стані ордера, нічого не створює й не відкриває знову; інші умови → `ExchangeDuplicateOrderError`, існуючий ордер не змінюється.
+- `cancel_order`: OPEN → CANCELED (`exchange_ts` = момент скасування). Невідомий ордер чи вже фінальний → `ExchangeRejectedError` без змін стану, однаково при кожному повторі (відповідає контракту `TradingClient`: «already final or unknown»).
+- `get_order`: пошук за `symbol` + `client_order_id`; інший символ — інший простір → `None`. Якщо передано `exchange_order_id`, що суперечить ордеру, → `ExchangeRejectedError`, а не `None`: ордер існує, і `None` дозволив би reconciliation вирішити «не розміщено» з ризиком дубля.
+- `get_open_orders(symbol)`: лише активні ордери символу, порядок `(created_at, client_order_id)`.
+- Час — лише з injected `Clock` (у тестах `ManualClock`). `Ambiguous` ніколи не виникає (транспорту немає). Fills, matching, комісії, slippage, баланси й позиції ще не реалізовані.
+- Правило архітектури: `exchanges.simulated` — implementation (ядро й Bybit не можуть його імпортувати); сам він може імпортувати лише stdlib, `app.domain`, `app.exchanges.models`, `app.exchanges.errors`.
+
 Цільові реалізації:
 
 | Реалізація | Призначення |
 |---|---|
 | `exchanges/bybit/` | Реальна біржа: mainnet і testnet (різні base URL) |
-| `exchanges/simulated/` | Реалістична модель виконання для backtest і paper |
+| `exchanges/simulated` | Реалістична модель виконання для backtest і paper (зараз — лише детермінований lifecycle ордера, без виконання) |
 | `exchanges/fake/` | Тестовий дубль зі скриптованими збоями для unit/failure-тестів |
 
 Спільний **contract test suite** (однакові тести поведінки адаптера) проганяється проти `fake`, `simulated` і, вручну, проти Bybit testnet.
