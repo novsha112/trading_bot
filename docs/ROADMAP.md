@@ -237,6 +237,8 @@
 - `out_of_range_policy` окремо для нижньої та верхньої межі; усі політики з `CLAUDE.md`.
 - `snapshot_state` / `restore_state` + метод «бажаний набір ордерів» для відновлення.
 
+**Стан.** Геометрію рівнів (`levels.py`, arithmetic / geometric, без округлення до tick) реалізовано раніше за порядком фаз: це чиста функція без залежностей від execution / risk. Логіка рішень, розмір ордера, прибутковість і out-of-range лишаються в цій фазі.
+
 **Файли.** `app/strategies/base.py`; `app/strategies/grid/{config,levels,sizing,profitability,start_analysis,worst_case,strategy,out_of_range,state}.py`; `scripts/grid_preview.py` (друк аналізу сітки для конфігурації без торгівлі).
 
 **Тести.** Рівні (обидва типи, граничні значення, злиття після округлення); прибутковість на прикладах, порахованих вручну; net < 0 → BLOCK; worst-case для long / short / neutral; реакція на fill у кожному режимі; частковий fill; кожна out-of-range політика; restore зі снапшоту дає ті самі бажані ордери; стратегія не імпортує нічого поза `domain` (тест архітектури).

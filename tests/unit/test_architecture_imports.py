@@ -47,6 +47,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "domain": frozenset(),
     # Configuration loading only: no logging, network, exchange or database code.
     "config": frozenset({"pydantic", "pydantic_settings", "yaml"}),
+    # Pure, deterministic algorithms on domain types: same code in backtest and live.
+    "strategies": frozenset(),
 }
 
 
@@ -174,7 +176,7 @@ def test_forbidden_imports_detected(
 @pytest.mark.parametrize(
     ("relative", "source"),
     [
-        ("strategies/grid.py", "from app.domain.models import Order\nimport structlog\n"),
+        ("strategies/grid.py", "from app.domain.models import Order\nimport decimal\n"),
         ("strategies/grid/levels.py", "from . import math\nfrom ..base import Strategy\n"),
         ("risk/limits.py", "from app.portfolio import Portfolio\nfrom app.domain import Side\n"),
         ("execution/engine.py", "from app.exchanges.base import ExchangeAdapter\n"),
@@ -313,6 +315,49 @@ def test_config_allowed_imports(tmp_path: Path) -> None:
         "from pydantic import BaseModel\nfrom pydantic_settings import BaseSettings\n"
         "from pathlib import Path\nfrom app.domain.enums import TradingMode\n"
         "from .settings import ConfigError\n",
+    )
+
+    assert find_violations(root) == []
+
+
+# --- Strategies: domain + standard library only ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from app.config.schema import GridConfig\n", "app.strategies -> app.config"),
+        ("from app.exchanges import bybit\n", "app.strategies -> app.exchanges"),
+        ("import app.market_data.feed\n", "app.strategies -> app.market_data"),
+        ("from app.risk.manager import RiskManager\n", "app.strategies -> app.risk"),
+        ("from app.execution import engine\n", "app.strategies -> app.execution"),
+        ("from app.persistence import db\n", "app.strategies -> app.persistence"),
+        ("from app.monitoring.logging import configure_logging\n", "-> app.monitoring"),
+        ("import pydantic\n", "'pydantic' (third-party"),
+        ("import yaml\n", "'yaml' (third-party"),
+        ("import structlog\n", "'structlog' (third-party"),
+        ("import httpx\n", "'httpx' (third-party"),
+        ("from pybit.unified_trading import HTTP\n", "'pybit"),
+    ],
+)
+def test_strategy_violations_detected(tmp_path: Path, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "strategies/grid/levels.py", source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+def test_strategy_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "strategies/grid/levels.py",
+        "import itertools\nfrom decimal import Decimal, localcontext\n"
+        "from app.domain.enums import GridSpacing\nfrom ...domain.validation import require_enum\n"
+        "from . import helpers\n",
     )
 
     assert find_violations(root) == []
