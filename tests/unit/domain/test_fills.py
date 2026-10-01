@@ -60,7 +60,7 @@ def test_text_fields_validated(field: str, value: Any) -> None:
         fill(**{field: value})
 
 
-@pytest.mark.parametrize("field", ["exec_id", "exchange_order_id", "symbol", "fee_asset"])
+@pytest.mark.parametrize("field", ["exec_id", "exchange_order_id", "symbol"])
 def test_required_text_fields_reject_none(field: str) -> None:
     with pytest.raises(DomainValidationError, match=rf"^{field} must be a str"):
         fill(**{field: None})
@@ -80,21 +80,109 @@ def test_price_and_qty_must_be_positive_decimal(field: str, value: Any) -> None:
 
 
 @pytest.mark.parametrize("fee", [D("-0.001"), D("0"), D("0.013")])
-def test_fee_any_sign(fee: Decimal) -> None:
-    # Negative fee = maker rebate.
-    assert fill(fee=fee).fee == fee
+def test_known_fee_any_sign(fee: Decimal) -> None:
+    # Negative fee = maker rebate; zero is a real, known fee of zero.
+    f = fill(fee=fee, fee_asset="USDT")
+    assert f.fee == fee
+    assert f.fee_asset == "USDT"
 
 
-@pytest.mark.parametrize("value", [0.01, 0, D("NaN"), D("sNaN"), D("-Infinity"), None])
-def test_fee_must_be_finite_decimal(value: Any) -> None:
+@pytest.mark.parametrize("value", [0.01, 0, 1, "0.01", True, D("NaN"), D("sNaN"), D("-Infinity")])
+def test_known_fee_must_be_finite_decimal(value: Any) -> None:
     with pytest.raises(DomainValidationError, match=r"^fee must be"):
         fill(fee=value)
 
 
-@pytest.mark.parametrize("value", [1, 0, "true", None])
-def test_is_maker_must_be_bool(value: Any) -> None:
+# --- unknown metadata ---------------------------------------------------------
+
+
+def test_unknown_fee_is_a_none_pair() -> None:
+    f = fill(fee=None, fee_asset=None)
+    assert f.fee is None
+    assert f.fee_asset is None
+
+
+def test_unknown_liquidity_role() -> None:
+    assert fill(is_maker=None).is_maker is None
+
+
+def test_all_metadata_unknown_keeps_the_execution_facts() -> None:
+    f = fill(fee=None, fee_asset=None, is_maker=None)
+
+    assert (f.fee, f.fee_asset, f.is_maker) == (None, None, None)
+    # The execution itself is confirmed and fully known.
+    assert f.exec_id == "e-1"
+    assert f.exchange_order_id == "o-1"
+    assert f.client_order_id == "grid1-buy-0001"
+    assert f.side is Side.BUY
+    assert f.price == D("65000.5")
+    assert f.qty == D("0.001")
+    assert f.exchange_ts == TS
+
+
+@pytest.mark.parametrize(
+    ("fee", "fee_asset"),
+    [(None, "USDT"), (D("0"), None), (D("0.013"), None), (D("-0.001"), None)],
+)
+def test_fee_and_fee_asset_are_known_or_unknown_together(
+    fee: Decimal | None, fee_asset: str | None
+) -> None:
+    with pytest.raises(DomainValidationError, match=r"^fee and fee_asset must be"):
+        fill(fee=fee, fee_asset=fee_asset)
+
+
+@pytest.mark.parametrize("value", ["", " USDT", "USDT ", 1])
+def test_known_fee_asset_is_validated_text(value: Any) -> None:
+    with pytest.raises(DomainValidationError, match=r"^fee_asset "):
+        fill(fee_asset=value)
+
+
+def test_zero_is_never_unknown() -> None:
+    known_zero = fill(fee=D("0"), fee_asset="USDT")
+    unknown = fill(fee=None, fee_asset=None)
+
+    assert known_zero.fee == 0
+    assert unknown.fee is None
+    assert known_zero != unknown
+
+
+# --- liquidity role -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_is_maker_true_false_or_unknown(value: bool | None) -> None:
+    assert fill(is_maker=value).is_maker is value
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", "maker", D("1")])
+def test_is_maker_must_be_bool_when_known(value: Any) -> None:
     with pytest.raises(DomainValidationError, match=r"^is_maker must be a bool"):
         fill(is_maker=value)
+
+
+@pytest.mark.parametrize(
+    ("fee", "fee_asset", "is_maker"),
+    [
+        (D("0.001"), "USDT", None),
+        (None, None, True),
+        (None, None, False),
+        (D("0"), "USDT", False),
+    ],
+)
+def test_liquidity_role_is_independent_of_fee_data(
+    fee: Decimal | None, fee_asset: str | None, is_maker: bool | None
+) -> None:
+    f = fill(fee=fee, fee_asset=fee_asset, is_maker=is_maker)
+
+    assert (f.fee, f.fee_asset, f.is_maker) == (fee, fee_asset, is_maker)
+
+
+@pytest.mark.parametrize("field", ["fee", "fee_asset", "is_maker"])
+def test_metadata_fields_have_no_defaults(field: str) -> None:
+    # Callers must state "unknown" explicitly.
+    values = {k: v for k, v in FILL.items() if k != field}
+    with pytest.raises(TypeError):
+        Fill(**values)
 
 
 @pytest.mark.parametrize(

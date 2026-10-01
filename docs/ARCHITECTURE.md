@@ -196,10 +196,18 @@ app/
 | `RiskDecision` | `intent_id`, `verdict` (APPROVED / REDUCED / REJECTED), `approved_qty`, `reasons[]`, `checks[]` |
 | `Order` | `client_order_id`, `exchange_order_id?`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `status`, `filled_qty`, `avg_fill_price`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version`. Зв'язок з `intent_id` — відкрите питання Phase 5 |
 | `OrderUpdate` | нормалізований звіт біржі про ордер: `client_order_id`, `exchange_order_id`, `status`, `cum_filled_qty`, `avg_price`, `reject_reason`, `exchange_ts` |
-| `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `fee_asset`, `is_maker`, `exchange_ts` |
+| `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee?`, `fee_asset?`, `is_maker?`, `exchange_ts` (див. нижче про невідомі метадані) |
 | `Position` | `symbol`, `side` / знакова `qty`, `entry_price`, `mark_price`, `unrealized_pnl`, `realized_pnl`, `leverage`, `margin_mode`, `position_margin`, `maintenance_margin`, `liquidation_price?`, `updated_at` |
 | `Balance` | `asset`, `wallet_balance`, `equity`, `available`, `margin_used`, `updated_at` |
 | `FundingPayment` | `symbol`, `amount` (знакова), `rate`, `position_qty`, `ts` |
+
+**Невідомі метадані `Fill`.** `Fill` — завжди **підтверджене** виконання: `exec_id`, id ордера, `symbol`, `side`, `price`, `qty`, `exchange_ts` відомі. Nullable-поля не роблять fill умовним, статусу «UNKNOWN fill» немає.
+
+- `fee` / `fee_asset` — пара: обидва `None` (комісія невідома / не моделювалась) або обидва задані. `fee=Decimal("0")` + asset — **відома** нульова комісія; `None` ніколи не означає нуль, sentinel-рядки й `0` для «невідомо» заборонені. Знак: від'ємна комісія — rebate.
+- `is_maker=None` — роль ліквідності невідома. Незалежна від даних комісії: допустимі будь-які поєднання.
+- Поля обов'язкові при створенні (без defaults): джерело явно заявляє «невідомо».
+- Реальні адаптери зберігають фактичні `fee`, `fee_asset` і роль ліквідності, якщо біржа їх надає; `None` — лише для джерел, які цієї інформації справді не мають (наприклад, симулятор без моделі комісій і книги).
+- **Правило PnL:** будь-який розрахунок net PnL, сумарних комісій, fee-adjusted return чи прибутковості після комісій **fail closed** або явно позначає результат як incomplete, якщо хоча б один задіяний `Fill.fee is None`. `None` ніколи не трактується як нуль. (Portfolio / PnL ще не реалізовані.)
 
 ### Стратегія Grid
 
