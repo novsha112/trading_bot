@@ -1,6 +1,6 @@
 """Exchange errors, classified by what is known about the request's effect.
 
-Three sibling outcome categories; none is a subclass of another, so handling one
+Sibling outcome categories; none is a subclass of another, so handling one
 can never swallow another:
 
 * ``ExchangeNotSentError``: the request definitely did not reach the exchange
@@ -13,6 +13,11 @@ can never swallow another:
   confirmed result exists (timeout or connection loss after sending, or the
   adapter cannot prove the request was not sent). Never retried blindly: the
   outcome is established first by reconciliation through ``client_order_id``.
+
+* ``ExchangeDuplicateOrderError``: identity conflict on placement; an order with
+  this ``client_order_id`` already exists with different terms. Not a rejection:
+  the logical order is present, so it is reconciled through ``get_order``, never
+  re-sent blindly and never marked REJECTED / FAILED.
 
 A timeout is never classified as "not sent" unless the adapter can prove it.
 
@@ -48,13 +53,16 @@ class ExchangeAuthenticationError(ExchangeRejectedError):
     """
 
 
-class ExchangeDuplicateOrderError(ExchangeRejectedError):
-    """A placement was refused because its ``client_order_id`` already belongs to an
-    existing order with different terms.
+class ExchangeDuplicateOrderError(ExchangeError):
+    """Identity conflict: a placement's ``client_order_id`` already belongs to an
+    existing exchange order with different terms.
 
-    This request created nothing, but an order with that id DOES exist: the caller
-    must not conclude "never placed". Reconcile the existing order through
-    ``get_order`` and treat the mismatch as a local-state bug.
+    Deliberately NOT an ``ExchangeRejectedError``: a rejection means the logical
+    order is absent, while here an order with this id EXISTS. This request created
+    nothing. The caller must not re-send blindly and must not mark the local order
+    REJECTED / FAILED; it reconciles the existing order through
+    ``get_order(OrderRef(symbol, client_order_id))`` and treats the mismatch as a
+    local-state bug.
     """
 
 

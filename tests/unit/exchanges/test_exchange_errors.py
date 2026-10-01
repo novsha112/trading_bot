@@ -20,6 +20,7 @@ from app.exchanges.errors import (
 OUTCOMES = [
     ExchangeNotSentError,
     ExchangeRejectedError,
+    ExchangeDuplicateOrderError,
     ExchangeAmbiguousResultError,
     ExchangeResponseError,
 ]
@@ -94,8 +95,24 @@ def test_request_validation_error_is_a_local_not_sent_error() -> None:
         assert not issubclass(ExchangeRequestValidationError, other)
 
 
-def test_duplicate_order_error_is_a_rejection() -> None:
-    # This request created nothing (rejected), yet the client id is taken.
-    assert issubclass(ExchangeDuplicateOrderError, ExchangeRejectedError)
-    for other in (ExchangeNotSentError, ExchangeAmbiguousResultError, ExchangeResponseError):
-        assert not issubclass(ExchangeDuplicateOrderError, other)
+def test_duplicate_order_error_is_its_own_category() -> None:
+    # Identity conflict: an order with this client id EXISTS. Never a rejection
+    # (which would mean the logical order is absent), never "not sent" or ambiguous.
+    assert issubclass(ExchangeDuplicateOrderError, ExchangeError)
+    assert not issubclass(ExchangeDuplicateOrderError, ExchangeRejectedError)
+    assert not issubclass(ExchangeDuplicateOrderError, ExchangeNotSentError)
+    assert not issubclass(ExchangeDuplicateOrderError, ExchangeAmbiguousResultError)
+    assert not issubclass(ExchangeDuplicateOrderError, ExchangeResponseError)
+    assert ExchangeDuplicateOrderError.__bases__ == (ExchangeError,)
+
+
+def test_generic_rejection_handler_does_not_catch_duplicate() -> None:
+    def classify(error: ExchangeError) -> str:
+        try:
+            raise error
+        except ExchangeRejectedError:
+            return "mark_rejected"
+        except ExchangeError:
+            return "other"
+
+    assert classify(ExchangeDuplicateOrderError("client id exists")) == "other"

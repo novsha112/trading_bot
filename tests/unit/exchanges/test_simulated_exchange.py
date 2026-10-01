@@ -261,9 +261,35 @@ async def test_same_client_id_with_changed_payload_is_refused(
     assert repr(exchange) == "SimulatedExchange(orders=1)"
 
 
-def test_duplicate_error_is_a_rejection_never_ambiguous() -> None:
-    assert issubclass(ExchangeDuplicateOrderError, ExchangeRejectedError)
+def test_duplicate_error_is_not_a_rejection_nor_ambiguous() -> None:
+    assert issubclass(ExchangeDuplicateOrderError, ExchangeError)
+    assert not issubclass(ExchangeDuplicateOrderError, ExchangeRejectedError)
     assert not issubclass(ExchangeDuplicateOrderError, ExchangeAmbiguousResultError)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_keeps_original_order_and_does_not_consume_an_id(
+    exchange: SimulatedExchange,
+) -> None:
+    original = await exchange.place_order(request())
+
+    with pytest.raises(ExchangeDuplicateOrderError) as excinfo:
+        await exchange.place_order(request(price=D("64000"), qty=D("0.5")))
+    assert not isinstance(excinfo.value, ExchangeRejectedError)
+
+    update = await exchange.get_order(ref())
+    assert update == OrderUpdate(
+        client_order_id="grid1-buy-0001",
+        exchange_order_id=original.exchange_order_id,
+        status=OrderStatus.OPEN,
+        cum_filled_qty=D("0"),
+        avg_fill_price=None,
+        reject_reason=None,
+        exchange_ts=T0,
+    )
+    assert original.exchange_order_id == "SIM-0000000001"
+    following = await exchange.place_order(request(client_order_id="next"))
+    assert following.exchange_order_id == "SIM-0000000002"
 
 
 # --- place_order: refused -----------------------------------------------------
