@@ -4,8 +4,9 @@ Each top-level package under ``app/`` may import only the ``app`` packages liste
 for it. Packages marked ``None`` have no import restriction defined yet. A new
 top-level package must be added here explicitly, otherwise the test fails.
 
-Packages in ``STDLIB_ONLY_PACKAGES`` may additionally import nothing outside the
-Python standard library (``sys.stdlib_module_names``) besides allowed ``app`` modules.
+Packages listed in ``ALLOWED_THIRD_PARTY`` may import, besides the Python standard
+library (``sys.stdlib_module_names``) and allowed ``app`` modules, only the listed
+third-party top-level packages. Unlisted packages have no third-party restriction yet.
 
 Imports are read with ``ast`` (modules are never executed). Relative imports are
 resolved against the importing module; one that would climb above the top-level
@@ -41,8 +42,12 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "services": None,
 }
 
-# The domain is the shared language of the system: no frameworks, SDKs or I/O libraries.
-STDLIB_ONLY_PACKAGES: frozenset[str] = frozenset({"domain"})
+ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
+    # The shared language of the system: no frameworks, SDKs or I/O libraries.
+    "domain": frozenset(),
+    # Configuration loading only: no logging, network, exchange or database code.
+    "config": frozenset({"pydantic", "pydantic_settings", "yaml"}),
+}
 
 
 def _module_name(path: Path, root: Path) -> str:
@@ -107,10 +112,15 @@ def find_violations(root: Path) -> list[str]:
         for name in sorted(imports):
             name_parts = name.split(".")
             if name_parts[0] != root.name:
-                if package in STDLIB_ONLY_PACKAGES and name_parts[0] not in sys.stdlib_module_names:
+                third_party = ALLOWED_THIRD_PARTY.get(package)
+                top = name_parts[0]
+                if (
+                    third_party is not None
+                    and top not in sys.stdlib_module_names
+                    and top not in third_party
+                ):
                     violations.append(
-                        f"{module}: imports '{name}' "
-                        f"(third-party; app.{package} allows only the standard library)"
+                        f"{module}: imports '{name}' (third-party; not allowed in app.{package})"
                     )
                 continue
             if len(name_parts) == 1:
@@ -265,5 +275,44 @@ def test_third_party_rule_applies_only_to_restricted_packages(tmp_path: Path) ->
     root = tmp_path / "app"
     _write(root, "monitoring/logging.py", "import structlog\n")
     _write(root, "config/settings.py", "from pydantic import BaseModel\n")
+    _write(root, "services/bootstrap.py", "import httpx\n")
+
+    assert find_violations(root) == []
+
+
+# --- Config: domain + configuration libraries only ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import structlog\n", "'structlog' (third-party"),
+        ("import httpx\n", "'httpx' (third-party"),
+        ("from pybit.unified_trading import HTTP\n", "'pybit"),
+        ("from sqlalchemy import create_engine\n", "'sqlalchemy.create_engine' (third-party"),
+        ("from app.monitoring.logging import configure_logging\n", "app.config -> app.monitoring"),
+        ("from app.exchanges import bybit\n", "app.config -> app.exchanges"),
+    ],
+)
+def test_config_violations_detected(tmp_path: Path, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "config/bootstrap.py", source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+def test_config_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "config/loader.py",
+        "import yaml\nfrom yaml.constructor import ConstructorError\n"
+        "from pydantic import BaseModel\nfrom pydantic_settings import BaseSettings\n"
+        "from pathlib import Path\nfrom app.domain.enums import TradingMode\n"
+        "from .settings import ConfigError\n",
+    )
 
     assert find_violations(root) == []

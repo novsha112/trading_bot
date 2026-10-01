@@ -130,8 +130,9 @@ def test_forbidden_combinations(tmp_path: Path, profile: str, mode: str) -> None
 @pytest.mark.parametrize("mode", ["backtest", "paper", "testnet", "live"])
 def test_unknown_profile_rejected_before_reading(tmp_path: Path, mode: str) -> None:
     # No production profile exists yet: live cannot be configured at all.
-    with pytest.raises(ConfigError, match="CONFIG_PROFILE=production is not a known profile"):
+    with pytest.raises(ConfigError, match="unknown configuration profile") as info:
         load_profile(tmp_path / "production.yaml", env(mode, "production"))
+    assert "production" not in str(info.value)
 
 
 def test_profile_name_must_match_config_profile(tmp_path: Path) -> None:

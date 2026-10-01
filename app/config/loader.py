@@ -115,10 +115,8 @@ def load_profile(path: Path, env: EnvSettings) -> AppConfig:
     """
     allowed_modes = PROFILE_MODES.get(env.config_profile)
     if allowed_modes is None:
-        known = ", ".join(PROFILE_MODES)
-        raise ConfigError(
-            f"CONFIG_PROFILE={env.config_profile} is not a known profile (known: {known})"
-        )
+        # The raw value is not echoed: it is arbitrary environment input.
+        raise ConfigError(f"unknown configuration profile (known: {', '.join(PROFILE_MODES)})")
     if env.trading_mode not in allowed_modes:
         allowed = ", ".join(sorted(mode.value for mode in allowed_modes))
         raise ConfigError(
