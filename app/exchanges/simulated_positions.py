@@ -26,9 +26,11 @@ average basis (e.g. 310/3) leaves no rounding residue. Only the published
 significant digits with ROUND_HALF_EVEN in an explicit context; the global
 decimal context is neither read nor modified. Quantities stay exact ``Decimal``.
 
-Batches: ``prepare(fills)`` computes the resulting state without touching the
-ledger and ``commit(prepared)`` installs it, so a caller can make several fills
-and its own state changes all-or-nothing.
+Batches: ``begin_batch()`` returns a working copy whose reads see its own
+prepared fills (needed when a later decision depends on the position after an
+earlier fill, e.g. reduce-only); ``prepare(fills)`` is the same for a fixed list.
+``commit(prepared)`` installs the result only on the ledger version it was built
+on, so a caller can make several fills and its own state changes all-or-nothing.
 """
 
 from __future__ import annotations
@@ -157,6 +159,49 @@ def _to_position(state: _PositionState) -> Position:
     )
 
 
+class PositionBatch:
+    """Working state on top of a ledger: fills applied here are visible to later
+    reads of the same batch, never to the ledger itself (until ``commit``)."""
+
+    __slots__ = ("_applied", "_base_version", "_ledger", "_states")
+
+    def __init__(self, ledger: SimulatedPositionLedger) -> None:
+        self._ledger = ledger
+        self._base_version = ledger._version
+        self._states: dict[str, _PositionState] = {}
+        self._applied: dict[str, Fill] = {}
+
+    def _state(self, symbol: str) -> _PositionState | None:
+        return self._states.get(symbol) or self._ledger._states.get(symbol)
+
+    def signed_qty(self, symbol: str) -> Decimal:
+        """Signed position quantity as prepared so far (0 if none)."""
+        state = self._state(symbol)
+        return _ZERO_DECIMAL if state is None else state.qty
+
+    def apply(self, fill: Fill) -> None:
+        """Apply one fill to the batch; on error the batch is unchanged."""
+        if not isinstance(fill, Fill):
+            raise PositionAccountingError("expected a Fill")
+        known = self._applied.get(fill.exec_id) or self._ledger._applied.get(fill.exec_id)
+        if known is not None:
+            if known != fill:
+                raise PositionAccountingError(
+                    f"exec_id {fill.exec_id} was already applied with a different payload"
+                )
+            return  # identical fill: already accounted for
+        new_state = _apply_fill(self._state(fill.symbol), fill)
+        self._states[fill.symbol] = new_state
+        self._applied[fill.exec_id] = fill
+
+    def prepared(self) -> PreparedPositions:
+        return PreparedPositions(
+            base_version=self._base_version,
+            states=dict(self._states),
+            applied=dict(self._applied),
+        )
+
+
 class SimulatedPositionLedger:
     """Net position per symbol, built only from confirmed fills."""
 
@@ -175,25 +220,18 @@ class SimulatedPositionLedger:
         state = self._states.get(symbol)
         return None if state is None else _to_position(state)
 
+    def begin_batch(self) -> PositionBatch:
+        """A working copy for preparing several fills; reads see the batch's own
+        prepared fills. The ledger is not changed until ``commit``."""
+        return PositionBatch(self)
+
     def prepare(self, fills: Sequence[Fill]) -> PreparedPositions:
         """Apply ``fills`` in the given order to a copy of the state. The ledger is
         not changed; any error leaves it exactly as it was."""
-        states: dict[str, _PositionState] = {}
-        applied: dict[str, Fill] = {}
+        batch = self.begin_batch()
         for fill in fills:
-            if not isinstance(fill, Fill):
-                raise PositionAccountingError("expected a Fill")
-            known = applied.get(fill.exec_id) or self._applied.get(fill.exec_id)
-            if known is not None:
-                if known != fill:
-                    raise PositionAccountingError(
-                        f"exec_id {fill.exec_id} was already applied with a different payload"
-                    )
-                continue  # identical fill: already accounted for
-            current = states.get(fill.symbol) or self._states.get(fill.symbol)
-            states[fill.symbol] = _apply_fill(current, fill)
-            applied[fill.exec_id] = fill
-        return PreparedPositions(base_version=self._version, states=states, applied=applied)
+            batch.apply(fill)
+        return batch.prepared()
 
     def commit(self, prepared: PreparedPositions) -> None:
         """Install a prepared batch built on the current ledger version."""

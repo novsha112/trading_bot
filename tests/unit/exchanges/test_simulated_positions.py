@@ -442,3 +442,63 @@ def test_ledger_has_no_forbidden_dependencies() -> None:
         assert not name.startswith("app.") or name.startswith("app.domain"), name
     for banned in ("float(", "getcontext", "setcontext", "localcontext", ".now(", ".fee"):
         assert banned not in source, banned
+
+
+# --- working batch ------------------------------------------------------------------
+
+
+def test_batch_reads_its_own_prepared_state_without_touching_the_ledger() -> None:
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("10", "100"))
+    batch = ledger.begin_batch()
+
+    assert batch.signed_qty("BTCUSDT") == D("10")
+    assert batch.signed_qty("ETHUSDT") == D("0")
+    batch.apply(sell("7", "110"))
+    assert batch.signed_qty("BTCUSDT") == D("3")  # sees the previous prepared fill
+    batch.apply(sell("3", "110"))
+    assert batch.signed_qty("BTCUSDT") == D("0")
+
+    original = ledger.get_position("BTCUSDT")
+    assert original is not None
+    assert original.qty == D("10")  # untouched until commit
+    ledger.commit(batch.prepared())
+    p = ledger.get_position("BTCUSDT")
+    assert p is not None
+    assert summary(p) == (D("0"), None, D("100"))
+
+
+def test_failed_batch_apply_keeps_ledger_and_batch_consistent() -> None:
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100", ts=T0 + timedelta(seconds=5)))
+    batch = ledger.begin_batch()
+    batch.apply(buy("1", "100", exec_id="ok", ts=T0 + timedelta(seconds=6)))
+
+    with pytest.raises(PositionAccountingError):
+        batch.apply(buy("1", "100", exec_id="stale", ts=T0))
+
+    assert batch.signed_qty("BTCUSDT") == D("2")  # the failed fill left no trace
+    original = ledger.get_position("BTCUSDT")
+    assert original is not None
+    assert original.qty == D("1")
+
+
+def test_stale_batch_commit_is_rejected() -> None:
+    ledger = SimulatedPositionLedger()
+    batch = ledger.begin_batch()
+    batch.apply(buy("1", "100"))
+    ledger.apply_fill(buy("1", "100"))
+
+    with pytest.raises(PositionAccountingError, match="stale"):
+        ledger.commit(batch.prepared())
+
+
+def test_batch_keeps_exec_id_idempotency() -> None:
+    ledger = SimulatedPositionLedger()
+    ledger.apply_fill(buy("1", "100", exec_id="X"))
+    batch = ledger.begin_batch()
+
+    batch.apply(buy("1", "100", exec_id="X"))  # identical: ignored
+    assert batch.signed_qty("BTCUSDT") == D("1")
+    with pytest.raises(PositionAccountingError, match="exec_id X"):
+        batch.apply(buy("2", "100", exec_id="X"))

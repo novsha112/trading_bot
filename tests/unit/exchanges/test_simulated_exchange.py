@@ -2098,3 +2098,470 @@ async def test_failed_position_preparation_leaves_everything_unchanged(
     assert [f.exec_id for f in fills] == ["SIM-EXEC-0000000002", "SIM-EXEC-0000000003"]
     p = await position_of(exchange)
     assert (p.qty, p.entry_price) == (D("10"), D("100"))
+
+
+# === reduce-only limit orders =================================================
+
+
+async def open_position(
+    exchange: SimulatedExchange, side: Side, qty: str, price: str = "100", cid: str = "open"
+) -> None:
+    await exchange.place_order(request(client_order_id=cid, side=side, price=D(price), qty=D(qty)))
+    await exchange.fill_crossed_limit_orders(symbol="BTCUSDT", execution_price=D(price))
+
+
+def ro(cid: str, side: Side, qty: str, price: str, **overrides: Any) -> OrderRequest:
+    return request(
+        client_order_id=cid, side=side, qty=D(qty), price=D(price), reduce_only=True, **overrides
+    )
+
+
+async def qty_of(exchange: SimulatedExchange) -> Decimal:
+    p = await position_of(exchange)
+    return D("0") if p is None else p.qty
+
+
+# --- placement ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("position_side", "ro_side", "accepted"),
+    [
+        (Side.BUY, Side.SELL, True),  # long reduced by sell
+        (Side.BUY, Side.BUY, False),  # would increase long
+        (Side.SELL, Side.BUY, True),  # short reduced by buy
+        (Side.SELL, Side.SELL, False),  # would increase short
+    ],
+)
+async def test_reduce_only_placement_direction(
+    exchange: SimulatedExchange, position_side: Side, ro_side: Side, accepted: bool
+) -> None:
+    await open_position(exchange, position_side, "5")
+    order = ro("ro", ro_side, "2", "100")
+
+    if accepted:
+        ack = await exchange.place_order(order)
+        assert ack.exchange_order_id == "SIM-0000000002"
+    else:
+        with pytest.raises(ExchangeRejectedError, match="reduce_only"):
+            await exchange.place_order(order)
+        assert await exchange.get_order(ref("ro")) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+async def test_reduce_only_without_position_is_rejected(
+    exchange: SimulatedExchange, side: Side
+) -> None:
+    with pytest.raises(ExchangeRejectedError, match="reduce_only"):
+        await exchange.place_order(ro("ro", side, "1", "100"))
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_on_flat_position_is_rejected(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("100"))
+    )
+    await fill_at(exchange, "100")
+    assert (await position_of(exchange)).qty == 0
+
+    with pytest.raises(ExchangeRejectedError, match="reduce_only"):
+        await exchange.place_order(ro("ro", Side.SELL, "1", "100"))
+
+
+@pytest.mark.asyncio
+async def test_oversized_reduce_only_is_accepted_at_placement(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+
+    await exchange.place_order(ro("ro", Side.SELL, "10", "110"))
+
+    assert (await update_of(exchange, "ro")).status is OrderStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_rejection_is_side_effect_free() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
+    await open_position(exchange, Side.BUY, "5")
+    clock.calls = 0
+
+    with pytest.raises(ExchangeRejectedError, match="reduce_only"):
+        await exchange.place_order(ro("ro", Side.BUY, "1", "100"))
+
+    assert clock.calls == 0
+    assert repr(exchange) == "SimulatedExchange(orders=1)"
+    ack = await exchange.place_order(request(client_order_id="next", price=D("90")))
+    assert ack.exchange_order_id == "SIM-0000000002"
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_still_passes_instrument_rules() -> None:
+    exchange = strict_exchange()
+    await exchange.place_order(strict_order(client_order_id="open", qty=D("5")))
+    await exchange.fill_crossed_limit_orders(symbol="BTCUSDT", execution_price=D("100"))
+
+    with pytest.raises(ExchangeRejectedError, match="tick_size"):
+        await exchange.place_order(
+            strict_order(client_order_id="ro", side=Side.SELL, price=D("100.05"), reduce_only=True)
+        )
+    with pytest.raises(ExchangeRejectedError, match="min_qty"):
+        await exchange.place_order(
+            strict_order(client_order_id="ro", side=Side.SELL, qty=D("0.1"), reduce_only=True)
+        )
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_retry_before_position_validation(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    original = await exchange.place_order(ro("ro", Side.SELL, "5", "110"))
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("105"))
+    )
+    await fill_at(exchange, "105")  # flat; "ro" (limit 110) not crossed
+    assert (await position_of(exchange)).qty == 0
+
+    assert await exchange.place_order(ro("ro", Side.SELL, "5", "110")) == original
+    with pytest.raises(ExchangeDuplicateOrderError):
+        await exchange.place_order(ro("ro", Side.SELL, "4", "110"))
+
+
+# --- execution --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_partial_lifecycle(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("ro", Side.SELL, "7", "110"))
+
+    (f1,) = await partial(exchange, "110", "3")
+    after1 = await update_of(exchange, "ro")
+    assert (f1.qty, after1.status, await qty_of(exchange)) == (
+        D("3"),
+        OrderStatus.PARTIALLY_FILLED,
+        D("7"),
+    )
+    assert [u.client_order_id for u in await exchange.get_open_orders(symbol="BTCUSDT")] == ["ro"]
+
+    (f2,) = await partial(exchange, "110", "2")
+    after2 = await update_of(exchange, "ro")
+    assert (f2.qty, after2.status, await qty_of(exchange)) == (
+        D("2"),
+        OrderStatus.PARTIALLY_FILLED,
+        D("5"),
+    )
+
+    (f3,) = await partial(exchange, "110", "10")
+    after3 = await update_of(exchange, "ro")
+    assert (f3.qty, after3.status, after3.cum_filled_qty, await qty_of(exchange)) == (
+        D("2"),
+        OrderStatus.FILLED,
+        D("7"),
+        D("3"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_exact_close(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.SELL, "5")
+    await exchange.place_order(ro("ro", Side.BUY, "5", "90"))
+
+    (fill,) = await fill_at(exchange, "90")
+
+    assert fill.qty == D("5")
+    assert (await update_of(exchange, "ro")).status is OrderStatus.FILLED
+    p = await position_of(exchange)
+    assert (p.qty, p.realized_pnl) == (D("0"), D("50"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("position_side", "ro_side", "price"),
+    [(Side.BUY, Side.SELL, "110"), (Side.SELL, Side.BUY, "90")],
+)
+async def test_oversized_reduce_only_never_reverses(
+    exchange: SimulatedExchange, clock: ManualClock, position_side: Side, ro_side: Side, price: str
+) -> None:
+    await open_position(exchange, position_side, "5")
+    await exchange.place_order(ro("ro", ro_side, "10", price))
+    clock.advance(timedelta(seconds=1))
+
+    fills = await exchange.fill_crossed_limit_orders(
+        symbol="BTCUSDT", execution_price=D(price), available_qty=D("10")
+    )
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("ro", D("5"))]
+    assert await qty_of(exchange) == D("0")  # flat, never the other side
+    update = await update_of(exchange, "ro")
+    assert update == OrderUpdate(
+        client_order_id="ro",
+        exchange_order_id="SIM-0000000002",
+        status=OrderStatus.CANCELED,
+        cum_filled_qty=D("5"),
+        avg_fill_price=D(price),
+        reject_reason=None,
+        exchange_ts=T0 + timedelta(seconds=1),
+    )
+    assert await exchange.get_open_orders(symbol="BTCUSDT") == ()
+
+
+@pytest.mark.asyncio
+async def test_two_oversized_reduce_only_orders_never_over_reduce(
+    exchange: SimulatedExchange,
+) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "7", "110"))
+    await exchange.place_order(ro("b", Side.SELL, "7", "110"))
+
+    fills = await fill_at(exchange, "110")
+
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("7")), ("b", D("3"))]
+    assert sum(f.qty for f in fills) == D("10")
+    assert await qty_of(exchange) == D("0")
+    a, b = await update_of(exchange, "a"), await update_of(exchange, "b")
+    assert (a.status, a.cum_filled_qty) == (OrderStatus.FILLED, D("7"))
+    assert (b.status, b.cum_filled_qty) == (OrderStatus.CANCELED, D("3"))
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_on_flat_at_execution_is_canceled_without_fill() -> None:
+    clock = CountingClock(T0)
+    exchange = SimulatedExchange(clock=clock, instruments=SPECS)
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "5", "110"))
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("105"))
+    )
+    await fill_at(exchange, "105")
+    clock.inner.advance(timedelta(seconds=9))
+    clock.calls = 0
+
+    fills = await fill_at(exchange, "110")
+
+    assert fills == []
+    assert clock.calls == 1  # an auto-cancel is a state change
+    update = await update_of(exchange, "ro")
+    assert (update.status, update.cum_filled_qty, update.avg_fill_price) == (
+        OrderStatus.CANCELED,
+        D("0"),
+        None,
+    )
+    assert update.exchange_ts == T0 + timedelta(seconds=9)
+    assert await exchange.get_open_orders(symbol="BTCUSDT") == ()
+    await exchange.place_order(request(client_order_id="n", price=D("100")))
+    (fill,) = await fill_at(exchange, "100")
+    assert fill.exec_id == "SIM-EXEC-0000000003"  # no exec id spent on the cancel
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_after_reversal_is_canceled_without_fill(
+    exchange: SimulatedExchange,
+) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "5", "110"))
+    await exchange.place_order(
+        request(client_order_id="rev", side=Side.SELL, qty=D("8"), price=D("105"))
+    )
+    await fill_at(exchange, "105")
+    assert await qty_of(exchange) == D("-3")
+
+    assert await fill_at(exchange, "110") == []
+
+    assert (await update_of(exchange, "ro")).status is OrderStatus.CANCELED
+    assert await qty_of(exchange) == D("-3")  # the new short is not reduced by a sell
+
+
+@pytest.mark.asyncio
+async def test_auto_cancel_does_not_consume_liquidity(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "5", "100"))
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("95"))
+    )
+    await fill_at(exchange, "97")  # only "close" crosses -> flat
+    await exchange.place_order(
+        request(client_order_id="z-buy", side=Side.BUY, qty=D("5"), price=D("105"))
+    )
+
+    fills = await partial(exchange, "100", "2")  # "ro" first (older), then "z-buy"
+
+    assert [(f.client_order_id, f.qty, f.exec_id) for f in fills] == [
+        ("z-buy", D("2"), "SIM-EXEC-0000000003")
+    ]
+    assert (await update_of(exchange, "ro")).status is OrderStatus.CANCELED
+    assert await qty_of(exchange) == D("2")
+
+
+@pytest.mark.asyncio
+async def test_normal_then_reduce_only_in_one_batch(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="a", side=Side.SELL, qty=D("6"), price=D("100"))
+    )
+    await exchange.place_order(ro("b", Side.SELL, "6", "100"))
+
+    fills = await fill_at(exchange, "100")
+
+    # "b" sees the position after "a": only 4 left to reduce.
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("6")), ("b", D("4"))]
+    assert await qty_of(exchange) == D("0")
+    assert (await update_of(exchange, "b")).status is OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_then_normal_in_one_batch(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "6", "100"))
+    await exchange.place_order(
+        request(client_order_id="b", side=Side.SELL, qty=D("6"), price=D("100"))
+    )
+
+    fills = await fill_at(exchange, "100")
+
+    # No special priority: the normal order may still reverse the position.
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("6")), ("b", D("6"))]
+    assert await qty_of(exchange) == D("-2")
+    assert (await update_of(exchange, "a")).status is OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
+async def test_post_only_reduce_only(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "3", "110", time_in_force=TimeInForce.POST_ONLY))
+
+    (fill,) = await fill_at(exchange, "110")
+
+    assert (fill.qty, fill.is_maker, fill.fee, fill.fee_asset) == (D("3"), None, None, None)
+    assert await qty_of(exchange) == D("2")
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_average_survives_auto_cancel(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("ro", Side.SELL, "10", "100"))
+    await partial(exchange, "100", "2")
+    await partial(exchange, "110", "3")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("90"))
+    )
+    await fill_at(exchange, "95")  # only "close" crosses -> flat
+
+    assert await fill_at(exchange, "100") == []
+
+    update = await update_of(exchange, "ro")
+    assert (update.status, update.cum_filled_qty, update.avg_fill_price) == (
+        OrderStatus.CANCELED,
+        D("5"),
+        D("106"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_cancel_of_reduce_only(exchange: SimulatedExchange) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "3", "110"))
+
+    await exchange.cancel_order(ref("ro"))
+
+    assert (await update_of(exchange, "ro")).status is OrderStatus.CANCELED
+    with pytest.raises(ExchangeRejectedError, match="canceled"):
+        await exchange.cancel_order(ref("ro"))
+    assert await fill_at(exchange, "120") == []
+    assert await qty_of(exchange) == D("5")
+
+
+# --- atomicity ----------------------------------------------------------------------
+
+
+async def snapshot(exchange: SimulatedExchange, *cids: str) -> tuple[object, ...]:
+    return (
+        await position_of(exchange),
+        [await update_of(exchange, c) for c in cids],
+        exchange._exec_sequence,
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_after_prepared_reduce_only_fill(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "7", "110"))
+    await exchange.place_order(
+        request(client_order_id="b", side=Side.SELL, qty=D("2"), price=D("110"))
+    )
+    before = await snapshot(exchange, "a", "b")
+    real_build = simulated._build_fill
+    calls: list[str] = []
+
+    def failing_second(record: Any, **kwargs: Any) -> Fill:
+        calls.append(record.request.client_order_id)
+        if len(calls) == 2:
+            raise RuntimeError("injected")
+        return real_build(record, **kwargs)
+
+    monkeypatch.setattr(simulated, "_build_fill", failing_second)
+    with pytest.raises(RuntimeError, match="injected"):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert calls == ["a", "b"]
+    assert await snapshot(exchange, "a", "b") == before
+
+
+@pytest.mark.asyncio
+async def test_failure_after_prepared_auto_cancel(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await open_position(exchange, Side.BUY, "5")
+    await exchange.place_order(ro("ro", Side.SELL, "5", "100"))
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("5"), price=D("95"))
+    )
+    await fill_at(exchange, "97")  # flat
+    await exchange.place_order(request(client_order_id="z-buy", qty=D("5"), price=D("105")))
+    before = await snapshot(exchange, "ro", "z-buy")
+
+    def failing(record: Any, **kwargs: Any) -> Fill:
+        raise RuntimeError("injected after auto-cancel")
+
+    monkeypatch.setattr(simulated, "_build_fill", failing)
+    with pytest.raises(RuntimeError, match="injected"):
+        await fill_at(exchange, "100")
+    monkeypatch.undo()
+
+    assert await snapshot(exchange, "ro", "z-buy") == before
+    assert (await update_of(exchange, "ro")).status is OrderStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_failure_in_position_preparation_after_earlier_order(
+    exchange: SimulatedExchange, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.exchanges import simulated_positions
+
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="a", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+    await exchange.place_order(ro("b", Side.SELL, "4", "110"))
+    before = await snapshot(exchange, "a", "b")
+    real_apply = simulated_positions._apply_fill
+    calls: list[str] = []
+
+    def failing_second(state: Any, fill: Fill) -> Any:
+        calls.append(fill.client_order_id or "")
+        if len(calls) == 2:
+            raise simulated_positions.PositionAccountingError("injected")
+        return real_apply(state, fill)
+
+    monkeypatch.setattr(simulated_positions, "_apply_fill", failing_second)
+    with pytest.raises(simulated_positions.PositionAccountingError, match="injected"):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert calls == ["a", "b"]
+    assert await snapshot(exchange, "a", "b") == before
+    fills = await fill_at(exchange, "110")
+    assert [(f.client_order_id, f.qty) for f in fills] == [("a", D("4")), ("b", D("4"))]

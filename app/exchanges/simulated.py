@@ -42,10 +42,18 @@ Current scope:
   (``simulated_positions.SimulatedPositionLedger``), read through the
   simulation-only ``get_position(symbol)`` (None before the first fill). Gross
   realized PnL only; no mark price, unrealized PnL unknown while open.
+* Reduce-only (deterministic simulator policy, not a claim about any exchange):
+  a new reduce-only order must reduce the current position (SELL a long, BUY a
+  short), else ``ExchangeRejectedError``; its size may exceed the position. At
+  every fill the position prepared so far in the batch is authoritative: the fill
+  is capped at the reducible quantity, never opening, increasing or reversing a
+  position. A crossed reduce-only order that can no longer reduce (position flat
+  or on the other side, before or after its fill) is CANCELED with its fills kept;
+  such a cancel uses no execution id and no budget.
 * No fees, balances, leverage or margin. Requests whose outcome cannot be
   determined without them are refused (``ExchangeRejectedError``): MARKET (no
   execution price model), LIMIT IOC / FOK (never rest on the book, their outcome
-  depends on matching), ``reduce_only`` (no position model).
+  depends on matching).
 
 Semantics:
 * Idempotency by ``client_order_id`` (unique per instance, across symbols): a repeat
@@ -64,12 +72,12 @@ Semantics:
 * Fill batches: crossed orders are processed in (created_at, client_order_id)
   order (a simulation determinism rule, not exchange price-time priority) with
   consecutive execution ids from a per-instance sequence. The clock is read once
-  per batch that fills anything; all fills and order updates of the batch carry
-  that time. A batch is all-or-nothing: every fill and new order record is built
-  first, together with the resulting position state, then positions, orders and
-  the execution sequence are committed together. A
-  record violating the status / fill invariants raises before anything is
-  committed and is never repaired.
+  per batch that changes anything (a fill or a reduce-only auto-cancel); all fills
+  and order updates of the batch carry that time. A batch is all-or-nothing:
+  orders are prepared one after another on working copies (each sees the position
+  after the previous fills), then positions, orders and the execution sequence
+  are committed together. A record violating the status / fill invariants raises
+  before anything is committed and is never repaired.
 * All timestamps come from the injected ``Clock``. Nothing is ever ambiguous: there
   is no transport.
 
@@ -309,9 +317,22 @@ def _check_instrument_rules(order: OrderRequest, spec: InstrumentSpec) -> None:
             )
 
 
-def _fill_qty(record: _SimulatedOrder, spec: InstrumentSpec, left: Decimal | None) -> Decimal:
-    """Quantity of this order's fill: the whole remaining quantity, or the part of
-    the budget ``left`` rounded DOWN to ``qty_step`` (0 if less than one step)."""
+def _reducible_qty(side: Side, position_qty: Decimal) -> Decimal:
+    """How much a reduce-only order of ``side`` may execute against the signed
+    position: a SELL reduces a long, a BUY reduces a short; otherwise nothing."""
+    if side is Side.SELL and position_qty > 0:
+        return position_qty
+    if side is Side.BUY and position_qty < 0:
+        return -position_qty
+    return _ZERO
+
+
+def _fill_qty(
+    record: _SimulatedOrder, spec: InstrumentSpec, left: Decimal | None, cap: Decimal | None
+) -> Decimal:
+    """Quantity of this order's fill: the remaining quantity, limited by ``cap``
+    (reduce-only: what the position allows) and by the budget ``left``, rounded
+    DOWN to ``qty_step`` (0 if less than one step)."""
     remaining = record.remaining_qty()
     try:
         aligned = is_qty_aligned(remaining, spec)
@@ -323,12 +344,15 @@ def _fill_qty(record: _SimulatedOrder, spec: InstrumentSpec, left: Decimal | Non
             f"{record.request.client_order_id}: remaining {remaining} is not a multiple "
             f"of qty_step {spec.qty_step}"
         )
-    if left is None or left >= remaining:
+    limit = remaining if cap is None else min(remaining, cap)
+    if left is not None:
+        limit = min(limit, left)
+    if limit == remaining:
         return remaining
-    if left < spec.qty_step:
+    if limit < spec.qty_step:
         return _ZERO
     try:
-        return round_qty(left, spec, RoundingDirection.DOWN)
+        return round_qty(limit, spec, RoundingDirection.DOWN)
     except DomainValidationError:
         raise ExchangeRequestValidationError(
             "simulated exchange: available_qty cannot be allocated exactly"
@@ -407,14 +431,12 @@ class SimulatedExchange:
                 f"simulated exchange: time_in_force {order.time_in_force.value} is unsupported "
                 f"(no matching engine)"
             )
-        if order.reduce_only:
-            raise ExchangeRejectedError(
-                "simulated exchange: reduce_only is unsupported (no position model)"
-            )
         spec = self._instruments.get(order.symbol)
         if spec is None:
             raise ExchangeRejectedError(f"simulated exchange: unknown instrument {order.symbol}")
         _check_instrument_rules(order, spec)
+        if order.reduce_only:
+            self._check_reduce_only_direction(order)
         now = self._now()
         record = _SimulatedOrder(
             request=order,
@@ -490,8 +512,8 @@ class SimulatedExchange:
             key=lambda record: (record.created_at, record.request.client_order_id),
         )
 
-        # Prepare the whole batch (allocation, fills, new records) without touching
-        # any state; the clock is read only if something executes.
+        # Prepare the whole batch sequentially without touching any state: each
+        # order sees the position prepared after the previous orders of the batch.
         if not crossed:
             return ()
         spec = self._instruments.get(symbol)
@@ -500,52 +522,78 @@ class SimulatedExchange:
                 f"simulated exchange: order state invariant violated: orders of "
                 f"{symbol} have no registered instrument"
             )
+        positions = self._positions.begin_batch()
+        batch_ts: datetime | None = None  # read once, at the first state change
+        sequence = self._exec_sequence
+        fills: list[Fill] = []
+        new_records: list[_SimulatedOrder] = []
+        left = available_qty
         try:
-            allocations: list[tuple[_SimulatedOrder, Decimal]] = []
-            left = available_qty
             for record in crossed:
                 record.check_invariants()  # never repair a corrupted record
-                qty = _fill_qty(record, spec, left)
+                side = record.request.side
+                cap: Decimal | None = None
+                if record.request.reduce_only:
+                    cap = _reducible_qty(side, positions.signed_qty(symbol))
+                    if cap == 0:
+                        # Cannot reduce anything any more: cancel, no fill, no budget used.
+                        if batch_ts is None:
+                            batch_ts = self._now()
+                        new_records.append(
+                            replace(record, status=OrderStatus.CANCELED, updated_at=batch_ts)
+                        )
+                        continue
+                qty = _fill_qty(record, spec, left, cap)
                 if qty == 0:
-                    break  # budget below one step: every later order gets 0 too
-                allocations.append((record, qty))
+                    continue  # budget below one step
+                if batch_ts is None:
+                    batch_ts = self._now()
+                sequence += 1
+                fill = _build_fill(
+                    record,
+                    exec_id=f"{EXEC_ID_PREFIX}{sequence:010d}",
+                    execution_price=execution_price,
+                    qty=qty,
+                    exchange_ts=batch_ts,
+                )
+                filled = _apply_fill(record, execution_price=execution_price, qty=qty, at=batch_ts)
+                positions.apply(fill)
+                if (
+                    record.request.reduce_only
+                    and filled.status is OrderStatus.PARTIALLY_FILLED
+                    and _reducible_qty(side, positions.signed_qty(symbol)) == 0
+                ):
+                    # The position is closed: the rest could only open or reverse it.
+                    filled = replace(filled, status=OrderStatus.CANCELED)
+                fills.append(fill)
+                new_records.append(filled)
                 if left is not None:
                     left = _exact_context().subtract(left, qty)
-            if not allocations:
-                return ()
-
-            batch_ts = self._now()
-            sequence = self._exec_sequence
-            fills: list[Fill] = []
-            new_records: list[_SimulatedOrder] = []
-            for record, qty in allocations:
-                sequence += 1
-                fills.append(
-                    _build_fill(
-                        record,
-                        exec_id=f"{EXEC_ID_PREFIX}{sequence:010d}",
-                        execution_price=execution_price,
-                        qty=qty,
-                        exchange_ts=batch_ts,
-                    )
-                )
-                new_records.append(
-                    _apply_fill(record, execution_price=execution_price, qty=qty, at=batch_ts)
-                )
         except DecimalException:
             raise ExchangeRequestValidationError(
                 "simulated exchange: fill quantities cannot be computed exactly"
             ) from None
-
-        # Position state of the whole batch, in fill order (still no mutation).
-        prepared_positions = self._positions.prepare(fills)
+        if not new_records:
+            return ()
 
         # Commit: positions, orders and the execution sequence together.
-        self._positions.commit(prepared_positions)
+        self._positions.commit(positions.prepared())
         for new_record in new_records:
             self._orders[new_record.request.client_order_id] = new_record
         self._exec_sequence = sequence
         return tuple(fills)
+
+    def _check_reduce_only_direction(self, order: OrderRequest) -> None:
+        """A new reduce-only order must reduce the current position: SELL a long,
+        BUY a short. Its size is not limited here; fills are capped at execution."""
+        position = self._positions.get_position(order.symbol)
+        position_qty = _ZERO if position is None else position.qty
+        if _reducible_qty(order.side, position_qty) == 0:
+            state = "no" if position_qty == 0 else ("a long" if position_qty > 0 else "a short")
+            raise ExchangeRejectedError(
+                f"simulated exchange: reduce_only {order.side.value} order "
+                f"{order.client_order_id} would not reduce {state} {order.symbol} position"
+            )
 
     async def get_position(self, *, symbol: str) -> Position | None:
         """Simulation-only read (not part of ``TradingClient``): the net position of
