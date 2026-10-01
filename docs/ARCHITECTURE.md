@@ -278,6 +278,7 @@ ExchangeError
 | `ExchangeRejectedError` | Біржа відповіла й однозначно відмовила, нічого не прийнято (зокрема явна відмова через rate limit) | Не повторюється наосліп |
 | `ExchangeAuthenticationError` | Біржа відхилила автентифікацію чи права (не для відсутніх локальних ключів — це помилка конфігурації) | Ні; HALTED + сповіщення |
 | `ExchangeAmbiguousResultError` | Мутуючий запит міг бути прийнятий, підтвердженого результату немає (timeout чи розрив після відправки, або адаптер не може довести, що запит не пішов) | **Ніколи наосліп**: спершу reconciliation |
+| `ExchangeResponseError` | **Лише для читання:** запит відправлено (або міг бути), але валідної відповіді немає (timeout, розрив, 5xx, зламаний чи неочікуваний JSON). Читання не має побічних ефектів, тому це не `Ambiguous`. Мутуючі запити його ніколи не кидають | Може повторити політика викликача |
 
 - Timeout ніколи не класифікується як `NotSent`, якщо адаптер не може цього довести.
 - Rate limit: відмова локального limiter до мережі → `NotSent`; явна відповідь біржі з відмовою → `Rejected`; timeout чи розрив після можливої відправки → `Ambiguous`. Окремого `RateLimitError` немає.
@@ -299,6 +300,19 @@ Retry-механізму ще немає (наступні кроки Phase 2); 
 Rate limiter (token bucket) живе в адаптері, окремо для кожної групи ендпоінтів. Якщо біржа повертає заголовки зі станом лімітів, адаптер їх використовує (формат перевірити в документації).
 
 ### 5.4 Реалізації
+
+**Наявна: `app/exchanges/bybit/market_data.py` — `BybitMarketDataClient`** (публічний REST V5, без ключів і підписів, без WebSocket і приватного API). Залежить лише від `httpx` (правило архітектури окремо для `exchanges.bybit`; ядро контрактів лишається на stdlib).
+
+- Ендпоінти (офіційні docs `bybit-exchange/docs`, `docs/v5`): `GET /v5/market/instruments-info` і `GET /v5/market/tickers` з `category=linear&symbol=...`; обгортка `retCode` / `retMsg` / `result` / `retExtInfo` / `time`.
+- Підтримується лише USDT linear perpetual: `contractType=LinearPerpetual`, `quoteCoin=settleCoin=USDT`, `status=Trading`, не pre-listing. `category=linear` містить і USDC-контракти та ф'ючерси — вони відхиляються (`ExchangeRejectedError`).
+- `InstrumentSpec`: `tickSize`, `qtyStep`, `minOrderQty`, `minNotionalValue`; `max_qty` = менше з `maxOrderQty` (limit/post-only) і `maxMktOrderQty`.
+- `Ticker`: `lastPrice` обов'язковий; `markPrice`, `bid1Price`, `ask1Price`, `fundingRate`, `nextFundingTime` — поле має бути присутнє, порожній рядок означає `None`. У тікера немає власної мітки часу: `exchange_ts` — це `time` обгортки (серверний час відповіді, ms), `received_ts` — з `Clock` після отримання відповіді.
+- Числа — лише з JSON-рядків простого десяткового вигляду, напряму в `Decimal` (JSON-числа на їх місці, `NaN`, експонента відхиляються). Мілісекунди — через `utc_from_ms`.
+- Відповідь має містити рівно один елемент саме для запитаного символу (без нормалізації регістру); порожній список — `ExchangeRejectedError` («not found»).
+- Помилки: з'єднання не встановлено → `NotSent`; інші транспортні збої, 5xx, зламаний JSON чи схема → `ExchangeResponseError`; HTTP 4xx і `retCode != 0` → `ExchangeRejectedError`. Повідомлення без тіл відповідей; `retMsg` обрізається.
+- `httpx.AsyncClient` і `base_url` передаються ззовні (адаптер не закриває клієнт). Константи `BYBIT_TESTNET_REST_URL` / `BYBIT_MAINNET_REST_URL` — в `exchanges/bybit/endpoints.py`; вибір URL за режимом робить майбутній composition layer, у адаптері значення за замовчуванням немає.
+
+Цільові реалізації:
 
 | Реалізація | Призначення |
 |---|---|

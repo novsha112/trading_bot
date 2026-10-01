@@ -5,6 +5,7 @@ description = "Modular cryptocurrency trading bot (backtest, paper, testnet, liv
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.28.1",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",

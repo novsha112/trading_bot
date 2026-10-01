@@ -16,6 +16,12 @@ can never swallow another:
 
 A timeout is never classified as "not sent" unless the adapter can prove it.
 
+For read-only requests there is a fourth sibling, ``ExchangeResponseError``: the
+request was (or may have been) sent, but no valid answer was obtained (timeout,
+connection loss, server error, malformed or unexpected response). A read has no
+side effect, so this is not ambiguous and may be retried by the caller's policy.
+Mutating requests never raise it: without a valid answer they are ambiguous.
+
 Messages must not contain credentials, signatures, raw headers or raw response
 bodies.
 """
@@ -44,3 +50,8 @@ class ExchangeAuthenticationError(ExchangeRejectedError):
 
 class ExchangeAmbiguousResultError(ExchangeError):
     """A request may have been accepted by the exchange; the outcome is unknown."""
+
+
+class ExchangeResponseError(ExchangeError):
+    """A read-only request got no valid answer (transport failure, server error,
+    malformed or unexpected response). Never raised for mutating requests."""

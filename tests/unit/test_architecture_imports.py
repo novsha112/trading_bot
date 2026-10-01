@@ -49,10 +49,25 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "config": frozenset({"pydantic", "pydantic_settings", "yaml"}),
     # Pure, deterministic algorithms on domain types: same code in backtest and live.
     "strategies": frozenset(),
-    # Exchange-neutral contracts; SDKs / HTTP / WS libraries are allowed only once a
-    # concrete adapter needs them, by an explicit change of this rule.
+    # Exchange-neutral contracts (protocols, DTOs, errors): no third-party code.
     "exchanges": frozenset(),
+    # Concrete adapter: the core contracts plus one HTTP client.
+    "exchanges.bybit": frozenset({"httpx"}),
 }
+
+# Implementation subpackages that the rest of their own top-level package must not
+# import (core contracts never depend on a concrete adapter).
+IMPLEMENTATION_SUBPACKAGES: frozenset[str] = frozenset({"exchanges.bybit"})
+
+
+def _third_party_rule(module: str) -> frozenset[str] | None:
+    """Most specific ALLOWED_THIRD_PARTY entry for a module (e.g. exchanges.bybit)."""
+    parts = module.split(".")[1:]
+    for length in range(len(parts), 0, -1):
+        key = ".".join(parts[:length])
+        if key in ALLOWED_THIRD_PARTY:
+            return ALLOWED_THIRD_PARTY[key]
+    return None
 
 
 def _module_name(path: Path, root: Path) -> str:
@@ -117,7 +132,7 @@ def find_violations(root: Path) -> list[str]:
         for name in sorted(imports):
             name_parts = name.split(".")
             if name_parts[0] != root.name:
-                third_party = ALLOWED_THIRD_PARTY.get(package)
+                third_party = _third_party_rule(module)
                 top = name_parts[0]
                 if (
                     third_party is not None
@@ -135,6 +150,16 @@ def find_violations(root: Path) -> list[str]:
             target = name_parts[1]
             if target != package and target not in allowed:
                 violations.append(f"{module}: imports '{name}' (app.{package} -> app.{target})")
+            for implementation in IMPLEMENTATION_SUBPACKAGES:
+                if implementation.split(".")[0] != package:
+                    continue  # other packages are governed by ALLOWED_APP_IMPORTS
+                prefix = f"{root.name}.{implementation}"
+                imports_impl = name == prefix or name.startswith(f"{prefix}.")
+                inside_impl = module == prefix or module.startswith(f"{prefix}.")
+                if imports_impl and not inside_impl:
+                    violations.append(
+                        f"{module}: imports '{name}' (core module -> implementation {prefix})"
+                    )
     return violations
 
 
@@ -404,6 +429,54 @@ def test_exchange_allowed_imports(tmp_path: Path) -> None:
         "exchanges/protocols.py",
         "from typing import Protocol\nfrom app.domain.orders import Order\n"
         "from .models import OrderAck\n",
+    )
+
+    assert find_violations(root) == []
+
+
+# --- Exchange implementation subpackage --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        # Core contracts may not use the adapter's dependency...
+        (
+            "exchanges/models.py",
+            "import httpx\n",
+            "'httpx' (third-party; not allowed in app.exchanges)",
+        ),
+        ("exchanges/protocols.py", "import httpx\n", "'httpx' (third-party"),
+        # ...nor import the adapter itself.
+        ("exchanges/protocols.py", "from app.exchanges.bybit import market_data\n", "core module"),
+        ("exchanges/errors.py", "from .bybit.endpoints import X\n", "core module"),
+        # The adapter gets httpx, nothing else.
+        ("exchanges/bybit/market_data.py", "import aiohttp\n", "'aiohttp' (third-party"),
+        ("exchanges/bybit/market_data.py", "import pybit\n", "'pybit' (third-party"),
+        ("exchanges/bybit/market_data.py", "import structlog\n", "'structlog' (third-party"),
+        ("exchanges/bybit/market_data.py", "from app.config.settings import X\n", "-> app.config"),
+    ],
+)
+def test_exchange_subpackage_violations(
+    tmp_path: Path, relative: str, source: str, expected: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert len(violations) == 1, violations
+    assert expected in violations[0]
+
+
+def test_bybit_adapter_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/bybit/market_data.py",
+        "import json\nimport httpx\nfrom app.domain.clock import Clock\n"
+        "from app.exchanges.errors import ExchangeRejectedError\nfrom ..models import OrderAck\n"
+        "from .endpoints import BYBIT_TESTNET_REST_URL\n",
     )
 
     assert find_violations(root) == []

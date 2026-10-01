@@ -12,9 +12,15 @@ from app.exchanges.errors import (
     ExchangeError,
     ExchangeNotSentError,
     ExchangeRejectedError,
+    ExchangeResponseError,
 )
 
-OUTCOMES = [ExchangeNotSentError, ExchangeRejectedError, ExchangeAmbiguousResultError]
+OUTCOMES = [
+    ExchangeNotSentError,
+    ExchangeRejectedError,
+    ExchangeAmbiguousResultError,
+    ExchangeResponseError,
+]
 
 
 @pytest.mark.parametrize("error", [*OUTCOMES, ExchangeAuthenticationError])
@@ -69,3 +75,11 @@ def test_blind_retry_policy(error: ExchangeError, allowed: bool) -> None:
 def test_errors_carry_only_a_message() -> None:
     error = ExchangeRejectedError("order rejected: insufficient balance")
     assert error.args == ("order rejected: insufficient balance",)
+
+
+def test_response_error_is_read_only_and_not_ambiguous() -> None:
+    # A failed read has no side effect: it must not be confused with an ambiguous
+    # mutating request nor with a definitive rejection.
+    assert not issubclass(ExchangeResponseError, ExchangeAmbiguousResultError)
+    assert not issubclass(ExchangeResponseError, ExchangeRejectedError)
+    assert "Never raised for mutating requests" in (ExchangeResponseError.__doc__ or "")
