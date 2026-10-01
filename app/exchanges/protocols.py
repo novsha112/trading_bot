@@ -17,9 +17,9 @@ from typing import Protocol
 from app.domain.balances import Balance
 from app.domain.instrument import InstrumentSpec
 from app.domain.market import Ticker
-from app.domain.orders import Order, OrderUpdate
+from app.domain.orders import OrderUpdate
 from app.domain.positions import Position
-from app.exchanges.models import OrderAck
+from app.exchanges.models import OrderAck, OrderRef, OrderRequest
 
 
 class MarketDataClient(Protocol):
@@ -43,41 +43,41 @@ class AccountClient(Protocol):
 
 
 class TradingClient(Protocol):
-    async def place_order(self, order: Order) -> OrderAck:
-        """Submit ``order`` (already persisted as SUBMITTING by the execution layer).
+    async def place_order(self, order: OrderRequest) -> OrderAck:
+        """Submit a placement request.
 
-        The order carries the client order id: the idempotency key the exchange
-        stores with the order, so an ambiguous outcome can be resolved by
-        ``get_order``. The adapter never generates its own id and never re-sends.
+        ``order.client_order_id`` is the idempotency key; the adapter sends it with
+        the request, never generates its own and never re-sends on its own.
 
         Returns an acknowledgement only; the order state is confirmed later by an
         OrderUpdate.
 
         Raises:
+            ExchangeNotSentError: the request definitely did not reach the exchange.
             ExchangeRejectedError: refused; the order does not exist on the exchange.
-            ExchangeUnavailableError: definitely not sent.
-            ExchangeAmbiguousResultError: may have been placed; reconcile, do not retry.
+            ExchangeAmbiguousResultError: may have been placed; reconcile through
+                ``get_order(OrderRef(symbol, client_order_id))``, never re-send blindly.
         """
         ...
 
-    async def cancel_order(self, order: Order) -> None:
-        """Request cancellation of ``order``.
+    async def cancel_order(self, order: OrderRef) -> None:
+        """Request cancellation of the referenced order.
 
-        The adapter chooses the identifier its exchange needs: the client order id,
-        or ``order.exchange_order_id`` when it is known. Returning means the request
-        was accepted, not that the order is canceled: the final state (CANCELED or
-        FILLED in a race) comes from an OrderUpdate.
+        The adapter chooses the identifier its exchange needs (client order id, or
+        exchange order id when known). Returning means the request was accepted, not
+        that the order is canceled: the final state (CANCELED, or FILLED in a race)
+        comes from an OrderUpdate.
 
         Raises:
+            ExchangeNotSentError: the request definitely did not reach the exchange.
             ExchangeRejectedError: refused (e.g. order already final or unknown);
                 check the order state with ``get_order``.
-            ExchangeUnavailableError: definitely not sent.
             ExchangeAmbiguousResultError: may have been accepted; reconcile.
         """
         ...
 
-    async def get_order(self, *, symbol: str, client_order_id: str) -> OrderUpdate | None:
-        """Current state of the order with ``client_order_id``.
+    async def get_order(self, order: OrderRef) -> OrderUpdate | None:
+        """Current state of the referenced order (works with only ``client_order_id``).
 
         ``None`` only when the exchange confirms that no such order exists. Any
         failure to get an answer raises an ExchangeError instead.

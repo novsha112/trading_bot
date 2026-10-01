@@ -137,7 +137,7 @@ app/
 4. ExecutionEngine:
    a. створює Order(NEW, client_order_id), персистить
    b. переводить у SUBMITTING, персистить (write-ahead)
-   c. запускає async-задачу adapter.create_order(...)
+   c. запускає async-задачу trading_client.place_order(OrderRequest)
    d. результат задачі (ack / reject / timeout) → подія в Event Queue
 5. PrivateStream приносить OrderUpdate і Fill → Event Queue
 6. TradingEngine: OrderManager.apply(update), Portfolio.apply(fill),
@@ -224,86 +224,77 @@ app/
 
 ## 5. Exchange Adapter
 
-### 5.0 Поточні контракти (Phase 2, `app/exchanges/`)
+### 5.1 Контракти (`app/exchanges/`)
 
-Реалізовано лише контракти, без жодного адаптера (Bybit ще немає):
-
-```text
-MarketDataClient   get_instrument(symbol) -> InstrumentSpec; get_ticker(symbol) -> Ticker
-AccountClient      get_balances() -> tuple[Balance, ...]; get_positions() -> tuple[Position, ...]
-TradingClient      place_order(order: Order) -> OrderAck
-                   cancel_order(order: Order) -> None
-                   get_order(*, symbol, client_order_id) -> OrderUpdate | None
-                   get_open_orders(*, symbol) -> tuple[OrderUpdate, ...]
-```
-
-- Усі методи `async`; протоколи структурні (`typing.Protocol`), відповідність перевіряє mypy.
-- Межа: через протоколи проходять лише доменні типи і `OrderAck`. Сирі відповіді, JSON, SDK-об'єкти й біржові назви (статуси, ідентифікатори) лишаються в адаптері, який перекладає їх явно.
-- `TradingClient` приймає доменний `Order`, а не intent: лише `Order` містить `client_order_id` (ключ ідемпотентності, згенерований і збережений execution до відправки) та відомий `exchange_order_id` для скасування. Адаптер ніколи не генерує власний ідентифікатор.
-- `OrderAck` (`client_order_id`, `exchange_order_id`, необов'язковий `exchange_ts`) — підтвердження прийняття запиту, **не статус**: ордер лишається `SUBMITTING`, доки `OrderUpdate` не підтвердить стан. Запис `exchange_order_id` — оновлення метаданих (Phase 5), не перехід state machine.
-- `cancel_order` повертає `None`: прийняття запиту на скасування не означає `CANCELED`; результат (у гонці й `FILLED`) приходить через `OrderUpdate`.
-- `get_order` повертає `None` лише тоді, коли біржа підтвердила, що такого ордера немає. Неможливість отримати відповідь — виняток, ніколи не `None` чи порожній результат.
-- Помилки (`app/exchanges/errors.py`): `ExchangeRejectedError` (однозначно відхилено, нічого не виконано; підклас `ExchangeAuthenticationError`), `ExchangeUnavailableError` (точно не виконано: не відправлено, явний rate limit), `ExchangeAmbiguousResultError` (мутуючий запит міг виконатися). Невизначений результат не наслідується від «безпечних» помилок і **ніколи не повторюється наосліп**: він запускає перевірку через `get_order` / reconciliation. Якщо адаптер не може довести, що запит не дійшов, він кидає `ExchangeAmbiguousResultError`.
-
-Підрозділи 5.1–5.2 нижче — цільовий повний дизайн; методи, яких ще немає в контрактах, додаються разом зі споживачами.
-
-### 5.1 Розділення на три інтерфейси
-
-Публічні дані, приватна торгівля і приватний стрім мають різні вимоги (auth, rate limit, reconnect). Тому замість одного великого протоколу — три невеликі:
+Три невеликі async-протоколи замість одного великого клієнта: публічні дані, акаунт і торгівля мають різні вимоги (ключі, rate limit, хто має доступ). Протоколи структурні (`typing.Protocol`), відповідність адаптерів перевіряє mypy.
 
 ```text
-PublicMarketDataClient      (без ключів)
+MarketDataClient   (без ключів)
   get_instrument(symbol) -> InstrumentSpec
   get_ticker(symbol) -> Ticker
-  get_klines(symbol, interval, start, end) -> list[Kline]
-  get_funding_history(symbol, start, end) -> list[FundingRate]
-  get_risk_limit_tiers(symbol) -> list[RiskLimitTier]
-  stream(symbols, channels) -> AsyncIterator[MarketEvent]
 
-TradingAdapter              (з ключами; лише execution і KillSwitch)
-  get_balance() -> list[Balance]
-  get_positions(symbol?) -> list[Position]
-  get_open_orders(symbol?) -> list[OrderUpdate]
-  get_order(client_order_id) -> OrderUpdate | None
-  get_fills(symbol, since) -> list[Fill]
-  get_fee_schedule(symbol) -> FeeSchedule
-  get_account_config() -> AccountConfig        # position mode, margin mode
-  get_api_key_info() -> ApiKeyInfo             # права, IP whitelist (якщо API дає)
-  set_leverage(symbol, leverage) -> None
-  create_order(OrderRequest) -> SubmitAck
-  cancel_order(symbol, client_order_id) -> CancelAck
-  cancel_all_orders(symbol) -> CancelAllAck
+AccountClient      (з ключами)
+  get_balances() -> tuple[Balance, ...]
+  get_positions() -> tuple[Position, ...]
 
-PrivateStream               (з ключами)
-  stream() -> AsyncIterator[OrderUpdate | Fill | Position | Balance | StreamGap]
+TradingClient      (з ключами; лише execution і KillSwitch)
+  place_order(order: OrderRequest) -> OrderAck
+  cancel_order(order: OrderRef) -> None
+  get_order(order: OrderRef) -> OrderUpdate | None
+  get_open_orders(*, symbol) -> tuple[OrderUpdate, ...]
 ```
 
-`CLAUDE.md` пропонує один `ExchangeAdapter`. Розділення на три протоколи — це уточнення, а не заміна: усі методи з `CLAUDE.md` є, і їх можна зібрати в один фасад, якщо так зручніше.
+Методи додаються разом з першим споживачем. Заплановані (ще не існують): klines і історія funding, risk-limit tiers, fills, ставки комісій, налаштування акаунта й права ключа, `set_leverage`, `cancel_all_orders`, а також стріми (публічний market data і приватний `PrivateStream` з `OrderUpdate` / `Fill` / `Position` / `Balance`).
 
-### 5.2 Нормалізовані помилки
+`CLAUDE.md` пропонує один `ExchangeAdapter`. Розділення на протоколи — уточнення, а не заміна: їх можна зібрати в один фасад.
 
-Критично важливо розрізняти, **чи міг запит дійти до біржі**:
+**Межа і DTO.** Через протоколи проходять лише доменні типи й три DTO межі (`app/exchanges/models.py`). Сирі відповіді, JSON, SDK-об'єкти й біржові назви (статуси, ідентифікатори) лишаються в адаптері, який перекладає їх явно.
 
-| Помилка | Значення | Що робить execution |
+| DTO | Поля | Сенс |
 |---|---|---|
-| `ExchangeRejectedError` | Біржа однозначно відхилила запит (з кодом) | `REJECTED`, без retry |
-| `OutcomeUnknownError` | Запит міг бути виконаний (timeout після відправки, розрив, 5xx) | `UNKNOWN`, перевірити через `get_order` |
-| `NotSentError` | Доведено, що запит не пішов (наприклад, помилка валідації до мережі) | `FAILED` |
-| `RateLimitError` | Перевищено ліміт | backoff; для create — як `NotSentError`, лише якщо біржа однозначно відповіла кодом ліміту |
-| `AuthError` | Проблема з ключами чи правами | HALTED + сповіщення |
-| `TemporaryExchangeError` | Біржа тимчасово недоступна | backoff; для create — як `OutcomeUnknownError` |
+| `OrderRequest` | `client_order_id`, `symbol`, `side`, `order_type`, `price?`, `qty`, `time_in_force`, `reduce_only` | Запит на розміщення. Будує execution зі збереженого `Order`; життєвого циклу (статус, виконання, версія, часи) в ньому немає. `client_order_id` існує до мережевого виклику — це ключ ідемпотентності; адаптер ніколи не генерує власний |
+| `OrderRef` | `symbol`, `client_order_id`, `exchange_order_id?` | Посилання на ордер для скасування й запиту. `client_order_id` обов'язковий (стабільний ідентифікатор для reconciliation); `exchange_order_id` відомий лише після ACK, тож усе працює й без нього |
+| `OrderAck` | `client_order_id`, `exchange_order_id`, `exchange_ts?` | Підтвердження прийняття запиту, **не статус**: ордер лишається `SUBMITTING`, доки `OrderUpdate` не підтвердить стан. Запис `exchange_order_id` — оновлення метаданих (Phase 5), не перехід state machine |
 
-Якщо не можна довести, що запит не дійшов, помилка вважається `OutcomeUnknownError`.
+Ланцюжок (Phase 5): затверджений intent → збережений `Order` з `client_order_id` → `OrderRequest` → `TradingClient`. `Order` і intents у протоколи не передаються.
+
+**Семантика результатів.** `cancel_order` повертає `None`: прийняття запиту не означає `CANCELED`; результат (у гонці й `FILLED`) приходить через `OrderUpdate`. `get_order` повертає `None` лише тоді, коли біржа підтвердила, що такого ордера немає; порожній `get_open_orders` — підтверджено, що відкритих немає. Неможливість отримати відповідь — завжди виняток.
+
+### 5.2 Помилки (`app/exchanges/errors.py`)
+
+Критично важливо знати, **чи міг запит бути прийнятий біржею**. Три категорії — сиблінги, жодна не є підкласом іншої, тож обробка однієї не може проковтнути іншу:
+
+```text
+ExchangeError
+├── ExchangeNotSentError
+├── ExchangeRejectedError
+│   └── ExchangeAuthenticationError
+└── ExchangeAmbiguousResultError
+```
+
+| Помилка | Значення | Повтор |
+|---|---|---|
+| `ExchangeNotSentError` | Запит точно не дійшов до біржі: локальна перевірка до відправки, з'єднання не встановлене до відправки байтів, відмова локального rate limiter | Може повторити політика викликача |
+| `ExchangeRejectedError` | Біржа відповіла й однозначно відмовила, нічого не прийнято (зокрема явна відмова через rate limit) | Не повторюється наосліп |
+| `ExchangeAuthenticationError` | Біржа відхилила автентифікацію чи права (не для відсутніх локальних ключів — це помилка конфігурації) | Ні; HALTED + сповіщення |
+| `ExchangeAmbiguousResultError` | Мутуючий запит міг бути прийнятий, підтвердженого результату немає (timeout чи розрив після відправки, або адаптер не може довести, що запит не пішов) | **Ніколи наосліп**: спершу reconciliation |
+
+- Timeout ніколи не класифікується як `NotSent`, якщо адаптер не може цього довести.
+- Rate limit: відмова локального limiter до мережі → `NotSent`; явна відповідь біржі з відмовою → `Rejected`; timeout чи розрив після можливої відправки → `Ambiguous`. Окремого `RateLimitError` немає.
+- Після `ExchangeAmbiguousResultError` на `place_order` ордер стає `UNKNOWN`, і стан встановлюється через `get_order(OrderRef(symbol, client_order_id))`: знайдено → фактичний статус, підтверджено «немає» → `FAILED` (розділ 7.3). Повторна відправка з тим самим `client_order_id` у v1 не робиться.
+- Повідомлення помилок не містять ключів, підписів, сирих заголовків і тіл відповідей.
 
 ### 5.3 Політика retry
 
+Retry-механізму ще немає (наступні кроки Phase 2); правила для нього:
+
 | Операція | Retry | Примітка |
 |---|---|---|
-| Читання (GET) | так, exponential backoff + jitter, обмежена кількість спроб | безпечно |
-| `create_order` | **ні** | невизначеність → `UNKNOWN` → перевірка за `client_order_id`. Ніколи не повторювати сліпо |
-| `cancel_order` | так, обмежено | «order not found» → перевірити статус через `get_order` |
-| `cancel_all_orders` | так, обмежено | потім перевірити `get_open_orders` |
-| `set_leverage` | так | ідемпотентна операція |
+| Читання (`get_*`) | так, exponential backoff + jitter, обмежена кількість спроб | безпечно |
+| `place_order` | **ні** | `Ambiguous` → `UNKNOWN` → перевірка за `client_order_id`. Ніколи не повторювати сліпо |
+| `cancel_order` | так, обмежено, лише після `NotSent` | `Rejected` («order not found» тощо) → перевірити стан через `get_order` |
+| `cancel_all_orders` (заплановано) | так, обмежено | потім перевірити `get_open_orders` |
+| `set_leverage` (заплановано) | так | ідемпотентна операція |
 
 Rate limiter (token bucket) живе в адаптері, окремо для кожної групи ендпоінтів. Якщо біржа повертає заголовки зі станом лімітів, адаптер їх використовує (формат перевірити в документації).
 
@@ -374,7 +365,7 @@ Private stream (ордери, виконання, позиції, гаманец
 approved intent
   → Order(status=NEW, client_order_id=gen()) → persist
   → status=SUBMITTING → persist                 # write-ahead: після рестарту відомо, що запит міг піти
-  → async task: adapter.create_order(request)
+  → async task: trading_client.place_order(OrderRequest з Order)
        ack          → зберегти exchange_order_id; статус лишається SUBMITTING,
                       доки не прийде OrderUpdate (WS) або REST get_order
        rejected     → REJECTED
@@ -481,7 +472,7 @@ risk:
 
 ### 9.3 Kill Switch
 
-- Незалежний компонент. Має прямий доступ до `TradingAdapter` в обхід Strategy.
+- Незалежний компонент. Має прямий доступ до `TradingClient` в обхід Strategy.
 - Тригери: вручну (CLI-команда або файл-прапорець), критичні ліміти ризику, повторні критичні помилки.
 - Дії (налаштовуються): (1) заблокувати нові ордери — завжди; (2) `cancel_all_orders` — налаштовується, за замовчуванням так; (3) закрити позиції reduce-only ринковими ордерами — налаштовується окремо; (4) записати причину; (5) сповістити.
 - Стан kill switch персистентний: після рестарту бот залишається в `HALTED`, доки людина не зніме його вручну.
@@ -772,7 +763,7 @@ v1 — мінімально, без зовнішньої інфраструкт�
 | Доступ до ключів | Ключі потрапляють лише в `exchanges/bybit` (auth). Решта коду отримує адаптер, а не ключі |
 | Права ключа | Торгівля — так; виведення — **ні** (перевіряється в preflight); IP whitelist — якщо доступний |
 | Акаунт | Виділений субакаунт з обмеженим балансом; основні кошти на іншому акаунті |
-| Торгові виклики | Тільки `ExecutionEngine` і `KillSwitch` мають `TradingAdapter` |
+| Торгові виклики | Тільки `ExecutionEngine` і `KillSwitch` мають `TradingClient` |
 | Режими | Mapping режим → endpoint у коді; live потребує двох прапорців і preflight |
 | Git | `.env`, дампи БД і логи в `.gitignore`; у репозиторії тільки `.env.example` з порожніми значеннями |
 | Вхідні канали керування | У v1 тільки CLI на сервері; жодних вхідних команд з месенджерів |
@@ -822,4 +813,4 @@ v1 — мінімально, без зовнішньої інфраструкт�
 5. Дані для бектесту: 1m свічки (простіше) чи трейди (точніше для Grid).
 6. Testnet чи Demo Trading як етап перед live (або обидва).
 7. Kill switch за замовчуванням: закривати позиції чи лише скасовувати ордери.
-8. Власник і напрямок залежностей KillSwitch. Зараз KillSwitch описаний у `risk/`, якому дозволено імпортувати тільки `domain` і `portfolio`, але KillSwitch потребує `TradingAdapter` з `exchanges/`. Follow-up: *Define the ownership and dependency direction for KillSwitch before implementing the risk/execution integration.*
+8. Власник і напрямок залежностей KillSwitch. Зараз KillSwitch описаний у `risk/`, якому дозволено імпортувати тільки `domain` і `portfolio`, але KillSwitch потребує `TradingClient` з `exchanges/`. Follow-up: *Define the ownership and dependency direction for KillSwitch before implementing the risk/execution integration.*

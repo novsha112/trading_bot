@@ -100,11 +100,11 @@
 
 **Мета.** Інтерфейси біржі, нормалізовані помилки і тестовий дубль, на якому можна будувати execution без реальної біржі.
 
-**Стан.** Розпочато: async-контракти `MarketDataClient` / `AccountClient` / `TradingClient`, `OrderAck` і базові помилки (`Rejected` / `Unavailable` / `AmbiguousResult`) — у `app/exchanges/`. Retry, rate limiter, `FakeExchange`, contract suite і вибір бібліотеки — наступні кроки фази. Геометрія Grid (`app/strategies/grid/levels.py`) лишається раннім ізольованим компонентом; решта Grid Strategy чекає своїх залежностей (Phase 5–6).
+**Стан.** Розпочато: async-контракти `MarketDataClient` / `AccountClient` / `TradingClient`, DTO `OrderRequest` / `OrderRef` / `OrderAck` і помилки `NotSent` / `Rejected` / `AmbiguousResult` — у `app/exchanges/`. Retry, rate limiter, `FakeExchange`, contract suite і вибір бібліотеки — наступні кроки фази. Геометрія Grid (`app/strategies/grid/levels.py`) лишається раннім ізольованим компонентом; решта Grid Strategy чекає своїх залежностей (Phase 5–6).
 
 **Що реалізуємо.**
-- Протоколи `PublicMarketDataClient`, `TradingAdapter`, `PrivateStream`.
-- Ієрархія помилок: `ExchangeRejectedError`, `OutcomeUnknownError`, `NotSentError`, `RateLimitError`, `AuthError`, `TemporaryExchangeError`.
+- Протоколи `MarketDataClient`, `AccountClient`, `TradingClient` (стріми — разом зі споживачами); DTO межі `OrderRequest`, `OrderRef`, `OrderAck`.
+- Ієрархія помилок: `ExchangeNotSentError`, `ExchangeRejectedError` (підклас `ExchangeAuthenticationError`), `ExchangeAmbiguousResultError` — три сиблінги за відомим ефектом запиту (ARCHITECTURE 5.2).
 - Спільні утиліти: retry-політика (exponential backoff + jitter, окремо для read / cancel; для create — без retry), token-bucket rate limiter, timeout-обгортка.
 - `FakeExchange` — in-memory реалізація зі скриптованими сценаріями: timeout після прийняття ордера, reject, часткові fills, дублікати й зміна порядку подій, розрив стріму.
 - **Contract test suite** — набір тестів поведінки адаптера, параметризований реалізацією.
@@ -195,7 +195,7 @@
 - рестарт з ордером у `SUBMITTING` у БД → при старті статус резолвиться, а не відправляється знову;
 - помилка БД перед відправкою → ордер не відправлено.
 
-**Критерії завершення.** Усі сценарії зелені проти `FakeExchange`; жоден шлях коду не викликає `create_order` двічі для одного intent; у кожного переходу є запис в `order_events`.
+**Критерії завершення.** Усі сценарії зелені проти `FakeExchange`; жоден шлях коду не викликає `place_order` двічі для одного intent; у кожного переходу є запис в `order_events`.
 
 **Залежності.** Phase 2, Phase 4.
 
@@ -256,7 +256,7 @@
 **Мета.** Відтворюваний бектест тим самим кодом Strategy / Risk / Execution / Portfolio.
 
 **Що реалізуємо.**
-- `SimulatedExchange` (реалізує `TradingAdapter` + `PrivateStream`): matching лімітних і ринкових ордерів, post-only, reduce-only, комісії, slippage, funding, ліквідація, опційна латентність, опційні часткові fills.
+- `SimulatedExchange` (реалізує `TradingClient` + приватний стрім): matching лімітних і ринкових ордерів, post-only, reduce-only, комісії, slippage, funding, ліквідація, опційна латентність, опційні часткові fills.
 - `ReplayFeed` + `SimulatedClock` з assert монотонності часу.
 - `BacktestRunner`: збирання тих самих компонентів через `services/bootstrap` з режимом `backtest`.
 - Метрики з `CLAUDE.md` розділ 18 + Grid-метрики (цикли, inventory, unrealized на кінець, max position, min liquidation distance, час поза діапазоном).
