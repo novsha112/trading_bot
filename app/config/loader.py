@@ -3,6 +3,8 @@
 YAML is parsed with a SafeLoader subclass (no Python object tags) that is
 stricter than YAML 1.1 defaults:
 
+* booleans are only ``true`` / ``false``; YAML 1.1 aliases (``yes``, ``on``,
+  ``True``, ``OFF``...) stay plain strings;
 * floats become ``Decimal`` built from the scalar text, never via ``float``;
 * integers must be plain decimal (``010`` would otherwise be octal 8, ``0x1F`` 31);
 * sexagesimal numbers (``1:30``) and duplicate mapping keys are errors.
@@ -40,6 +42,8 @@ PROFILE_MODES: Final[Mapping[str, frozenset[TradingMode]]] = MappingProxyType(
 )
 
 _PLAIN_INT = re.compile(r"[-+]?(?:0|[1-9][0-9_]*)\Z")
+_BOOL_TAG = "tag:yaml.org,2002:bool"
+_STRICT_BOOL = re.compile(r"^(?:true|false)$")
 
 
 class _ProfileLoader(yaml.SafeLoader):
@@ -80,6 +84,22 @@ def _construct_int(loader: yaml.SafeLoader, node: yaml.Node) -> int:
     return int(text)
 
 
+def _construct_bool(loader: yaml.SafeLoader, node: yaml.Node) -> bool:
+    # Reached by the strict implicit resolver or an explicit !!bool tag.
+    text = str(loader.construct_scalar(node))  # type: ignore[arg-type]
+    if not _STRICT_BOOL.match(text):
+        raise ConstructorError(None, None, "booleans must be true or false", node.start_mark)
+    return text == "true"
+
+
+# Own copy of the implicit resolvers without the YAML 1.1 boolean resolver, plus a
+# strict lowercase one. The global yaml.SafeLoader tables are not touched.
+_ProfileLoader.yaml_implicit_resolvers = {
+    first_char: [(tag, regexp) for tag, regexp in resolvers if tag != _BOOL_TAG]
+    for first_char, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_ProfileLoader.add_implicit_resolver(_BOOL_TAG, _STRICT_BOOL, ["t", "f"])
+_ProfileLoader.add_constructor(_BOOL_TAG, _construct_bool)
 _ProfileLoader.add_constructor("tag:yaml.org,2002:float", _construct_decimal)
 _ProfileLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
 

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 import yaml
 
-from app.config.loader import PROFILE_MODES, load_profile
+from app.config.loader import PROFILE_MODES, _ProfileLoader, load_profile
 from app.config.schema import AppConfig
 from app.config.settings import ConfigError, EnvSettings
 from app.domain.enums import GridMode
@@ -333,3 +333,73 @@ def test_yaml_float_constructor_is_never_used(monkeypatch: pytest.MonkeyPatch) -
     for profile, mode in [("development", "backtest"), ("paper", "paper"), ("testnet", "testnet")]:
         config = load_profile(CONFIGS / f"{profile}.yaml", env(mode, profile))
         assert config.strategy.grid.order_qty == D("0.001")
+
+
+# --- Strict booleans (loader level) ------------------------------------------------------
+
+
+def load_yaml(text: str) -> object:
+    return yaml.load(text, Loader=_ProfileLoader)  # noqa: S506 - SafeLoader subclass under test
+
+
+@pytest.mark.parametrize(("text", "expected"), [("true", True), ("false", False)])
+def test_lowercase_true_false_are_booleans(text: str, expected: bool) -> None:
+    value = load_yaml(f"value: {text}")["value"]  # type: ignore[index]
+    assert type(value) is bool
+    assert value is expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "True",
+        "False",
+        "TRUE",
+        "FALSE",
+        "yes",
+        "no",
+        "Yes",
+        "No",
+        "YES",
+        "NO",
+        "on",
+        "off",
+        "On",
+        "OFF",
+        "y",
+        "n",
+    ],
+)
+def test_yaml_1_1_boolean_aliases_stay_strings(text: str) -> None:
+    value = load_yaml(f"value: {text}")["value"]  # type: ignore[index]
+    assert type(value) is str
+    assert value == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [('"true"', "true"), ("'false'", "false"), ("true story", "true story"), ("falsey", "falsey")],
+)
+def test_quoted_and_longer_values_stay_strings(text: str, expected: str) -> None:
+    value = load_yaml(f"value: {text}")["value"]  # type: ignore[index]
+    assert type(value) is str
+    assert value == expected
+
+
+@pytest.mark.parametrize("text", ["!!bool yes", "!!bool on", "!!bool True"])
+def test_explicit_bool_tag_requires_strict_form(tmp_path: Path, text: str) -> None:
+    with pytest.raises(yaml.YAMLError):
+        load_yaml(f"value: {text}")
+    with pytest.raises(ConfigError, match="failed to parse config YAML"):
+        load_profile(write(tmp_path, f"profile: {{name: paper, flag: {text}}}\n"), env())
+
+
+def test_explicit_bool_tag_strict_form_accepted() -> None:
+    assert load_yaml("value: !!bool true")["value"] is True  # type: ignore[index]
+
+
+def test_global_safe_loader_booleans_unchanged() -> None:
+    assert yaml.safe_load("value: yes")["value"] is True
+    assert yaml.safe_load("value: on")["value"] is True
+    assert yaml.safe_load("value: TRUE")["value"] is True
+    assert yaml.SafeLoader.yaml_implicit_resolvers is not _ProfileLoader.yaml_implicit_resolvers
