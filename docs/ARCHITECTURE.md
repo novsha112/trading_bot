@@ -312,6 +312,16 @@ Rate limiter (token bucket) живе в адаптері, окремо для к
 - Помилки: з'єднання не встановлено → `NotSent`; `retCode` 10001 (помилка параметрів) і HTTP 400 / 404 → `ExchangeRejectedError`; `retCode` 10000 / 10006 / 10016 / 429, **будь-який невідомий `retCode`**, HTTP 403 / 408 / 429 / 5xx / інші не-2xx, інші транспортні збої, зламаний JSON чи схема → `ExchangeResponseError`. Повідомлення без тіл відповідей; `retMsg` обрізається.
 - `httpx.AsyncClient` і `base_url` передаються ззовні (адаптер не закриває клієнт). Константи `BYBIT_TESTNET_REST_URL` / `BYBIT_MAINNET_REST_URL` — в `exchanges/bybit/endpoints.py`; вибір URL за режимом робить майбутній composition layer, у адаптері значення за замовчуванням немає.
 
+**Наявний: `app/exchanges/bybit/private_rest.py` — `BybitPrivateRestTransport`** (лише підпис і транспорт; `TradingClient`, ордери й акаунт ще не реалізовані).
+
+- Підпис за офіційними docs (`docs/v5/guide.mdx`): заголовки `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP` (UTC ms), `X-BAPI-SIGN`, `X-BAPI-RECV-WINDOW` (за замовчуванням 5000; максимум у docs не задано); рядок для підпису — `timestamp + api_key + recv_window + queryString` (GET) або `+ jsonBodyString` (POST); HMAC_SHA256, lowercase hex.
+- Детермінованість: query (порядок викликача, percent-encoding UTF-8 один раз) і JSON-тіло (порядок ключів викликача, компактні роздільники, ASCII, без NaN) формуються один раз і відправляються саме в тому вигляді, в якому підписані. Значення: у query — `str` / `int`, у тілі — JSON-native без `float` / `Decimal` (числа передає адаптер у документованому рядковому вигляді).
+- Секрети: `BybitCredentials` (власна обгортка без pydantic, `repr` маскований) будує composition із `EnvSettings`; секрет лише підписує і ніколи не відправляється; `retMsg` у помилках очищується від ключа й секрету; тіла відповідей у помилки не потрапляють; транспорт нічого не логує.
+- Час — лише з injected `Clock` (UTC → цілі мілісекунди, без `float`).
+- Шляхи — лише відносні `/v5/...` (без `..`, `//`, `?`, `#`, `%`), тож ключ не може піти на інший host; `base_url` перевіряється як у публічному адаптері; `httpx.AsyncClient` — ззовні, не закривається.
+- API: `get(path, params=...)` — лише читання, ніколи не `Ambiguous`; `post_mutating(path, body=...)` — для мутуючих запитів. Обидва повертають `BybitResponse(result, ret_ext_info, server_time)`.
+- Класифікація: `ConnectError` / `ConnectTimeout` / `PoolTimeout` (httpcore 1.x кидає їх лише до запису запиту) і локальна валідація → `NotSent`; HTTP 401 і `retCode` 10003 / 10004 / 10005 / 10007 / 10010 / 33004 → `ExchangeAuthenticationError`; HTTP 400 / 404 і `retCode` 10001 / 10002 → `ExchangeRejectedError`; **усе інше** (інші транспортні збої, інші не-2xx, зламана відповідь, 10000 / 10006 / 10016 / 429, невідомі коди) → `ExchangeResponseError` для GET і **`ExchangeAmbiguousResultError` для мутуючого POST**.
+
 Цільові реалізації:
 
 | Реалізація | Призначення |

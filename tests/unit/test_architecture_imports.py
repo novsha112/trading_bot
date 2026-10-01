@@ -454,6 +454,12 @@ def test_exchange_allowed_imports(tmp_path: Path) -> None:
         ("exchanges/bybit/market_data.py", "import aiohttp\n", "'aiohttp' (third-party"),
         ("exchanges/bybit/market_data.py", "import pybit\n", "'pybit' (third-party"),
         ("exchanges/bybit/market_data.py", "import structlog\n", "'structlog' (third-party"),
+        (
+            "exchanges/bybit/private_rest.py",
+            "from pydantic import SecretStr\n",
+            "'pydantic.SecretStr'",
+        ),
+        ("exchanges/bybit/private_rest.py", "import requests\n", "'requests' (third-party"),
         ("exchanges/bybit/market_data.py", "from app.config.settings import X\n", "-> app.config"),
     ],
 )
