@@ -55,10 +55,16 @@ Current scope:
   (``simulated_fees``), its fee asset and ``is_maker`` from that assumed role;
   without it fee, fee asset and liquidity role stay None (unknown, not zero).
   Fees are computed while preparing the batch. Position realized PnL stays gross.
-* No balances, leverage or margin. Requests whose outcome cannot be
-  determined without them are refused (``ExchangeRejectedError``): MARKET (no
-  execution price model), LIMIT IOC / FOK (never rest on the book, their outcome
-  depends on matching).
+* Cash accounting is opt-in: ``cash=SimulatedCashConfig(asset, starting_cash)``
+  keeps ``starting_cash + gross realized PnL - fees`` of one asset
+  (``simulated_accounting``), fed per fill with the exact realized delta from the
+  position ledger and the fill's fee. It requires a fee policy in the same asset
+  and instruments quoted in it (checked at construction). Opening notional does
+  not move cash; no unrealized PnL, equity, funding or margin.
+* No ``Balance`` (it would need equity / available), leverage or margin.
+  Requests whose outcome cannot be determined without a matching model are
+  refused (``ExchangeRejectedError``): MARKET (no execution price model), LIMIT
+  IOC / FOK (never rest on the book, their outcome depends on matching).
 
 Semantics:
 * Idempotency by ``client_order_id`` (unique per instance, across symbols): a repeat
@@ -80,8 +86,8 @@ Semantics:
   per batch that changes anything (a fill or a reduce-only auto-cancel); all fills
   and order updates of the batch carry that time. A batch is all-or-nothing:
   orders are prepared one after another on working copies (each sees the position
-  after the previous fills), then positions, orders and the execution sequence
-  are committed together. A record violating the status / fill invariants raises
+  after the previous fills), then positions, cash, orders and the execution
+  sequence are committed together. A record violating the status / fill invariants raises
   before anything is committed and is never repaired.
 * All timestamps come from the injected ``Clock``. Nothing is ever ambiguous: there
   is no transport.
@@ -126,6 +132,11 @@ from app.exchanges.errors import (
     ExchangeRequestValidationError,
 )
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
+from app.exchanges.simulated_accounting import (
+    CashState,
+    SimulatedCashConfig,
+    SimulatedCashLedger,
+)
 from app.exchanges.simulated_fees import SimulatedFeePolicy
 from app.exchanges.simulated_positions import SimulatedPositionLedger
 
@@ -382,6 +393,7 @@ class SimulatedExchange:
     """In-memory ``TradingClient`` with deterministic ids and injected time."""
 
     __slots__ = (
+        "_cash",
         "_clock",
         "_exec_sequence",
         "_fees",
@@ -397,9 +409,12 @@ class SimulatedExchange:
         clock: Clock,
         instruments: tuple[InstrumentSpec, ...] = (),
         fees: SimulatedFeePolicy | None = None,
+        cash: SimulatedCashConfig | None = None,
     ) -> None:
         if fees is not None and not isinstance(fees, SimulatedFeePolicy):
             raise TypeError("fees must be a SimulatedFeePolicy or None")
+        if cash is not None and not isinstance(cash, SimulatedCashConfig):
+            raise TypeError("cash must be a SimulatedCashConfig or None")
         registry: dict[str, InstrumentSpec] = {}
         for spec in tuple(instruments):
             if not isinstance(spec, InstrumentSpec):
@@ -416,6 +431,22 @@ class SimulatedExchange:
         self._positions = SimulatedPositionLedger()
         # Immutable for the lifetime of the simulator; None = fees not modeled.
         self._fees = fees
+        if cash is not None:
+            # Cash must stay fully known: every fill needs a known fee in the cash
+            # asset, and realized PnL of every instrument is in its quote asset.
+            if fees is None:
+                raise ValueError("cash accounting requires a fee policy")
+            if fees.schedule.fee_asset != cash.asset:
+                raise ValueError(
+                    f"fee asset {fees.schedule.fee_asset} differs from cash asset {cash.asset}"
+                )
+            for spec in registry.values():
+                if spec.quote_asset != cash.asset:
+                    raise ValueError(
+                        f"{spec.symbol} quote asset {spec.quote_asset} differs from "
+                        f"cash asset {cash.asset} (no conversion)"
+                    )
+        self._cash = None if cash is None else SimulatedCashLedger(cash)
 
     def __repr__(self) -> str:
         return f"SimulatedExchange(orders={len(self._orders)})"
@@ -553,6 +584,7 @@ class SimulatedExchange:
                 f"{symbol} have no registered instrument"
             )
         positions = self._positions.begin_batch()
+        cash = None if self._cash is None else self._cash.begin_batch()
         batch_ts: datetime | None = None  # read once, at the first state change
         sequence = self._exec_sequence
         fills: list[Fill] = []
@@ -588,7 +620,18 @@ class SimulatedExchange:
                     fees=self._fees,
                 )
                 filled = _apply_fill(record, execution_price=execution_price, qty=qty, at=batch_ts)
-                positions.apply(fill)
+                realized_delta = positions.apply(fill)
+                if cash is not None:
+                    if realized_delta is None:  # fresh exec ids are never replays
+                        raise RuntimeError(
+                            f"simulated exchange: fill {fill.exec_id} was not applied"
+                        )
+                    cash.apply(
+                        exec_id=fill.exec_id,
+                        realized_delta=realized_delta,
+                        fee=fill.fee,
+                        fee_asset=fill.fee_asset,
+                    )
                 if (
                     record.request.reduce_only
                     and filled.status is OrderStatus.PARTIALLY_FILLED
@@ -607,8 +650,12 @@ class SimulatedExchange:
         if not new_records:
             return ()
 
-        # Commit: positions, orders and the execution sequence together.
-        self._positions.commit(positions.prepared())
+        # Commit: positions, cash, orders and the execution sequence together.
+        prepared_positions = positions.prepared()
+        prepared_cash = None if cash is None else cash.prepared()
+        self._positions.commit(prepared_positions)
+        if self._cash is not None and prepared_cash is not None:
+            self._cash.commit(prepared_cash)
         for new_record in new_records:
             self._orders[new_record.request.client_order_id] = new_record
         self._exec_sequence = sequence
@@ -625,6 +672,12 @@ class SimulatedExchange:
                 f"simulated exchange: reduce_only {order.side.value} order "
                 f"{order.client_order_id} would not reduce {state} {order.symbol} position"
             )
+
+    async def get_cash_state(self) -> CashState | None:
+        """Simulation-only read (not part of ``TradingClient``): cash components of
+        the accounting asset, or None when cash accounting is not configured. Cash
+        is not equity (no unrealized PnL). Never reads the clock."""
+        return None if self._cash is None else self._cash.state()
 
     async def get_position(self, *, symbol: str) -> Position | None:
         """Simulation-only read (not part of ``TradingClient``): the net position of

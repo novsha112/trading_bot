@@ -502,3 +502,35 @@ def test_batch_keeps_exec_id_idempotency() -> None:
     assert batch.signed_qty("BTCUSDT") == D("1")
     with pytest.raises(PositionAccountingError, match="exec_id X"):
         batch.apply(buy("2", "100", exec_id="X"))
+
+
+# --- exact realized delta per fill --------------------------------------------------
+
+
+def test_batch_apply_returns_exact_realized_delta() -> None:
+    from fractions import Fraction
+
+    ledger = SimulatedPositionLedger()
+    batch = ledger.begin_batch()
+
+    assert batch.apply(buy("2", "100")) == Fraction(0)  # open
+    assert batch.apply(buy("1", "110")) == Fraction(0)  # increase
+    assert batch.apply(sell("1", "120")) == Fraction(50, 3)  # 120 - 310/3, exact
+    assert batch.apply(sell("4", "100")) == Fraction(-20, 3)  # closes 2 @ 310/3, opens 2
+    replay = sell("1", "100", exec_id="R")
+    assert batch.apply(replay) == Fraction(0)
+    assert batch.apply(replay) is None  # identical replay: nothing applied
+
+
+def test_delta_sum_equals_exact_realized() -> None:
+    ledger = SimulatedPositionLedger()
+    batch = ledger.begin_batch()
+    deltas = [
+        batch.apply(f)
+        for f in (buy("3", "100"), sell("1", "101"), sell("1", "102"), sell("1", "103.5"))
+    ]
+
+    ledger.commit(batch.prepared())
+    p = ledger.get_position("BTCUSDT")
+    assert p is not None
+    assert sum(d for d in deltas if d is not None) == p.realized_pnl == D("6.5")

@@ -78,12 +78,15 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.exchanges.errors",
             "app.exchanges.simulated_positions",
             "app.exchanges.simulated_fees",
+            "app.exchanges.simulated_accounting",
         }
     ),
     # Position accounting: domain only (no exchange contracts, no instrument rules).
     "exchanges.simulated_positions": frozenset({"app.domain"}),
     # Fee model: domain only.
     "exchanges.simulated_fees": frozenset({"app.domain"}),
+    # Cash accounting: domain only (realized deltas are passed in, not computed).
+    "exchanges.simulated_accounting": frozenset({"app.domain"}),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -96,6 +99,7 @@ IMPLEMENTATION_SUBPACKAGES: dict[str, frozenset[str]] = {
     "exchanges.simulated_positions": frozenset({"exchanges.simulated"}),
     # Fee model likewise: used by the simulator only.
     "exchanges.simulated_fees": frozenset({"exchanges.simulated"}),
+    "exchanges.simulated_accounting": frozenset({"exchanges.simulated"}),
 }
 
 
@@ -763,6 +767,71 @@ def test_simulator_may_use_fee_model(tmp_path: Path) -> None:
         root,
         "exchanges/simulated_fees.py",
         "from decimal import Decimal\nfrom app.domain.validation import require_text\n",
+    )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("exchanges/protocols.py", "from .simulated_accounting import X\n", "implementation"),
+        (
+            "exchanges/simulated_positions.py",
+            "from app.exchanges.simulated_accounting import X\n",
+            "implementation",
+        ),
+        (
+            "exchanges/simulated_fees.py",
+            "from app.exchanges.simulated_accounting import X\n",
+            "implementation",
+        ),
+        (
+            "exchanges/bybit/market_data.py",
+            "from app.exchanges.simulated_accounting import X\n",
+            "implementation",
+        ),
+        (
+            "exchanges/simulated_accounting.py",
+            "from app.exchanges.simulated import SimulatedExchange\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/simulated_accounting.py",
+            "from app.exchanges.simulated_positions import X\n",
+            "module allowlist",
+        ),
+        (
+            "exchanges/simulated_accounting.py",
+            "from app.exchanges.simulated_fees import X\n",
+            "module allowlist",
+        ),
+        ("exchanges/simulated_accounting.py", "import httpx\n", "'httpx' (third-party"),
+        ("exchanges/simulated_accounting.py", "from app.config import X\n", "-> app.config"),
+    ],
+)
+def test_cash_accounting_violations(
+    tmp_path: Path, relative: str, source: str, expected: str
+) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_simulator_may_use_cash_accounting(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "exchanges/simulated.py",
+        "from app.exchanges.simulated_accounting import SimulatedCashLedger\n",
+    )
+    _write(
+        root,
+        "exchanges/simulated_accounting.py",
+        "from fractions import Fraction\nfrom app.domain.validation import require_text\n",
     )
 
     assert find_violations(root) == []

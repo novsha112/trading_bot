@@ -179,8 +179,11 @@ class PositionBatch:
         state = self._state(symbol)
         return _ZERO_DECIMAL if state is None else state.qty
 
-    def apply(self, fill: Fill) -> None:
-        """Apply one fill to the batch; on error the batch is unchanged."""
+    def apply(self, fill: Fill) -> Fraction | None:
+        """Apply one fill to the batch; on error the batch is unchanged.
+
+        Returns the exact gross realized PnL delta of this fill (before any public
+        rounding), or None for an identical replay that changed nothing."""
         if not isinstance(fill, Fill):
             raise PositionAccountingError("expected a Fill")
         known = self._applied.get(fill.exec_id) or self._ledger._applied.get(fill.exec_id)
@@ -189,10 +192,12 @@ class PositionBatch:
                 raise PositionAccountingError(
                     f"exec_id {fill.exec_id} was already applied with a different payload"
                 )
-            return  # identical fill: already accounted for
-        new_state = _apply_fill(self._state(fill.symbol), fill)
+            return None  # identical fill: already accounted for
+        current = self._state(fill.symbol)
+        new_state = _apply_fill(current, fill)
         self._states[fill.symbol] = new_state
         self._applied[fill.exec_id] = fill
+        return new_state.realized - (current.realized if current is not None else _ZERO)
 
     def prepared(self) -> PreparedPositions:
         return PreparedPositions(

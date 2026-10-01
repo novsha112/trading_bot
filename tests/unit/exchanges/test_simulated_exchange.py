@@ -31,6 +31,7 @@ from app.exchanges.errors import (
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
 from app.exchanges.protocols import TradingClient
 from app.exchanges.simulated import SimulatedExchange
+from app.exchanges.simulated_accounting import SimulatedCashConfig
 from app.exchanges.simulated_fees import (
     LiquidityRole,
     SimulatedFeePolicy,
@@ -2742,3 +2743,285 @@ async def test_retry_and_refill_do_not_create_fees() -> None:
     assert await exchange.place_order(request(price=D("100"))) == original
     assert await fill_at(exchange, "100") == []
     assert fill.fee == D("0.0001")
+
+
+# === cash accounting ============================================================
+
+
+def cash_exchange(
+    *,
+    starting: str = "10000",
+    taker: str = "0.001",
+    maker: str = "-0.0001",
+    role: LiquidityRole = LiquidityRole.TAKER,
+    clock: Any = None,
+) -> SimulatedExchange:
+    return SimulatedExchange(
+        clock=clock or ManualClock(T0),
+        instruments=SPECS,
+        fees=SimulatedFeePolicy(
+            schedule=TradingFeeSchedule(maker_rate=D(maker), taker_rate=D(taker), fee_asset="USDT"),
+            liquidity_role=role,
+        ),
+        cash=SimulatedCashConfig(asset="USDT", starting_cash=D(starting)),
+    )
+
+
+async def cash_parts(exchange: SimulatedExchange) -> tuple[Decimal, ...]:
+    state = await exchange.get_cash_state()
+    assert state is not None
+    return state.gross_realized_pnl, state.trading_fees, state.cash
+
+
+@pytest.mark.asyncio
+async def test_no_accounting_mode_has_no_cash_state(exchange: SimulatedExchange) -> None:
+    await exchange.place_order(request(price=D("100")))
+    await fill_at(exchange, "100")
+
+    assert await exchange.get_cash_state() is None
+
+
+def test_cash_requires_a_fee_policy(clock: ManualClock) -> None:
+    with pytest.raises(ValueError, match="fee policy"):
+        SimulatedExchange(
+            clock=clock,
+            instruments=SPECS,
+            cash=SimulatedCashConfig(asset="USDT", starting_cash=D("1")),
+        )
+
+
+def test_cash_and_fee_asset_must_match(clock: ManualClock) -> None:
+    with pytest.raises(ValueError, match="fee asset"):
+        SimulatedExchange(
+            clock=clock,
+            instruments=SPECS,
+            fees=SimulatedFeePolicy(
+                schedule=TradingFeeSchedule(maker_rate=D("0"), taker_rate=D("0"), fee_asset="USDC"),
+                liquidity_role=LiquidityRole.TAKER,
+            ),
+            cash=SimulatedCashConfig(asset="USDT", starting_cash=D("1")),
+        )
+
+
+def test_instrument_quote_asset_must_match_cash_asset(clock: ManualClock) -> None:
+    with pytest.raises(ValueError, match="quote asset"):
+        SimulatedExchange(
+            clock=clock,
+            instruments=(spec("BTCUSDT"), spec("BTCUSDC", quote_asset="USDC")),
+            fees=SimulatedFeePolicy(
+                schedule=TradingFeeSchedule(maker_rate=D("0"), taker_rate=D("0"), fee_asset="USDT"),
+                liquidity_role=LiquidityRole.TAKER,
+            ),
+            cash=SimulatedCashConfig(asset="USDT", starting_cash=D("1")),
+        )
+
+
+def test_cash_argument_type(clock: ManualClock) -> None:
+    with pytest.raises(TypeError, match="SimulatedCashConfig"):
+        SimulatedExchange(clock=clock, instruments=SPECS, cash="10000")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_initial_cash_state_and_read_does_not_use_clock() -> None:
+    clock = CountingClock(T0)
+    exchange = cash_exchange(clock=clock)
+
+    state = await exchange.get_cash_state()
+
+    assert state is not None
+    assert (state.asset, state.starting_cash, state.cash) == ("USDT", D("10000"), D("10000"))
+    assert clock.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_opening_moves_cash_by_fee_only() -> None:
+    exchange = cash_exchange()
+
+    await open_position(exchange, Side.BUY, "10")  # notional 1000, fee 1
+
+    assert await cash_parts(exchange) == (D("0"), D("1"), D("9999"))
+
+
+@pytest.mark.asyncio
+async def test_close_with_profit_and_fees() -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.SELL, qty=D("10"), price=D("110"))
+    )
+
+    await fill_at(exchange, "110")
+
+    assert await cash_parts(exchange) == (D("100"), D("2.1"), D("10097.9"))
+    p = await position_of(exchange)
+    assert p.realized_pnl == D("100")  # position stays gross
+
+
+@pytest.mark.asyncio
+async def test_close_with_loss() -> None:
+    exchange = cash_exchange(taker="0")
+    await open_position(exchange, Side.SELL, "10")
+    await exchange.place_order(
+        request(client_order_id="close", side=Side.BUY, qty=D("10"), price=D("110"))
+    )
+
+    await fill_at(exchange, "110")
+
+    assert await cash_parts(exchange) == (D("-100"), D("0"), D("9900"))
+
+
+@pytest.mark.asyncio
+async def test_partial_closes_and_reversal() -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")  # fee 1
+    await exchange.place_order(
+        request(client_order_id="s1", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+    await fill_at(exchange, "110")  # +40, fee 0.44
+    assert await cash_parts(exchange) == (D("40"), D("1.44"), D("10038.56"))
+    await exchange.place_order(
+        request(client_order_id="s2", side=Side.SELL, qty=D("9"), price=D("90"))
+    )
+
+    await fill_at(exchange, "90")  # closes 6 @100 -> -60, opens short 3; fee on all 9
+
+    assert await cash_parts(exchange) == (D("-20"), D("2.25"), D("9977.75"))
+    assert (await position_of(exchange)).qty == D("-3")
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_cash_and_auto_cancel() -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "5")  # fee 0.5
+    await exchange.place_order(ro("ro", Side.SELL, "10", "110"))
+
+    await fill_at(exchange, "110")  # fills 5: +50, fee 0.55; remainder canceled
+
+    assert await cash_parts(exchange) == (D("50"), D("1.05"), D("10048.95"))
+    assert (await update_of(exchange, "ro")).status is OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_maker_rebate_increases_cash() -> None:
+    exchange = cash_exchange(role=LiquidityRole.MAKER)
+
+    await open_position(exchange, Side.BUY, "10")  # fee -0.1
+
+    assert await cash_parts(exchange) == (D("0"), D("-0.1"), D("10000.1"))
+
+
+@pytest.mark.asyncio
+async def test_multiple_fills_in_one_batch() -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")  # fee 1
+    await exchange.place_order(
+        request(client_order_id="a", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+    await exchange.place_order(
+        request(client_order_id="b", side=Side.SELL, qty=D("6"), price=D("110"))
+    )
+
+    await fill_at(exchange, "120")  # +80 and +120, fees 0.48 + 0.72
+
+    assert await cash_parts(exchange) == (D("200"), D("2.2"), D("10197.8"))
+
+
+@pytest.mark.asyncio
+async def test_failed_fee_calculation_leaves_cash_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "4", "110"))
+    await exchange.place_order(ro("b", Side.SELL, "20", "110"))
+    before = (await snapshot(exchange, "a", "b"), await exchange.get_cash_state())
+    real_fee = SimulatedFeePolicy.fill_fee
+    calls: list[Decimal] = []
+
+    def failing_second(self: SimulatedFeePolicy, *, price: Decimal, qty: Decimal) -> Any:
+        calls.append(qty)
+        if len(calls) == 2:
+            raise ArithmeticError("injected")
+        return real_fee(self, price=price, qty=qty)
+
+    monkeypatch.setattr(SimulatedFeePolicy, "fill_fee", failing_second)
+    with pytest.raises(ArithmeticError):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert (await snapshot(exchange, "a", "b"), await exchange.get_cash_state()) == before
+
+
+@pytest.mark.asyncio
+async def test_failed_position_preparation_leaves_cash_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.exchanges import simulated_positions
+
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(
+        request(client_order_id="a", side=Side.SELL, qty=D("4"), price=D("110"))
+    )
+    await exchange.place_order(ro("b", Side.SELL, "4", "110"))
+    before = (await snapshot(exchange, "a", "b"), await exchange.get_cash_state())
+    real_apply = simulated_positions._apply_fill
+    calls: list[str] = []
+
+    def failing_second(state: Any, fill: Fill) -> Any:
+        calls.append(fill.exec_id)
+        if len(calls) == 2:
+            raise simulated_positions.PositionAccountingError("injected")
+        return real_apply(state, fill)
+
+    monkeypatch.setattr(simulated_positions, "_apply_fill", failing_second)
+    with pytest.raises(simulated_positions.PositionAccountingError):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert (await snapshot(exchange, "a", "b"), await exchange.get_cash_state()) == before
+
+
+@pytest.mark.asyncio
+async def test_failed_accounting_preparation_leaves_everything_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.exchanges import simulated_accounting
+
+    exchange = cash_exchange()
+    await open_position(exchange, Side.BUY, "10")
+    await exchange.place_order(ro("a", Side.SELL, "4", "110"))
+    await exchange.place_order(ro("b", Side.SELL, "20", "110"))  # partial + auto-cancel
+    before = (await snapshot(exchange, "a", "b"), await exchange.get_cash_state())
+    real_apply = simulated_accounting.CashBatch.apply
+    calls: list[str] = []
+
+    def failing_second(self: Any, **kwargs: Any) -> None:
+        calls.append(kwargs["exec_id"])
+        if len(calls) == 2:
+            raise simulated_accounting.CashAccountingError("injected")
+        real_apply(self, **kwargs)
+
+    monkeypatch.setattr(simulated_accounting.CashBatch, "apply", failing_second)
+    with pytest.raises(simulated_accounting.CashAccountingError, match="injected"):
+        await fill_at(exchange, "110")
+    monkeypatch.undo()
+
+    assert calls == ["SIM-EXEC-0000000002", "SIM-EXEC-0000000003"]
+    assert (await snapshot(exchange, "a", "b"), await exchange.get_cash_state()) == before
+    assert (await update_of(exchange, "b")).status is OrderStatus.OPEN  # no auto-cancel
+
+
+@pytest.mark.asyncio
+async def test_cash_scenario_is_deterministic() -> None:
+    async def run() -> tuple[object, ...]:
+        exchange = cash_exchange()
+        await open_position(exchange, Side.BUY, "3")
+        await exchange.place_order(
+            request(client_order_id="s", side=Side.SELL, qty=D("5"), price=D("101"))
+        )
+        await partial(exchange, "103.3", "2")
+        await fill_at(exchange, "99.7")
+        return await position_of(exchange), await exchange.get_cash_state()
+
+    assert await run() == await run()
