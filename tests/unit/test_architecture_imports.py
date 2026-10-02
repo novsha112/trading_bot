@@ -35,7 +35,9 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     # portfolio never import execution.
     "execution": frozenset({"domain", "exchanges", "risk", "portfolio"}),
     "portfolio": frozenset({"domain"}),
-    "persistence": frozenset({"domain"}),
+    # Persisted account aggregate reuses execution's PlacementRecord; execution
+    # never imports persistence.
+    "persistence": frozenset({"domain", "execution"}),
     # Orchestration / infrastructure packages: restrictions will be refined as
     # their modules appear.
     "backtesting": None,
@@ -66,8 +68,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "services": frozenset(),
     # Pure position rules on domain types.
     "portfolio": frozenset(),
-    # Storage codecs: standard library only (no driver, ORM or other library).
-    "persistence.codecs": frozenset(),
+    # Storage codecs and the store contract: no driver, ORM or other library yet.
+    "persistence": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -138,6 +140,21 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "execution.timing": frozenset({"app.domain"}),
     # Storage codecs: no app module at all (not even the domain).
     "persistence.codecs": frozenset(),
+    # Store contract: errors stand alone; models reuse domain / execution records;
+    # the Protocol knows only the models; the in-memory store implements them.
+    "persistence.errors": frozenset(),
+    "persistence.models": frozenset(
+        {"app.domain", "app.execution.models", "app.persistence.errors"}
+    ),
+    "persistence.protocols": frozenset({"app.persistence.models"}),
+    "persistence.memory": frozenset(
+        {
+            "app.domain",
+            "app.execution.models",
+            "app.persistence.errors",
+            "app.persistence.models",
+        }
+    ),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -1154,6 +1171,57 @@ def test_persistence_codecs_allowed_imports(tmp_path: Path) -> None:
         root,
         "persistence/codecs.py",
         "import re\nfrom datetime import UTC, datetime\nfrom decimal import Context, Decimal\n",
+    )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        (
+            "persistence/protocols.py",
+            "from app.persistence.memory import InMemoryAccountStateStore\n",
+        ),
+        ("persistence/models.py", "from app.execution.account_state import InMemoryAccountState\n"),
+        ("persistence/models.py", "from app.persistence.codecs import encode_decimal\n"),
+        ("persistence/memory.py", "from app.persistence.codecs import encode_decimal\n"),
+        ("persistence/memory.py", "from app.risk.manager import evaluate\n"),
+        ("persistence/memory.py", "from app.exchanges.simulated import SimulatedExchange\n"),
+        ("persistence/memory.py", "from app.services.placement import X\n"),
+        ("persistence/memory.py", "from app.config.settings import EnvSettings\n"),
+        ("persistence/memory.py", "import sqlalchemy\n"),
+        ("persistence/errors.py", "from app.domain.errors import DomainError\n"),
+        ("execution/account_state.py", "from app.persistence.protocols import AccountStateStore\n"),
+    ],
+)
+def test_persistence_store_violations(tmp_path: Path, relative: str, source: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    assert find_violations(root), source
+
+
+def test_persistence_store_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(root, "persistence/errors.py", "from __future__ import annotations\n")
+    _write(
+        root,
+        "persistence/models.py",
+        "from app.domain.orders import Order\n"
+        "from app.execution.models import PlacementRecord\n"
+        "from app.persistence.errors import StoreValidationError\n",
+    )
+    _write(
+        root,
+        "persistence/protocols.py",
+        "from typing import Protocol\nfrom app.persistence.models import AccountStateChange\n",
+    )
+    _write(
+        root,
+        "persistence/memory.py",
+        "import asyncio\nfrom app.persistence.models import AccountStateChange\n"
+        "from app.persistence.errors import StoreConflictError\n",
     )
 
     assert find_violations(root) == []

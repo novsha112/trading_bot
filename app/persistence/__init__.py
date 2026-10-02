@@ -1,5 +1,6 @@
 """Persistence (docs/ARCHITECTURE.md 11, 11.0).
 
-So far only the pure storage codecs for exact Decimal and UTC datetime values.
-No database driver, store or migrations yet.
+Pure storage codecs (exact Decimal, UTC datetime) and the account state store
+contract with its deterministic in-memory reference implementation. No database
+driver or migrations yet; the execution layer does not use the store yet.
 """
