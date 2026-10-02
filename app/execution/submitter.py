@@ -53,11 +53,15 @@ A safety-blocked order is FAILED (definitely not sent), its reservation is
 released and its approved ``PlacementRecord`` stays: a replay of the same intent
 returns that record; a new trading decision needs a new ``intent_id``.
 
-Time: the clock is read only once a mutation is decided: phase A (block or
-marker, strict), phase A2 refusal and phase C outcomes fall back to the order's
-own ``updated_at`` when the clock fails or goes back, so a known outcome is
-always recorded. TradingState is never changed here (e.g. on an authentication
-error): the submitter only reads the effective state.
+Time: the clock is read only once a mutation is decided. The write-ahead marker
+reads it directly. A safety block (phase A or A2) uses ``strict_change_time``:
+a clock exception propagates and a naive / non-UTC / non-datetime value raises,
+before any commit (the order stays NEW / SUBMITTING, nothing is sent, nothing is
+poisoned); a valid time before the order's ``updated_at`` is clamped to it. Only
+phase C outcomes fall back to the order's own ``updated_at`` when the clock
+fails or goes back, so a known transport outcome is always recorded.
+TradingState is never changed here (e.g. on an authentication error): the
+submitter only reads the effective state.
 """
 
 from __future__ import annotations
@@ -81,7 +85,7 @@ from app.execution.account_state import (
 from app.execution.models import SubmissionBlockStage, SubmissionOutcome
 from app.execution.requests import order_request_from_order
 from app.execution.safety import SafetyController, SafetyStateError, submission_allowed
-from app.execution.timing import change_time
+from app.execution.timing import change_time, strict_change_time
 from app.risk.models import TradingState
 
 
@@ -162,7 +166,9 @@ class OrderSubmitter:
                 # Never sent: NEW -> FAILED with its durable reason. A store error
                 # propagates unchanged (the order stays NEW) and nothing is sent.
                 await locked.record_safety_block(
-                    client_order_id, effective_state=effective, at=self._clock.now()
+                    client_order_id,
+                    effective_state=effective,
+                    at=strict_change_time(self._clock, floor=order.updated_at),
                 )
                 raise self._blocked(order, effective, SubmissionBlockStage.BEFORE_WRITE_AHEAD)
             # Write-ahead: SUBMITTING is durable before any request may be sent.
@@ -184,7 +190,7 @@ class OrderSubmitter:
                 await locked.record_safety_block(
                     client_order_id,
                     effective_state=effective,
-                    at=change_time(self._clock, floor=order.updated_at),
+                    at=strict_change_time(self._clock, floor=order.updated_at),
                 )
                 raise self._blocked(order, effective, SubmissionBlockStage.BEFORE_SEND)
         # No await between the final check and the send (the lock release does

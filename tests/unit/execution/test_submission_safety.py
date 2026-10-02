@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -75,19 +75,6 @@ class Clock:
         value = self.times[min(self.calls, len(self.times) - 1)]
         self.calls += 1
         return value
-
-
-class FirstOnlyClock:
-    """One valid read, then failures (the fallback path of later reads)."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def now(self) -> datetime:
-        self.calls += 1
-        if self.calls > 1:
-            raise RuntimeError("clock unavailable")
-        return T1
 
 
 class Client:
@@ -612,12 +599,120 @@ async def test_poison_between_the_checks_wins_over_the_final_check() -> None:
 # --- clock ----------------------------------------------------------------------------------
 
 
+class ScriptedClock:
+    """Returns (or raises) the scripted values in order; the last one repeats."""
+
+    def __init__(self, *values: object) -> None:
+        self.values = list(values)
+        self.calls = 0
+
+    def now(self) -> datetime:
+        value = self.values[min(self.calls, len(self.values) - 1)]
+        self.calls += 1
+        if isinstance(value, BaseException):
+            raise value
+        return value  # type: ignore[return-value]
+
+
+CLOCK_FAILURE = RuntimeError("clock unavailable")
+BAD_CLOCK_VALUES: dict[str, tuple[object, type[BaseException]]] = {
+    "raises": (CLOCK_FAILURE, RuntimeError),
+    "naive": (datetime(2026, 1, 15, 12, 30), DomainValidationError),  # noqa: DTZ001
+    "non-utc": (
+        datetime(2026, 1, 15, 12, 30, tzinfo=timezone(timedelta(hours=2))),
+        DomainValidationError,
+    ),
+    "wrong type": ("2026-01-15T12:30:00+00:00", DomainValidationError),
+}
+
+
+async def assert_untouched(
+    account: InMemoryAccountState,
+    store: ScriptedStore,
+    client: Client,
+    *,
+    status: OrderStatus,
+    commits: int,
+) -> None:
+    assert client.requests == []
+    assert store.commits == commits
+    assert (await order_of(account)).status is status
+    assert (await durable_order(store)).status is status
+    assert await account.safety_block("c-1") is None
+    loaded = await store.load(account_scope_id=SCOPE)
+    assert loaded is not None
+    assert dict(loaded.safety_blocks) == {}
+    assert not account.is_poisoned
+
+
+@pytest.mark.parametrize("case", sorted(BAD_CLOCK_VALUES))
 @pytest.mark.asyncio
-async def test_final_block_falls_back_to_the_order_time_when_the_clock_fails() -> None:
+async def test_initial_block_needs_a_valid_clock_time(case: str) -> None:
+    value, error = BAD_CLOCK_VALUES[case]
+    account, store = await reserved()
+    client = Client()
+
+    with pytest.raises(error) as raised:
+        await sender(account, safety_for(account, PAUSED), client, ScriptedClock(value)).submit(
+            client_order_id="c-1"
+        )
+
+    if value is CLOCK_FAILURE:
+        assert raised.value is CLOCK_FAILURE  # propagated unchanged
+    await assert_untouched(account, store, client, status=S.NEW, commits=0)
+
+
+@pytest.mark.parametrize("case", sorted(BAD_CLOCK_VALUES))
+@pytest.mark.asyncio
+async def test_final_block_needs_a_valid_clock_time(case: str) -> None:
+    value, error = BAD_CLOCK_VALUES[case]
     account, store = await reserved()
     store.block_at = 1
     safety = safety_for(account, RUNNING)
-    clock = FirstOnlyClock()
+    client = Client()
+    clock = ScriptedClock(T1, value)  # the marker time is valid, the block time is not
+    task = asyncio.create_task(sender(account, safety, client, clock).submit(client_order_id="c-1"))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+    safety.request_state(PAUSED)
+    store.release.set()
+
+    with pytest.raises(error) as raised:
+        await asyncio.wait_for(task, timeout=5)
+
+    if value is CLOCK_FAILURE:
+        assert raised.value is CLOCK_FAILURE
+    assert clock.calls == 2
+    await assert_untouched(account, store, client, status=S.SUBMITTING, commits=1)
+    # Still not sendable while PAUSED, and nothing is poisoned: a later attempt
+    # is an ordinary "already submitted" refusal.
+    with pytest.raises(AccountStateError, match="submitting: not sent again"):
+        await sender(account, safety, client, Clock()).submit(client_order_id="c-1")
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_initial_block_clamps_an_earlier_clock_time_to_the_order_time() -> None:
+    account, store = await reserved()  # reserved at T0
+    earlier = T0 - timedelta(seconds=5)
+
+    with pytest.raises(OrderSubmissionBlockedError):
+        await sender(account, safety_for(account, PAUSED), Client(), Clock(earlier)).submit(
+            client_order_id="c-1"
+        )
+
+    failed = await order_of(account)
+    block = await account.safety_block("c-1")
+    assert block is not None
+    assert failed.updated_at == block.blocked_at == T0
+    assert store.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_final_block_clamps_an_earlier_clock_time_to_the_order_time() -> None:
+    account, store = await reserved()
+    store.block_at = 1
+    safety = safety_for(account, RUNNING)
+    clock = ScriptedClock(T2, T1)  # SUBMITTING at T2, the block reads an earlier T1
     task = asyncio.create_task(
         sender(account, safety, Client(), clock).submit(client_order_id="c-1")
     )
@@ -629,24 +724,11 @@ async def test_final_block_falls_back_to_the_order_time_when_the_clock_fails() -
         await asyncio.wait_for(task, timeout=5)
 
     failed = await order_of(account)
+    block = await account.safety_block("c-1")
+    assert block is not None
     assert failed.status is S.FAILED
-    assert failed.updated_at == T1  # the SUBMITTING time, never earlier
-    assert clock.calls == 2
-
-
-@pytest.mark.asyncio
-async def test_initial_block_reads_the_clock_strictly() -> None:
-    account, _ = await reserved()
-
-    class NaiveClock:
-        def now(self) -> datetime:
-            return datetime(2026, 1, 15, 12, 30)  # noqa: DTZ001 - naive on purpose
-
-    with pytest.raises(DomainValidationError):
-        await sender(account, safety_for(account, PAUSED), Client(), NaiveClock()).submit(
-            client_order_id="c-1"
-        )
-    assert (await order_of(account)).status is S.NEW
+    assert failed.updated_at == block.blocked_at == T2  # never before SUBMITTING
+    assert store.commits == 2
 
 
 # --- reservation / replay -------------------------------------------------------------------
