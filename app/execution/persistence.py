@@ -19,6 +19,8 @@ library, the domain and execution's own models only.
 * ``PersistedOrderNotional``: the exact accumulated fill notional of an order
   (``sum(price * qty)`` of its fills): an exact, finite ``Decimal`` >= 0.
 * ``AccountStateChange``: one atomic change set, guarded by ``expected_revision``.
+* ``SafetyBlockRecord`` (execution model): the durable reason of an order FAILED
+  by the local safety gate (definitely not sent), immutable per order.
 * ``PersistedAccountState``: an immutable snapshot of one account's durable state.
 * Errors of the port: ``PersistenceStoreError`` and its four outcomes, so callers
   handle them without importing an adapter.
@@ -31,14 +33,14 @@ and ``Fill`` are reused as they are.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from app.domain.fills import Fill
 from app.domain.orders import Order
-from app.execution.models import PlacementRecord
+from app.execution.models import PlacementRecord, SafetyBlockRecord
 
 
 class PersistenceStoreError(Exception):
@@ -137,6 +139,8 @@ class AccountStateChange:
     fill_writes: tuple[Fill, ...] = ()
     position_writes: tuple[PersistedPosition, ...] = ()
     notional_writes: tuple[PersistedOrderNotional, ...] = ()
+    safety_block_writes: tuple[SafetyBlockRecord, ...] = ()
+    """Immutable reasons of safety-blocked (definitely unsent) FAILED orders."""
 
     def __post_init__(self) -> None:
         _text(self.account_scope_id, "account_scope_id")
@@ -152,8 +156,10 @@ class AccountStateChange:
         _typed_tuple(self.fill_writes, Fill, "fill_writes")
         _typed_tuple(self.position_writes, PersistedPosition, "position_writes")
         _typed_tuple(self.notional_writes, PersistedOrderNotional, "notional_writes")
+        _typed_tuple(self.safety_block_writes, SafetyBlockRecord, "safety_block_writes")
         if new == expected and (
             self.order_writes
+            or self.safety_block_writes
             or self.fill_writes
             or self.position_writes
             or self.notional_writes
@@ -189,6 +195,8 @@ class PersistedAccountState:
     """By symbol."""
     notionals: Mapping[str, Decimal]
     """Exact accumulated fill notional by client_order_id."""
+    safety_blocks: Mapping[str, SafetyBlockRecord] = field(default_factory=dict)
+    """Why an order was FAILED by the safety gate, by client_order_id."""
 
     def __post_init__(self) -> None:
         _text(self.account_scope_id, "account_scope_id")
@@ -203,8 +211,16 @@ class PersistedAccountState:
             _keyed(position, PersistedPosition, key, getattr(position, "symbol", None), "positions")
         for key, notional in self.notionals.items():
             _exact_decimal(notional, f"notionals[{key!r}]")
+        for key, block in self.safety_blocks.items():
+            _keyed(
+                block,
+                SafetyBlockRecord,
+                key,
+                getattr(block, "client_order_id", None),
+                "safety_blocks",
+            )
         # Defensive read-only copies: later changes to the given mappings are not seen.
-        for name in ("placements", "orders", "fills", "positions", "notionals"):
+        for name in ("placements", "orders", "fills", "positions", "notionals", "safety_blocks"):
             object.__setattr__(self, name, _frozen(getattr(self, name)))
 
 

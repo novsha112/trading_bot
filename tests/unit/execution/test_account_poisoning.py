@@ -159,10 +159,7 @@ def ready_safety(account: InMemoryAccountState) -> SafetyController:
     """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
     safety = SafetyController(account_state=account)
     safety.mark_hydrated()
-    safety.mark_orders_reconciled()
-    safety.mark_positions_reconciled()
-    safety.mark_open_orders_reconciled()
-    safety.mark_fills_complete()
+    safety.mark_exchange_reconciled()
     safety.request_state(TradingState.RUNNING)
     return safety
 
@@ -534,7 +531,9 @@ async def test_uncertain_submitting_poisons_and_no_request_is_ever_sent() -> Non
     store = CountingStore()
     account = await account_with_order(store, submitted=False)
     client, clock = Client(), Clock()
-    sender = OrderSubmitter(account_state=account, client=client, clock=clock)
+    sender = OrderSubmitter(
+        account_state=account, safety=ready_safety(account), client=client, clock=clock
+    )
     store.fail_next()
 
     with pytest.raises(StoreUncertainError):

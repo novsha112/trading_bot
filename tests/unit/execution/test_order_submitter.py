@@ -42,6 +42,7 @@ from app.execution.account_state import (
 from app.execution.models import SubmissionOutcome
 from app.execution.persistence import AccountStateChange, PersistedOrderNotional
 from app.execution.requests import order_request_from_order
+from app.execution.safety import SafetyController
 from app.execution.submitter import OrderAlreadySubmittedError, OrderSubmitter
 from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, TradingState
@@ -56,6 +57,15 @@ T3 = T0 + timedelta(seconds=3)
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def ready_safety(account: InMemoryAccountState) -> SafetyController:
+    """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_exchange_reconciled()
+    safety.request_state(TradingState.RUNNING)
+    return safety
 
 
 def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
@@ -179,7 +189,10 @@ def submitter(
     account: InMemoryAccountState, client: FakeClient, clock: Any = None
 ) -> OrderSubmitter:
     return OrderSubmitter(
-        account_state=account, client=client, clock=SteppingClock() if clock is None else clock
+        account_state=account,
+        safety=ready_safety(account),
+        client=client,
+        clock=SteppingClock() if clock is None else clock,
     )
 
 
@@ -856,6 +869,7 @@ def test_execution_modules_use_only_exchange_abstractions(module: Any) -> None:
         "app.exchanges.models",
         "app.exchanges.errors",
         "app.exchanges.protocols",
+        "app.risk.models",  # TradingState of the safety gate (a model, not Risk logic)
     )
     for name in imports:
         assert not name.startswith("app.") or name.startswith(allowed), name

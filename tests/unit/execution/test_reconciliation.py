@@ -41,6 +41,7 @@ from app.execution.reconciliation import (
     UnknownOrderReconciler,
     exchange_state_from_update,
 )
+from app.execution.safety import SafetyController
 from app.execution.submitter import OrderSubmitter
 from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, TradingState
@@ -55,6 +56,15 @@ T3 = T0 + timedelta(seconds=3)
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def ready_safety(account: InMemoryAccountState) -> SafetyController:
+    """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_exchange_reconciled()
+    safety.request_state(TradingState.RUNNING)
+    return safety
 
 
 def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
@@ -986,7 +996,9 @@ async def test_local_error_after_the_network_is_not_a_transport_ambiguity(
     monkeypatch.setattr(LockedAccountState, "record_ack", broken)
     account = await account_with(S.NEW)
     client = AckClient()
-    sender = OrderSubmitter(account_state=account, client=client, clock=FixedClock(T1))
+    sender = OrderSubmitter(
+        account_state=account, safety=ready_safety(account), client=client, clock=FixedClock(T1)
+    )
 
     with pytest.raises(RuntimeError, match="local bug"):
         await sender.submit(client_order_id="c-1")

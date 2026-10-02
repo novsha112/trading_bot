@@ -16,8 +16,15 @@ session: a re-hydrated account gets a new controller). It owns the requested
 state (runtime-only, PAUSED by default: a restart never restores RUNNING) and
 the readiness gates. Gates only go ``False -> True``: there is no API to lower
 one (a later loss of trust is a runtime-health concern, not a gate).
-Exchange gates (orders, positions, open orders, fills) complete in any order,
-but only after ``mark_hydrated`` (an orchestration bug otherwise).
+The exchange gates (orders, positions, open orders, fills) are confirmed
+together by ONE ``mark_exchange_reconciled`` after a recovery's final
+verification, and only after ``mark_hydrated`` (an orchestration bug
+otherwise); the fields stay separate for observability.
+
+``submission_allowed`` is the pure send permission of one order under an
+effective state: RUNNING -> any order; REDUCE_ONLY -> reduce-only orders only;
+PAUSED and HALTED -> none (HALTED blocks reduce-only too). The order submitter
+checks it before the write-ahead marker and again right before the send.
 
 Hydrated is not ready: ``InMemoryAccountState.hydrate`` never touches a
 controller; the future bootstrap marks the gates explicitly. Effective state is
@@ -87,6 +94,16 @@ def effective_trading_state(
     return requested
 
 
+def submission_allowed(state: TradingState, *, reduce_only: bool) -> bool:
+    """May an order with ``reduce_only`` be sent under the effective ``state``?"""
+    state = _require_state(state, "state")
+    if type(reduce_only) is not bool:
+        raise DomainValidationError("reduce_only must be a bool")
+    if state is TradingState.RUNNING:
+        return True
+    return state is TradingState.REDUCE_ONLY and reduce_only
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SafetySnapshot:
     """One consistent, immutable read of the controller."""
@@ -139,25 +156,19 @@ class SafetyController:
         """The durable local state was loaded and crash-classified."""
         self._readiness = replace(self._readiness, hydrated=True)
 
-    def mark_orders_reconciled(self) -> None:
-        """Every local active order was confirmed against the exchange."""
-        self._mark_exchange_gate("orders_reconciled")
-
-    def mark_positions_reconciled(self) -> None:
-        """Every position was confirmed against the exchange."""
-        self._mark_exchange_gate("positions_reconciled")
-
-    def mark_open_orders_reconciled(self) -> None:
-        """The exchange's open orders were compared with the local ones."""
-        self._mark_exchange_gate("open_orders_reconciled")
-
-    def mark_fills_complete(self) -> None:
-        """No execution is missing locally."""
-        self._mark_exchange_gate("fills_complete")
-
-    def _mark_exchange_gate(self, gate: str) -> None:
+    def mark_exchange_reconciled(self) -> None:
+        """Confirm ALL exchange gates at once (orders, positions, open orders,
+        fills), after the final verification of a recovery. There is no API to
+        confirm them one by one: no partial readiness state exists. Idempotent;
+        before ``mark_hydrated`` a ``RecoveryGateOrderError``."""
         if not self._readiness.hydrated:
             raise RecoveryGateOrderError(
-                f"{gate} cannot be confirmed before the account is hydrated"
+                "exchange gates cannot be confirmed before the account is hydrated"
             )
-        self._readiness = replace(self._readiness, **{gate: True})
+        self._readiness = RecoveryReadiness(
+            hydrated=True,
+            orders_reconciled=True,
+            positions_reconciled=True,
+            open_orders_reconciled=True,
+            fills_complete=True,
+        )

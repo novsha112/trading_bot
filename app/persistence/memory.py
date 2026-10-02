@@ -3,18 +3,18 @@ fake of the execution-owned persistence port (``app.execution.persistence``).
 NOT durable storage (lost with the process).
 
 It models the future database constraints within each ``account_scope_id``:
-unique ``intent_id`` (placements), ``client_order_id`` (orders, notionals and
-approved placements), ``exec_id`` (fills), ``exchange_order_id`` (when known),
-``symbol`` (positions). A commit is validated completely first and then applied
-as a whole, or not at all:
+unique ``intent_id`` (placements), ``client_order_id`` (orders, notionals,
+approved placements and safety blocks), ``exec_id`` (fills),
+``exchange_order_id`` (when known), ``symbol`` (positions). A commit is
+validated completely first and then applied as a whole, or not at all:
 
 1. revision CAS: ``expected_revision`` must equal the stored revision (0 for an
    account never committed), else ``StoreConflictError``;
 2. identities: an identical rewrite is a no-op; the same identity with different
-   data is a ``StoreConflictError`` (placements, fills); an ``Order`` is replaced
-   only by a higher ``version`` (same version: identical -> no-op, different ->
-   conflict; lower -> conflict); positions and notionals are projections replaced
-   inside the successful CAS commit. "Identical" means equal AND equally
+   data is a ``StoreConflictError`` (placements, fills, safety blocks); an
+   ``Order`` is replaced only by a higher ``version`` (same version: identical ->
+   no-op, different -> conflict; lower -> conflict); positions and notionals
+   are projections replaced inside the successful CAS commit. "Identical" means equal AND equally
    represented (``Decimal("4")`` and ``Decimal("4.0")`` are different payloads);
 3. references of the resulting state: an approved placement's order exists and
    carries the intent's terms; a fill belongs to an existing order (same symbol
@@ -48,7 +48,7 @@ from typing import TypeVar
 
 from app.domain.fills import Fill
 from app.domain.orders import Order
-from app.execution.models import PlacementRecord
+from app.execution.models import PlacementRecord, SafetyBlockRecord
 from app.execution.persistence import (
     AccountStateChange,
     PersistedAccountState,
@@ -78,6 +78,7 @@ class _Account:
     fills: dict[str, Fill] = field(default_factory=dict)
     positions: dict[str, PersistedPosition] = field(default_factory=dict)
     notionals: dict[str, Decimal] = field(default_factory=dict)
+    safety_blocks: dict[str, SafetyBlockRecord] = field(default_factory=dict)
 
     def copy(self) -> _Account:
         return _Account(
@@ -87,6 +88,7 @@ class _Account:
             fills=dict(self.fills),
             positions=dict(self.positions),
             notionals=dict(self.notionals),
+            safety_blocks=dict(self.safety_blocks),
         )
 
 
@@ -136,6 +138,7 @@ def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
     _no_duplicates(change.fill_writes, "exec_id", "exec_id")
     _no_duplicates(change.position_writes, "symbol", "position")
     _no_duplicates(change.notional_writes, "client_order_id", "notional")
+    _no_duplicates(change.safety_block_writes, "client_order_id", "safety block")
     account = _Account() if current is None else current.copy()
     for record in change.placement_writes:
         _write_immutable(account.placements, record.intent_id, record, "intent_id")
@@ -147,11 +150,14 @@ def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
         account.positions[position.symbol] = position
     for notional in change.notional_writes:
         account.notionals[notional.client_order_id] = notional.filled_notional
+    for block in change.safety_block_writes:
+        _write_immutable(account.safety_blocks, block.client_order_id, block, "safety block")
     check_account_references(
         placements=account.placements,
         orders=account.orders,
         fills=account.fills,
         notionals=account.notionals,
+        safety_blocks=account.safety_blocks,
     )
     account.revision = change.new_revision
     return account
@@ -186,6 +192,7 @@ class InMemoryAccountStateStore:
                 fills=account.fills,
                 positions=account.positions,
                 notionals=account.notionals,
+                safety_blocks=account.safety_blocks,
             )
 
     async def commit(self, change: AccountStateChange) -> None:

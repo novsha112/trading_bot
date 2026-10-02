@@ -74,6 +74,11 @@ notional, the position, the applied fill and the revision are then committed
 together, or nothing changes. An identical ``exec_id`` replay changes nothing;
 the same ``exec_id`` with different data raises ``FillConflictError``.
 
+Safety blocks (``record_safety_block``, driven by ``OrderSubmitter``): when the
+effective trading state refuses a send, a NEW or SUBMITTING order (never sent)
+becomes FAILED together with a durable ``SafetyBlockRecord`` (the reason survives
+a restart); the reservation is released, the placement record stays.
+
 Submission (driven by ``OrderSubmitter``): ``mark_submitting`` is the write-ahead
 ``NEW -> SUBMITTING`` before any request may be sent; ``record_ack`` stores the
 exchange order id as metadata on any sent order (never a status change, never a
@@ -120,7 +125,13 @@ from app.domain.intents import PlaceOrderIntent
 from app.domain.order_state import record_exchange_order_id, transition
 from app.domain.orders import Order
 from app.domain.validation import require_text, require_utc
-from app.execution.models import ExchangeOrderState, PlacementRecord, SubmissionOutcome
+from app.execution.models import (
+    ExchangeOrderState,
+    PlacementRecord,
+    SafetyBlockRecord,
+    SubmissionBlockStage,
+    SubmissionOutcome,
+)
 from app.execution.persistence import (
     AccountStateChange,
     AccountStateStore,
@@ -137,7 +148,7 @@ from app.execution.recovery import (
     validate_persisted_account_state,
 )
 from app.portfolio.positions import PositionStateError, position_after_fill
-from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
+from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision, TradingState
 
 _V = TypeVar("_V")
 _INITIAL_VERSION: Final = 0
@@ -147,6 +158,11 @@ _OUTCOME_TARGET: Final = {
     SubmissionOutcome.NOT_SENT: OrderStatus.FAILED,
     SubmissionOutcome.REJECTED: OrderStatus.REJECTED,
     SubmissionOutcome.AMBIGUOUS: OrderStatus.UNKNOWN,
+}
+# Where a safety block can stop an order: never sent in both cases.
+_BLOCK_STAGE: Final = {
+    OrderStatus.NEW: SubmissionBlockStage.BEFORE_WRITE_AHEAD,
+    OrderStatus.SUBMITTING: SubmissionBlockStage.BEFORE_SEND,
 }
 # An acknowledgement contradicts these: never sent, or definitely not accepted.
 _ACK_CONTRADICTING_STATUSES: Final = frozenset(
@@ -238,6 +254,8 @@ class _State:
     positions: dict[str, Decimal] = dataclasses.field(default_factory=dict)
     """Known signed positions only; a missing symbol is unknown."""
     fills: dict[str, Fill] = dataclasses.field(default_factory=dict)
+    safety_blocks: dict[str, SafetyBlockRecord] = dataclasses.field(default_factory=dict)
+    """Why an order was FAILED by the safety gate (definitely not sent)."""
     revision: int = 0
 
 
@@ -355,6 +373,11 @@ class LockedAccountState:
     def order(self, client_order_id: str) -> Order | None:
         state = self._live()
         return state.orders.get(require_text(client_order_id, "client_order_id"))
+
+    def safety_block(self, client_order_id: str) -> SafetyBlockRecord | None:
+        """The durable reason if the safety gate FAILED this order, else None."""
+        state = self._live()
+        return state.safety_blocks.get(require_text(client_order_id, "client_order_id"))
 
     def replay_of(self, intent: PlaceOrderIntent) -> PlacementRecord | None:
         """The recorded result of an equal intent, or None for a new ``intent_id``.
@@ -500,6 +523,44 @@ class LockedAccountState:
         order = self._existing(state, client_order_id)
         updated = transition(order, OrderStatus.SUBMITTING, at=at)
         return await self._publish_order(state, updated)
+
+    async def record_safety_block(
+        self, client_order_id: str, *, effective_state: TradingState, at: datetime
+    ) -> Order:
+        """The safety gate refused to send the order: ``NEW -> FAILED`` (before the
+        write-ahead marker) or ``SUBMITTING -> FAILED`` (the definite NOT_SENT
+        outcome, before the request was sent), together with its durable
+        ``SafetyBlockRecord``; +1 revision. FAILED releases the reservation. Only
+        the caller knows that nothing was sent; any other status raises."""
+        state = self._mutable()
+        order = self._existing(state, client_order_id)
+        stage = _BLOCK_STAGE.get(order.status)
+        if stage is None:
+            raise AccountStateError(
+                f"order {client_order_id} is {order.status.value}: only a NEW or "
+                "SUBMITTING order can be blocked before sending"
+            )
+        updated = transition(order, OrderStatus.FAILED, at=at)
+        block = SafetyBlockRecord(
+            client_order_id=client_order_id,
+            effective_state=effective_state,
+            stage=stage,
+            blocked_at=updated.updated_at,
+        )
+        prepared = dataclasses.replace(
+            state,
+            orders=_with(state.orders, client_order_id, updated),
+            safety_blocks=_with(state.safety_blocks, client_order_id, block),
+            revision=state.revision + 1,
+        )
+        change = self._change(
+            state,
+            new_revision=prepared.revision,
+            order_writes=(updated,),
+            safety_block_writes=(block,),
+        )
+        await self._commit_and_publish(state, prepared, change)
+        return updated
 
     async def record_ack(
         self, client_order_id: str, *, exchange_order_id: str, at: datetime
@@ -822,6 +883,7 @@ def _runtime_state(snapshot: PersistedAccountState, change: AccountStateChange |
         placements=dict(snapshot.placements),
         positions={},
         fills=dict(snapshot.fills),
+        safety_blocks=dict(snapshot.safety_blocks),
         revision=revision,
     )
 
@@ -947,3 +1009,7 @@ class InMemoryAccountState:
     async def order(self, client_order_id: str) -> Order | None:
         async with self.account_lock() as locked:
             return locked.order(client_order_id)
+
+    async def safety_block(self, client_order_id: str) -> SafetyBlockRecord | None:
+        async with self.account_lock() as locked:
+            return locked.safety_block(client_order_id)

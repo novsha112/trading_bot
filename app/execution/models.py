@@ -1,6 +1,8 @@
 """Execution-local records (not domain models).
 
-``SubmissionOutcome`` classifies the transport result of a placement request.
+``SubmissionOutcome`` classifies the transport result of a placement request;
+``SafetyBlockRecord`` is the durable reason of a submission refused by the
+local safety gate before any send.
 ``ExchangeOrderState`` is a confirmed exchange report about one order, normalized
 for the account state (which does not depend on exchange DTOs).
 
@@ -29,7 +31,7 @@ from app.domain.validation import (
     require_text,
     require_utc,
 )
-from app.risk.models import RiskDecision
+from app.risk.models import RiskDecision, TradingState
 
 
 class SubmissionOutcome(StrEnum):
@@ -41,6 +43,34 @@ class SubmissionOutcome(StrEnum):
     """The exchange definitively refused it -> REJECTED."""
     AMBIGUOUS = "ambiguous"
     """It may exist on the exchange -> UNKNOWN (stays active)."""
+
+
+class SubmissionBlockStage(StrEnum):
+    """Where the safety gate stopped a submission (both before any send)."""
+
+    BEFORE_WRITE_AHEAD = "before_write_ahead"
+    """The order was still NEW: NEW -> FAILED."""
+    BEFORE_SEND = "before_send"
+    """SUBMITTING was durable, the final pre-send check refused: SUBMITTING -> FAILED."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SafetyBlockRecord:
+    """Durable reason of a safety-blocked submission: the order was FAILED by the
+    local safety gate and was DEFINITELY NOT SENT (no exchange was called)."""
+
+    client_order_id: str
+    effective_state: TradingState
+    """The effective trading state that refused the send."""
+    stage: SubmissionBlockStage
+    blocked_at: datetime
+    """Local time of the FAILED transition (the order's new ``updated_at``)."""
+
+    def __post_init__(self) -> None:
+        require_text(self.client_order_id, "client_order_id")
+        require_enum(self.effective_state, TradingState, "effective_state")
+        require_enum(self.stage, SubmissionBlockStage, "stage")
+        require_utc(self.blocked_at, "blocked_at")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

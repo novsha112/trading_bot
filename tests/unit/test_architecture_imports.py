@@ -120,7 +120,8 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     ),
     # Pure request mapping: the Order and the exchange-neutral DTO only.
     "execution.requests": frozenset({"app.domain", "app.exchanges.models"}),
-    # Submission: exchange abstractions only (no adapter, simulator, Risk, services).
+    # Submission: exchange abstractions and the safety gate only (no adapter,
+    # simulator, Risk logic, services); Risk models only for TradingState.
     "execution.submitter": frozenset(
         {
             "app.domain",
@@ -130,7 +131,9 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.account_state",
             "app.execution.models",
             "app.execution.requests",
+            "app.execution.safety",
             "app.execution.timing",
+            "app.risk.models",
         }
     ),
     # Single-shot UNKNOWN reconciliation: the same exchange abstractions only.

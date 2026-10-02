@@ -91,6 +91,7 @@ def validate_persisted_account_state(
             orders=loaded.orders,
             fills=loaded.fills,
             notionals=loaded.notionals,
+            safety_blocks=loaded.safety_blocks,
         )
     except (StoreValidationError, StoreConflictError) as error:
         raise AccountHydrationError(

@@ -12,7 +12,9 @@ the persistence port, keeps them out of any concrete adapter.
 * every order has exactly one exact notional (>= 0), zero exactly when nothing
   is filled; every notional belongs to an order;
 * every fill has a ``client_order_id`` of an existing order with the same symbol
-  and side and a compatible exchange order id.
+  and side and a compatible exchange order id;
+* a safety block belongs to an existing FAILED order without an exchange id
+  (it was never sent).
 
 Errors are the port's: ``StoreConflictError`` for an identity owned twice,
 ``StoreValidationError`` for a dangling or inconsistent reference. Nothing is
@@ -25,9 +27,10 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Final
 
+from app.domain.enums import OrderStatus
 from app.domain.fills import Fill
 from app.domain.orders import Order
-from app.execution.models import PlacementRecord
+from app.execution.models import PlacementRecord, SafetyBlockRecord
 from app.execution.persistence import StoreConflictError, StoreValidationError
 
 _INTENT_TERMS: Final = (
@@ -54,6 +57,7 @@ def check_account_references(
     orders: Mapping[str, Order],
     fills: Mapping[str, Fill],
     notionals: Mapping[str, Decimal],
+    safety_blocks: Mapping[str, SafetyBlockRecord],
 ) -> None:
     """Validate the references of one complete account state (see module doc)."""
     placed: dict[str, str] = {}
@@ -99,6 +103,15 @@ def check_account_references(
     for cid in notionals:
         if cid not in orders:
             raise StoreValidationError(f"filled notional for unknown order {cid}")
+    for cid in safety_blocks:
+        order = orders.get(cid)
+        if order is None:
+            raise StoreValidationError(f"safety block for unknown order {cid}")
+        if order.status is not OrderStatus.FAILED or order.exchange_order_id is not None:
+            raise StoreValidationError(
+                f"safety-blocked order {cid} must be FAILED without an exchange id, "
+                f"got {order.status.value}"
+            )
     for fill in fills.values():
         if fill.client_order_id is None:
             raise StoreValidationError(f"fill {fill.exec_id} has no client_order_id")

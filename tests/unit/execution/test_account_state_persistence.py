@@ -239,10 +239,7 @@ def ready_safety(account: InMemoryAccountState) -> SafetyController:
     """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
     safety = SafetyController(account_state=account)
     safety.mark_hydrated()
-    safety.mark_orders_reconciled()
-    safety.mark_positions_reconciled()
-    safety.mark_open_orders_reconciled()
-    safety.mark_fills_complete()
+    safety.mark_exchange_reconciled()
     safety.request_state(TradingState.RUNNING)
     return safety
 
@@ -666,9 +663,9 @@ async def test_submitting_commit_failure_forbids_the_network(failure: CommitFail
     store.inject_commit_failure(failure)
 
     with pytest.raises(store_error(failure)):
-        await OrderSubmitter(account_state=account, client=client, clock=Clock()).submit(
-            client_order_id="c-1"
-        )
+        await OrderSubmitter(
+            account_state=account, safety=ready_safety(account), client=client, clock=Clock()
+        ).submit(client_order_id="c-1")
 
     assert client.placed == []  # write-ahead: no durable SUBMITTING, no request
     assert (await account.order("c-1")).status is S.NEW  # type: ignore[union-attr]
@@ -687,9 +684,9 @@ async def test_network_is_outside_the_lock_and_the_store_inside() -> None:
     account = await prepared_account(store, submitted=False)
     client = Client(account)
 
-    order = await OrderSubmitter(account_state=account, client=client, clock=Clock()).submit(
-        client_order_id="c-1"
-    )
+    order = await OrderSubmitter(
+        account_state=account, safety=ready_safety(account), client=client, clock=Clock()
+    ).submit(client_order_id="c-1")
 
     assert (order.status, order.exchange_order_id) == (S.SUBMITTING, "ex-1")
     assert client.lock_held == [False]
@@ -704,7 +701,9 @@ async def test_ack_persistence_failure_never_resends(failure: CommitFailure) -> 
     store = FailingOnNthCommitStore(4, failure)
     account = await prepared_account(store, submitted=False)
     client = Client(account)
-    sender = OrderSubmitter(account_state=account, client=client, clock=Clock())
+    sender = OrderSubmitter(
+        account_state=account, safety=ready_safety(account), client=client, clock=Clock()
+    )
 
     with pytest.raises(store_error(failure)):
         await sender.submit(client_order_id="c-1")
@@ -737,9 +736,9 @@ async def test_outcome_persistence_failure_wins_and_keeps_the_transport_error(
     client = Client(account, error=transport)
 
     with pytest.raises(store_error(failure)) as caught:
-        await OrderSubmitter(account_state=account, client=client, clock=Clock()).submit(
-            client_order_id="c-1"
-        )
+        await OrderSubmitter(
+            account_state=account, safety=ready_safety(account), client=client, clock=Clock()
+        ).submit(client_order_id="c-1")
 
     assert caught.value.__context__ is transport
     assert len(client.placed) == 1

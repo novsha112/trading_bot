@@ -156,10 +156,7 @@ def ready_safety(
     """A controller with every recovery gate confirmed: effective == requested."""
     safety = SafetyController(account_state=account)
     safety.mark_hydrated()
-    safety.mark_orders_reconciled()
-    safety.mark_positions_reconciled()
-    safety.mark_open_orders_reconciled()
-    safety.mark_fills_complete()
+    safety.mark_exchange_reconciled()
     safety.request_state(requested)
     return safety
 
@@ -1095,10 +1092,7 @@ def test_safety_must_cover_the_same_account() -> None:
 async def test_incomplete_recovery_makes_risk_see_paused(risk_states: list[TradingState]) -> None:
     account = await flat_account()
     safety = SafetyController(account_state=account)
-    safety.mark_hydrated()
-    safety.mark_orders_reconciled()
-    safety.mark_positions_reconciled()
-    safety.mark_open_orders_reconciled()  # fills not complete yet
+    safety.mark_hydrated()  # hydrated, exchange gates not confirmed yet
     safety.request_state(RUNNING)
     ids, clock = SequenceIds(), CountingClock()
     coord = coordinator(account=account, safety=safety, ids=ids, clock=clock)
@@ -1141,20 +1135,17 @@ async def test_complete_recovery_passes_the_requested_state_to_risk(
 
 
 @pytest.mark.asyncio
-async def test_completing_the_last_gate_lets_the_next_placement_run(
+async def test_the_atomic_exchange_confirmation_lets_the_next_placement_run(
     risk_states: list[TradingState],
 ) -> None:
     account = await flat_account()
     safety = SafetyController(account_state=account)
     safety.request_state(RUNNING)
     safety.mark_hydrated()
-    safety.mark_fills_complete()
-    safety.mark_open_orders_reconciled()
-    safety.mark_orders_reconciled()
     coord = coordinator(account=account, safety=safety)
 
     first = await coord.place(intent=intent("i-1"))
-    safety.mark_positions_reconciled()
+    safety.mark_exchange_reconciled()
     second = await coord.place(intent=intent("i-2"))
 
     assert risk_states == [TradingState.PAUSED, RUNNING]

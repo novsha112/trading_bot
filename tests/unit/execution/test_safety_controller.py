@@ -40,12 +40,13 @@ GATES = (
     "open_orders_reconciled",
     "fills_complete",
 )
-EXCHANGE_MARKS = {
-    "orders_reconciled": "mark_orders_reconciled",
-    "positions_reconciled": "mark_positions_reconciled",
-    "open_orders_reconciled": "mark_open_orders_reconciled",
-    "fills_complete": "mark_fills_complete",
-}
+EXCHANGE_GATES = GATES[1:]
+OLD_PARTIAL_MARKS = (
+    "mark_orders_reconciled",
+    "mark_positions_reconciled",
+    "mark_open_orders_reconciled",
+    "mark_fills_complete",
+)
 COMPLETE = RecoveryReadiness(**dict.fromkeys(GATES, True))
 
 
@@ -59,8 +60,7 @@ def controller(target: InMemoryAccountState | None = None) -> SafetyController:
 
 def complete(safety: SafetyController) -> SafetyController:
     safety.mark_hydrated()
-    for method in EXCHANGE_MARKS.values():
-        getattr(safety, method)()
+    safety.mark_exchange_reconciled()
     return safety
 
 
@@ -202,16 +202,15 @@ def test_requested_running_is_remembered_while_recovery_is_incomplete() -> None:
     assert safety.snapshot().requested_state is RUNNING
 
 
-@pytest.mark.parametrize("missing", GATES)
-def test_controller_stays_paused_with_one_gate_missing(missing: str) -> None:
+@pytest.mark.parametrize("hydrated", [False, True])
+def test_controller_stays_paused_until_the_exchange_gates_are_confirmed(hydrated: bool) -> None:
     safety = controller()
     safety.request_state(RUNNING)
-    if missing != "hydrated":
+    if hydrated:
         safety.mark_hydrated()
-        for gate, method in EXCHANGE_MARKS.items():
-            if gate != missing:
-                getattr(safety, method)()
-    assert getattr(safety.snapshot().readiness, missing) is False
+    readiness = safety.snapshot().readiness
+    assert readiness.hydrated is hydrated
+    assert [getattr(readiness, gate) for gate in EXCHANGE_GATES] == [False] * 4
     assert safety.effective_state is PAUSED
 
 
@@ -297,26 +296,29 @@ async def test_poison_with_incomplete_recovery_is_paused_and_halted_wins() -> No
 # --- gates ----------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("gate", sorted(EXCHANGE_MARKS))
-def test_exchange_gate_before_hydrate_is_an_orchestration_error(gate: str) -> None:
+def test_exchange_confirmation_before_hydrate_is_an_orchestration_error() -> None:
     safety = controller()
-    with pytest.raises(RecoveryGateOrderError, match=gate):
-        getattr(safety, EXCHANGE_MARKS[gate])()
+    with pytest.raises(RecoveryGateOrderError, match="hydrated"):
+        safety.mark_exchange_reconciled()
     assert safety.snapshot().readiness == RecoveryReadiness()
     assert issubclass(RecoveryGateOrderError, SafetyStateError)
 
 
-@pytest.mark.parametrize("order", list(itertools.permutations(sorted(EXCHANGE_MARKS))))
-def test_exchange_gates_complete_in_any_order(order: tuple[str, ...]) -> None:
+def test_exchange_gates_are_confirmed_together_in_one_snapshot() -> None:
     safety = controller()
     safety.request_state(RUNNING)
     safety.mark_hydrated()
-    for n, gate in enumerate(order):
-        assert safety.effective_state is PAUSED
-        getattr(safety, EXCHANGE_MARKS[gate])()
-        assert getattr(safety.snapshot().readiness, gate) is True
-        assert safety.snapshot().readiness.complete is (n == len(order) - 1)
-    assert safety.effective_state is RUNNING
+    before = safety.snapshot()
+    assert before.effective_state is PAUSED
+
+    safety.mark_exchange_reconciled()
+
+    after = safety.snapshot()
+    assert after.readiness == COMPLETE
+    assert all(getattr(after.readiness, gate) for gate in EXCHANGE_GATES)
+    assert after.effective_state is RUNNING
+    assert before.readiness.hydrated is True
+    assert not any(getattr(before.readiness, gate) for gate in EXCHANGE_GATES)
 
 
 def test_marking_twice_is_idempotent() -> None:
@@ -331,11 +333,8 @@ def test_there_is_no_api_to_lower_a_gate() -> None:
     assert public == {
         "account_state",
         "effective_state",
-        "mark_fills_complete",
+        "mark_exchange_reconciled",
         "mark_hydrated",
-        "mark_open_orders_reconciled",
-        "mark_orders_reconciled",
-        "mark_positions_reconciled",
         "request_state",
         "snapshot",
     }
@@ -343,6 +342,8 @@ def test_there_is_no_api_to_lower_a_gate() -> None:
         member = getattr(SafetyController, name)
         if name.startswith("mark_"):
             assert list(inspect.signature(member).parameters) == ["self"]
+    # No partial confirmation of the exchange gates is possible.
+    assert not any(hasattr(SafetyController, name) for name in OLD_PARTIAL_MARKS)
 
 
 def test_snapshot_is_immutable_and_detached() -> None:
@@ -398,6 +399,6 @@ def test_controller_methods_are_synchronous() -> None:
         SafetyController.request_state,
         SafetyController.snapshot,
         SafetyController.mark_hydrated,
-        *(getattr(SafetyController, m) for m in EXCHANGE_MARKS.values()),
+        SafetyController.mark_exchange_reconciled,
     ]
     assert not any(inspect.iscoroutinefunction(member) for member in members)
