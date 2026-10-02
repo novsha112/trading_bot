@@ -127,6 +127,20 @@ def calculate_order_notional(*, price: Decimal, qty: Decimal) -> Decimal:
         raise ExposureCalculationError("order notional cannot be computed exactly") from None
 
 
+def calculate_remaining_qty(*, qty: Decimal, filled_qty: Decimal) -> Decimal:
+    """Exact ``qty - filled_qty`` of an order: what may still execute (may be 0)."""
+    if type(qty) is not Decimal or not qty.is_finite() or qty <= 0:
+        raise DomainValidationError("qty must be a finite, exact Decimal > 0")
+    if type(filled_qty) is not Decimal or not filled_qty.is_finite() or filled_qty < 0:
+        raise DomainValidationError("filled_qty must be a finite, exact Decimal >= 0")
+    if filled_qty > qty:
+        raise DomainValidationError(f"filled_qty ({filled_qty}) must be <= qty ({qty})")
+    try:
+        return _exact().subtract(qty, filled_qty)
+    except DecimalException:
+        raise ExposureCalculationError("remaining qty cannot be computed exactly") from None
+
+
 def calculate_exposure(
     *,
     position_qty: Decimal,
