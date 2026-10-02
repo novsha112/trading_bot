@@ -77,6 +77,56 @@ def _require_inputs(
         raise DomainValidationError("valid_reduce_only requires a reduce_only intent")
 
 
+def _pending_paths(
+    context: Context, position_qty: Decimal, open_orders: tuple[OpenOrderExposure, ...]
+) -> tuple[Decimal, Decimal]:
+    """Signed long / short paths: position plus every non-reduce-only BUY, and
+    position minus every non-reduce-only SELL (opposite orders never net)."""
+    long_path = position_qty
+    short_path = position_qty
+    for order in open_orders:
+        if order.reduce_only:
+            continue  # can never increase either side
+        if order.side is Side.BUY:
+            long_path = context.add(long_path, order.remaining_qty)
+        else:
+            short_path = context.subtract(short_path, order.remaining_qty)
+    return long_path, short_path
+
+
+def _magnitudes(long_path: Decimal, short_path: Decimal) -> tuple[Decimal, Decimal]:
+    return max(long_path, _ZERO), max(short_path.copy_negate(), _ZERO)
+
+
+def calculate_worst_case(
+    *, position_qty: Decimal, open_orders: tuple[OpenOrderExposure, ...]
+) -> tuple[Decimal, Decimal]:
+    """Baseline ``(worst_long_qty, worst_short_qty)`` of the current position and
+    the existing active orders, without any new intent (same rules as
+    ``calculate_exposure``)."""
+    if type(position_qty) is not Decimal or not position_qty.is_finite():
+        raise DomainValidationError("position_qty must be a known, finite, exact Decimal")
+    if type(open_orders) is not tuple or not all(
+        isinstance(order, OpenOrderExposure) for order in open_orders
+    ):
+        raise DomainValidationError("open_orders must be a known tuple of OpenOrderExposure")
+    try:
+        return _magnitudes(*_pending_paths(_exact(), position_qty, open_orders))
+    except DecimalException:
+        raise ExposureCalculationError("exposure cannot be computed exactly") from None
+
+
+def calculate_order_notional(*, price: Decimal, qty: Decimal) -> Decimal:
+    """Exact ``price * qty`` of an order (no rounding, global context untouched)."""
+    for value, field in ((price, "price"), (qty, "qty")):
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            raise DomainValidationError(f"{field} must be a finite Decimal > 0")
+    try:
+        return _exact().multiply(price, qty)
+    except DecimalException:
+        raise ExposureCalculationError("order notional cannot be computed exactly") from None
+
+
 def calculate_exposure(
     *,
     position_qty: Decimal,
@@ -97,15 +147,7 @@ def calculate_exposure(
         reducing = min(position_size, order_qty) if opposite else _ZERO
         increasing = _ZERO if valid_reduce_only else context.subtract(order_qty, reducing)
 
-        long_path = position_qty
-        short_path = position_qty
-        for order in open_orders:
-            if order.reduce_only:
-                continue  # can never increase either side
-            if order.side is Side.BUY:
-                long_path = context.add(long_path, order.remaining_qty)
-            else:
-                short_path = context.subtract(short_path, order.remaining_qty)
+        long_path, short_path = _pending_paths(context, position_qty, open_orders)
         if not valid_reduce_only:
             if intent.side is Side.BUY:
                 long_path = context.add(long_path, order_qty)
@@ -114,9 +156,10 @@ def calculate_exposure(
     except DecimalException:
         raise ExposureCalculationError("exposure cannot be computed exactly") from None
 
+    worst_long, worst_short = _magnitudes(long_path, short_path)
     return ExposureChange(
         reducing_qty=reducing,
         increasing_qty=increasing,
-        worst_long_qty=max(long_path, _ZERO),
-        worst_short_qty=max(short_path.copy_negate(), _ZERO),
+        worst_long_qty=worst_long,
+        worst_short_qty=worst_short,
     )
