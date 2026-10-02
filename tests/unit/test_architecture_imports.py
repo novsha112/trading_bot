@@ -117,8 +117,23 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.account_state",
             "app.execution.models",
             "app.execution.requests",
+            "app.execution.timing",
         }
     ),
+    # Single-shot UNKNOWN reconciliation: the same exchange abstractions only.
+    "execution.reconciliation": frozenset(
+        {
+            "app.domain",
+            "app.exchanges.models",
+            "app.exchanges.errors",
+            "app.exchanges.protocols",
+            "app.execution.account_state",
+            "app.execution.models",
+            "app.execution.timing",
+        }
+    ),
+    # Fallback-safe local change time: the domain clock only.
+    "execution.timing": frozenset({"app.domain"}),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -1071,5 +1086,40 @@ def test_submitter_allowed_imports(tmp_path: Path) -> None:
         "from app.execution.requests import order_request_from_order\n",
     )
     _write(root, "execution/requests.py", "from app.exchanges.models import OrderRequest\n")
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from app.exchanges.bybit.private_rest import X\n",
+        "from app.exchanges.simulated import SimulatedExchange\n",
+        "from app.services.placement import PlacementCoordinator\n",
+        "from app.risk.manager import evaluate\n",
+        "from app.persistence import X\n",
+        "from app.config.settings import EnvSettings\n",
+        "from app.execution.submitter import OrderSubmitter\n",
+    ],
+)
+def test_reconciliation_violations(tmp_path: Path, source: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "execution/reconciliation.py", source)
+
+    assert find_violations(root), source
+
+
+def test_reconciliation_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "execution/reconciliation.py",
+        "from app.domain.orders import OrderUpdate\n"
+        "from app.exchanges.models import OrderRef\n"
+        "from app.exchanges.protocols import TradingClient\n"
+        "from app.execution.account_state import InMemoryAccountState\n"
+        "from app.execution.timing import change_time\n",
+    )
+    _write(root, "execution/timing.py", "from app.domain.clock import Clock\n")
 
     assert find_violations(root) == []

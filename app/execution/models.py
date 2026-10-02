@@ -1,6 +1,8 @@
 """Execution-local records (not domain models).
 
 ``SubmissionOutcome`` classifies the transport result of a placement request.
+``ExchangeOrderState`` is a confirmed exchange report about one order, normalized
+for the account state (which does not depend on exchange DTOs).
 
 ``PlacementRecord`` links one ``PlaceOrderIntent`` to the outcome registered for
 it: the Risk decision and, when approved, the ``client_order_id`` of the local
@@ -12,11 +14,21 @@ not carry ``intent_id``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
+from typing import Final
 
+from app.domain.enums import OrderStatus
 from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
-from app.domain.validation import require_text
+from app.domain.validation import (
+    require_enum,
+    require_non_negative,
+    require_positive,
+    require_text,
+    require_utc,
+)
 from app.risk.models import RiskDecision
 
 
@@ -65,3 +77,49 @@ class PlacementRecord:
     @property
     def approved(self) -> bool:
         return self.decision.approved
+
+
+# Statuses an exchange can actually report about an order. Local lifecycle
+# statuses (NEW, SUBMITTING, CANCELING, UNKNOWN) and FAILED ("never sent") are
+# never exchange facts.
+EXCHANGE_REPORTED_STATUSES: Final = frozenset(
+    {
+        OrderStatus.OPEN,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExchangeOrderState:
+    """What the exchange confirms about one order: identity, status, cumulative
+    execution and its time. Consistency with the local order (quantity, fill
+    invariants) is checked when it is applied."""
+
+    client_order_id: str
+    exchange_order_id: str | None
+    status: OrderStatus
+    filled_qty: Decimal
+    """Cumulative executed quantity on the exchange."""
+    avg_fill_price: Decimal | None
+    """None exactly when nothing is filled."""
+    exchange_ts: datetime
+
+    def __post_init__(self) -> None:
+        require_text(self.client_order_id, "client_order_id")
+        if self.exchange_order_id is not None:
+            require_text(self.exchange_order_id, "exchange_order_id")
+        status = require_enum(self.status, OrderStatus, "status")
+        if status not in EXCHANGE_REPORTED_STATUSES:
+            raise DomainValidationError(f"status {status.value} is not an exchange-reported status")
+        filled = require_non_negative(self.filled_qty, "filled_qty")
+        if filled == 0:
+            if self.avg_fill_price is not None:
+                raise DomainValidationError("avg_fill_price must be None without fills")
+        else:
+            require_positive(self.avg_fill_price, "avg_fill_price")
+        require_utc(self.exchange_ts, "exchange_ts")

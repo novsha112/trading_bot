@@ -12,6 +12,7 @@ lock, so orders and positions can only be read and changed together::
         locked.register_approved(...) / locked.register_rejected(...)
         locked.mark_submitting(...) / locked.record_ack(...)
         locked.record_submission_outcome(...) / locked.apply_fill(...)
+        locked.apply_exchange_state(...)
         locked.set_position_qty(...)
 
 Lock design: one non-reentrant ``asyncio.Lock``. Mutations exist only on the
@@ -54,14 +55,22 @@ progress beats a transport outcome: an ambiguous outcome for an order already
 advanced by fills changes nothing; a definite one raises
 ``SubmissionOutcomeConflictError`` and keeps the state.
 
+Exchange reports (``apply_exchange_state``, an ``ExchangeOrderState``): identity,
+executed quantity and average price must agree with the local order; a report
+showing more execution than the applied fills raises ``MissingFillsError`` (fills
+are never synthesized, so Order and position stay consistent), less or a status
+the order cannot reach is an ``ExchangeStateMismatchError``. Stronger local
+progress is never regressed; nothing changes on any error.
+
 Revision: starts at 0 and versions the whole local risk-relevant state. +1 for
 an approved reservation, an order transition (``mark_submitting``, a recorded
-outcome), a newly recorded exchange order id, an applied fill and a changed
-position; nothing for a rejected record, a replay, a repeated ack, an outcome
-that the observed state already supersedes or setting a position to its current
-value. Every new placement must name the current revision (``expected_revision``) or raises
-``StaleRevisionError``. Client order ids are supplied by the caller and only
-validated here; nothing is generated. No exchange, network or storage.
+outcome, an applied exchange report), a newly recorded exchange order id, an
+applied fill and a changed position; nothing for a rejected record, a replay, a
+repeated ack or report, an outcome that the observed state already supersedes
+or setting a position to its current value. Every new placement must name the
+current revision (``expected_revision``) or raises ``StaleRevisionError``.
+Client order ids are supplied by the caller and only validated here; nothing is
+generated. No exchange, network or storage.
 """
 
 from __future__ import annotations
@@ -74,14 +83,14 @@ from decimal import Decimal, DecimalException
 from typing import Any, Final
 
 from app.domain.enums import OrderStatus
-from app.domain.errors import DomainValidationError
+from app.domain.errors import DomainValidationError, InvalidOrderTransition
 from app.domain.fill_math import accumulate_execution
 from app.domain.fills import Fill
 from app.domain.intents import PlaceOrderIntent
 from app.domain.order_state import record_exchange_order_id, transition
 from app.domain.orders import Order
 from app.domain.validation import require_text, require_utc
-from app.execution.models import PlacementRecord, SubmissionOutcome
+from app.execution.models import ExchangeOrderState, PlacementRecord, SubmissionOutcome
 from app.portfolio.positions import PositionStateError, position_after_fill
 from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
 
@@ -138,6 +147,19 @@ class FillConflictError(FillApplicationError):
 class OrderAckMismatchError(AccountStateError):
     """An acknowledgement does not belong to the local order (other client or
     exchange id, or an order that was never sent / definitely not accepted)."""
+
+
+class ExchangeStateMismatchError(AccountStateError):
+    """A confirmed exchange report contradicts the local order (identity, a
+    smaller executed quantity, a different average price, a status the local
+    order can no longer move to, or a status / fill combination the domain
+    forbids); nothing was changed."""
+
+
+class MissingFillsError(AccountStateError):
+    """The exchange reports more execution than the fills applied locally. Fills
+    are never synthesized from an order report: the missing fills must be
+    applied first (Order and position stay consistent); nothing was changed."""
 
 
 class SubmissionOutcomeConflictError(AccountStateError):
@@ -392,6 +414,78 @@ class LockedAccountState:
             f"{outcome.value} for order {order.client_order_id} contradicts its observed "
             f"status {order.status.value} (filled {order.filled_qty}); state kept"
         )
+
+    def apply_exchange_state(self, report: ExchangeOrderState, *, at: datetime) -> Order:
+        """Apply a confirmed exchange report to the local order, or change nothing.
+
+        Checked before any change: the order exists and was sent (not NEW or
+        FAILED); a known ``exchange_order_id`` matches; the reported execution
+        equals the locally applied one (less -> stale ``ExchangeStateMismatchError``,
+        more -> ``MissingFillsError``: fills are never synthesized); with fills,
+        a reported average equals the local one. Then, for a different status,
+        the existing state machine and Order invariants decide the transition
+        (a status the order cannot move to, e.g. PARTIALLY_FILLED -> OPEN or any
+        change of a terminal order, is a mismatch). The position is never
+        changed here. A report confirming the current status only records a new
+        ``exchange_order_id``; an identical report is a no-op. +1 revision only
+        for a real change.
+        """
+        state = self._live()
+        if type(report) is not ExchangeOrderState:
+            raise DomainValidationError("report must be an ExchangeOrderState")
+        order = self._existing(state, report.client_order_id)
+        if order.status in (OrderStatus.NEW, OrderStatus.FAILED):
+            raise ExchangeStateMismatchError(
+                f"exchange reports order {order.client_order_id} as {report.status.value}, "
+                f"but it is locally {order.status.value} (never accepted)"
+            )
+        exchange_order_id = report.exchange_order_id
+        if exchange_order_id is not None and order.exchange_order_id not in (
+            None,
+            exchange_order_id,
+        ):
+            raise ExchangeStateMismatchError(
+                f"exchange_order_id {exchange_order_id} differs from "
+                f"{order.exchange_order_id} of order {order.client_order_id}"
+            )
+        if report.filled_qty < order.filled_qty:
+            raise ExchangeStateMismatchError(
+                f"exchange reports {report.filled_qty} executed for order "
+                f"{order.client_order_id}, below the {order.filled_qty} applied locally"
+            )
+        if report.filled_qty > order.filled_qty:
+            raise MissingFillsError(
+                f"exchange reports {report.filled_qty} executed for order "
+                f"{order.client_order_id}, {order.filled_qty} applied locally: "
+                "apply the missing fills first"
+            )
+        if report.avg_fill_price is not None and report.avg_fill_price != order.avg_fill_price:
+            raise ExchangeStateMismatchError(
+                f"exchange average price {report.avg_fill_price} differs from "
+                f"{order.avg_fill_price} of order {order.client_order_id}"
+            )
+        if report.status is order.status:
+            if exchange_order_id is None:
+                return order
+            updated = record_exchange_order_id(order, exchange_order_id, at=at)
+        else:
+            try:
+                updated = transition(
+                    order,
+                    report.status,
+                    at=at,
+                    exchange_order_id=exchange_order_id,
+                    last_exchange_update_ts=report.exchange_ts,
+                )
+            except (InvalidOrderTransition, DomainValidationError) as error:
+                raise ExchangeStateMismatchError(
+                    f"order {order.client_order_id} cannot move from {order.status.value} "
+                    f"to reported {report.status.value}: {error}"
+                ) from error
+        if updated is not order:
+            state.orders[order.client_order_id] = updated
+            state.revision += 1
+        return updated
 
     @staticmethod
     def _existing(state: _State, client_order_id: str) -> Order:

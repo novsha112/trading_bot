@@ -30,7 +30,7 @@ controller's job.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.domain.clock import Clock
 from app.domain.enums import OrderStatus
@@ -48,6 +48,7 @@ from app.execution.account_state import (
 )
 from app.execution.models import SubmissionOutcome
 from app.execution.requests import order_request_from_order
+from app.execution.timing import change_time
 
 
 class OrderAlreadySubmittedError(AccountStateError):
@@ -134,11 +135,4 @@ class OrderSubmitter:
         order = locked.order(client_order_id)
         if order is None:
             raise AccountStateError(f"no local order {client_order_id}")
-        floor = order.updated_at
-        try:
-            now = self._clock.now()
-        except Exception:
-            return floor
-        if not isinstance(now, datetime) or now.utcoffset() != timedelta(0) or now < floor:
-            return floor
-        return now
+        return change_time(self._clock, floor=order.updated_at)
