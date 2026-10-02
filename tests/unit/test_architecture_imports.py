@@ -30,7 +30,9 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "market_data": frozenset({"domain", "exchanges"}),
     "strategies": frozenset({"domain"}),
     "risk": frozenset({"domain", "portfolio"}),
-    "execution": frozenset({"domain", "exchanges"}),
+    # Execution may store Risk results (RiskDecision) and read the active-status set;
+    # Risk never imports execution.
+    "execution": frozenset({"domain", "exchanges", "risk"}),
     "portfolio": frozenset({"domain"}),
     "persistence": frozenset({"domain"}),
     # Orchestration / infrastructure packages: restrictions will be refined as
@@ -55,6 +57,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "exchanges.bybit": frozenset({"httpx"}),
     # Pure risk evaluation on domain types: no frameworks or I/O.
     "risk": frozenset(),
+    # Local order state and (later) submission through exchange contracts only.
+    "execution": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -89,6 +93,9 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "exchanges.simulated_fees": frozenset({"app.domain"}),
     # Cash accounting: domain only (realized deltas are passed in, not computed).
     "exchanges.simulated_accounting": frozenset({"app.domain"}),
+    # Reservation registry: local state only, no exchange contracts or network.
+    "execution.models": frozenset({"app.domain", "app.risk.models"}),
+    "execution.registry": frozenset({"app.domain", "app.risk.models", "app.execution.models"}),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -871,5 +878,49 @@ def test_risk_allowed_imports(tmp_path: Path) -> None:
         "from dataclasses import dataclass\nfrom types import MappingProxyType\n"
         "from app.domain.enums import Side\nfrom app.domain.validation import require_text\n",
     )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("execution/registry.py", "from app.exchanges.models import OrderRequest\n", "allowlist"),
+        ("execution/registry.py", "from app.risk.manager import evaluate\n", "allowlist"),
+        ("execution/models.py", "from app.exchanges.errors import ExchangeError\n", "allowlist"),
+        ("execution/engine.py", "from app.services import X\n", "app.execution -> app.services"),
+        (
+            "execution/engine.py",
+            "from app.persistence import X\n",
+            "app.execution -> app.persistence",
+        ),
+        ("execution/engine.py", "import httpx\n", "'httpx' (third-party"),
+        (
+            "risk/models.py",
+            "from app.execution.models import PlacementRecord\n",
+            "app.risk -> app.execution",
+        ),
+    ],
+)
+def test_execution_violations(tmp_path: Path, relative: str, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_execution_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "execution/registry.py",
+        "import asyncio\nfrom app.domain.orders import Order\n"
+        "from app.execution.models import PlacementRecord\n"
+        "from app.risk.models import RiskDecision\n",
+    )
+    _write(root, "execution/models.py", "from app.risk.models import RiskDecision\n")
+    _write(root, "execution/engine.py", "from app.exchanges.models import OrderRequest\n")
 
     assert find_violations(root) == []

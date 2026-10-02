@@ -81,7 +81,7 @@ app/
 ├── market_data/     фіди, stale-детектор, replay. Залежить від domain, exchanges (protocol).
 ├── strategies/      base.py + grid/. Залежить ТІЛЬКИ від domain.
 ├── risk/            RiskManager, ліміти, KillSwitch, TradingState, оцінка ліквідації. domain, portfolio.
-├── execution/       OrderManager, ExecutionEngine, генерація client order id. domain, exchanges.
+├── execution/       OrderManager, ExecutionEngine, реєстр резервувань. domain, exchanges, risk (лише моделі).
 ├── portfolio/       позиції, баланси, PnL з fills. domain.
 ├── persistence/     БД, таблиці, репозиторії, міграції. domain.
 ├── backtesting/     runner, завантаження історії, метрики, звіт.
@@ -94,6 +94,7 @@ app/
 
 Жорсткі правила залежностей:
 - `strategies/` не імпортує `exchanges/`, `execution/`, `persistence/`, `config/`. Параметри стратегія отримує як готову доменну модель.
+- `risk/` не імпортує `execution/` чи `services/`; `execution/` може зберігати результати Risk (`RiskDecision`), але не викликає `evaluate` — їх поєднує coordinator у `services/`.
 - `domain/` не імпортує нічого з `app/`, крім власних модулів `app.domain`, і з зовнішнього світу — лише стандартну бібліотеку Python (без Pydantic, structlog, SDK бірж, HTTP/WS, БД).
 - Тільки `execution/` і `KillSwitch` викликають торгові методи адаптера.
 - Тільки `services/bootstrap` знає, який режим активний і які реалізації підставити.
@@ -499,6 +500,16 @@ Private stream (ордери, виконання, позиції, гаманец
 
 ## 7. Execution Engine
 
+### 7.0 Резервування й серіалізація акаунта (V1, foundation)
+
+- **`Order(NEW)` — локальна резервація.** Схвалений intent одразу стає доменним `Order(status=NEW)` у локальному реєстрі **до** будь-якого мережевого виклику; NEW входить в активні статуси, тож наступний snapshot уже враховує його як pending exposure (повний `qty`) і в лічильнику ордерів акаунта.
+- **Межа серіалізації — акаунт.** Один `asyncio.Lock` на акаунт (не на символ: `max_open_orders` глобальний). Під ним майбутній coordinator виконує `revision / views → build snapshot → evaluate → register`; lock звільняється до мережевого виклику. V1: один процес-writer на акаунт.
+- **`InMemoryOrderRegistry` (`app/execution/registry.py`)** — локальний уніфікований перелік ордерів акаунта: ордери за `client_order_id`, окремий індекс `intent_id → PlacementRecord` (execution-локальна незмінна модель: intent, `RiskDecision`, `client_order_id` або `None`) і монотонна `revision`. `intent_id` у доменний `Order` **не** додається.
+- **Lock API:** `async with registry.placement_lock() as locked:` дає синхронний handle `LockedOrderRegistry` (views, `register_approved`, `register_rejected`); мутації існують лише на handle й lock повторно не беруть, тож deadlock неможливий; повторний вхід у lock тією ж задачею → `RegistryLockError`, handle після звільнення lock непридатний.
+- **Ідемпотентність intent:** один запис на `intent_id`; повтор з рівним (поле в поле) intent повертає той самий запис без нового `Order`, `client_order_id` і зміни `revision`; інші дані під тим самим `intent_id` або зайнятий `client_order_id` → `PlacementConflictError`. `client_order_id` реєстр не генерує: його передає викликач, реєстр лише валідує й перевіряє унікальність.
+- **Revision:** починається з 0; резервація NEW → +1; відхилений запис і повтор → без змін (revision відображає лише ризик-релевантний стан ордерів). Нова реєстрація має назвати поточну revision (`expected_revision`), інакше `StaleRevisionError`: рішення над старим станом не резервує.
+- **Біржа лишається джерелом істини.** Реєстр — локальна надмножина (включно з NEW / SUBMITTING / UNKNOWN, яких біржа ще не бачить); після reconciliation його стан узгоджується з біржею, а не навпаки. Інші переходи, submit, resolver, persistence і reconciliation ще не реалізовані.
+
 ### 7.1 Складові
 
 - `ClientOrderIdGenerator` — унікальний, персистентний, з префіксом бота. Формат приблизно `{bot_prefix}{strategy_short}{time_base36}{counter}`. Обмеження довжини і дозволені символи для `orderLinkId` перевірити в документації Bybit (очікувано до 36 символів). Префікс дає змогу відрізнити «наші» ордери від сторонніх.
@@ -610,7 +621,7 @@ NEW ──► SUBMITTING ──► OPEN ──► PARTIALLY_FILLED ──► FIL
 - **Помилки:** відмова — очікуваний результат `RiskDecision` з машинними кодами `RiskReason`, не exception; exception лише для некоректного входу (типи, невідповідність symbol, некоректні snapshot / policy).
 - **Аудит:** рішення містить `intent_id`, `snapshot_id`, `policy_id`, `reasons`, `exposure`; persistence / логування — пізніше.
 - **Побудова snapshot (`app/risk/snapshots.py`, чиста межа):** `open_order_exposure(order)` перетворює активний локальний `Order` (NEW, SUBMITTING, OPEN, PARTIALLY_FILLED, CANCELING, UNKNOWN) на `OpenOrderExposure` з точним `remaining_qty = qty − filled_qty` (> 0) і скопійованими `side`, `price` (`None` для MARKET), `reduce_only`, `status`; термінальний ордер або UNKNOWN без залишку → `DomainValidationError`. `build_risk_snapshot(...)` отримує вже зібраний локальний уніфікований перелік активних ордерів **одного символу** (`None` = невідомо), зберігає їхній порядок, відхиляє чужий символ, термінальний ордер і повтор `client_order_id`, а `account_open_order_count` передає як є (не через `len`). Вона не читає біржу чи реєстр, не бере lock, не генерує `snapshot_id`, не визначає `TradingState` і не рахує позицію з fills — це робить orchestration.
-- **Конкурентність:** чисте ядро гонку двох рішень над одним snapshot не вирішує. Серіалізація й резервування — в orchestration / execution: оцінка, створення `Order(NEW)` і включення його у відкриті ордери наступного snapshot відбуваються послідовно (одна черга подій або блокування на акаунт). Не реалізовано.
+- **Конкурентність:** чисте ядро гонку двох рішень над одним snapshot не вирішує. Серіалізація й резервування — в orchestration / execution: оцінка, створення `Order(NEW)` і включення його у відкриті ордери наступного snapshot відбуваються послідовно під одним lock акаунта (див. 7.0). Реєстр резервувань і lock реалізовано; coordinator (`services`), що поєднує їх з `evaluate`, — ще ні.
 
 ### 9.1 Три рівні перевірок (цільова картина; V1 — див. 9.0)
 
