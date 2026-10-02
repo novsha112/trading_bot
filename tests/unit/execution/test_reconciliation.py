@@ -681,6 +681,150 @@ async def test_not_found_keeps_the_order_unknown_and_active() -> None:
     assert await active_exposure(account) == 1
 
 
+async def concurrent_fill(account: InMemoryAccountState, qty: str) -> None:
+    async with account.account_lock() as locked:
+        locked.apply_fill(fill("e-1", qty), at=T2)
+
+
+async def concurrent_report(account: InMemoryAccountState, status: OrderStatus) -> None:
+    async with account.account_lock() as locked:
+        locked.apply_exchange_state(report(status, exchange_order_id=None), at=T2)
+
+
+async def concurrent_ack(account: InMemoryAccountState) -> None:
+    async with account.account_lock() as locked:
+        locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+
+
+@pytest.mark.parametrize(
+    ("event", "status", "active"),
+    [
+        (lambda account: concurrent_fill(account, "4"), S.PARTIALLY_FILLED, 1),
+        (lambda account: concurrent_fill(account, "10"), S.FILLED, 0),
+        (lambda account: concurrent_report(account, S.OPEN), S.OPEN, 1),
+        (lambda account: concurrent_report(account, S.CANCELED), S.CANCELED, 0),
+        (lambda account: concurrent_report(account, S.EXPIRED), S.EXPIRED, 0),
+        (lambda account: concurrent_report(account, S.REJECTED), S.REJECTED, 0),
+        (lambda account: concurrent_ack(account), S.UNKNOWN, 1),  # newer exchange id
+    ],
+    ids=["partial-fill", "full-fill", "open", "canceled", "expired", "rejected", "exchange-id"],
+)
+@pytest.mark.asyncio
+async def test_not_found_after_newer_local_exchange_facts_is_a_mismatch(
+    event: Callable[[InMemoryAccountState], Awaitable[None]], status: OrderStatus, active: int
+) -> None:
+    account = await account_with(S.UNKNOWN)
+    base = await account.revision()
+
+    async def meanwhile(ref: OrderRef) -> None:
+        await event(account)
+
+    client = ReadClient(answer=None, during=meanwhile)
+
+    with pytest.raises(ExchangeStateMismatchError, match="newer exchange facts") as caught:
+        await reconciler(account, client).reconcile(client_order_id="c-1")
+
+    assert not isinstance(caught.value, OrderStillUnknownError)
+    after = whole_state(account)
+    order = await current(account)
+    assert order.status is status  # the concurrent event's state is kept
+    assert await account.revision() == base + 1  # only the concurrent event
+    assert len(client.refs) == 1
+    assert await active_exposure(account) == active
+    # Handling "not found" itself changes nothing.
+    assert whole_state(account) == after
+
+
+@pytest.mark.asyncio
+async def test_not_found_after_a_partial_fill_keeps_order_position_and_fills() -> None:
+    account = await account_with(S.UNKNOWN)
+
+    async def meanwhile(ref: OrderRef) -> None:
+        await concurrent_fill(account, "4")
+
+    with pytest.raises(ExchangeStateMismatchError):
+        await reconciler(account, ReadClient(answer=None, during=meanwhile)).reconcile(
+            client_order_id="c-1"
+        )
+
+    order = await current(account)
+    assert (order.status, order.filled_qty) == (S.PARTIALLY_FILLED, D("4"))
+    assert await account.position_qty("BTCUSDT") == D("4")
+    assert await account.fill("e-1") == fill("e-1", "4")
+
+
+@pytest.mark.asyncio
+async def test_not_found_for_a_disappeared_order_is_an_invariant_error() -> None:
+    account = await account_with(S.UNKNOWN)
+
+    async def remove(ref: OrderRef) -> None:
+        del account._state.orders["c-1"]  # white-box: orders are never removed
+
+    with pytest.raises(AccountStateError, match="disappeared") as caught:
+        await reconciler(account, ReadClient(answer=None, during=remove)).reconcile(
+            client_order_id="c-1"
+        )
+
+    assert not isinstance(caught.value, OrderStillUnknownError | ExchangeStateMismatchError)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_not_found_answers_while_still_unknown() -> None:
+    account = await account_with(S.UNKNOWN)
+    gate = asyncio.Event()
+    client = ReadClient(answer=None, gate=gate)
+    tool = reconciler(account, client)
+    before = whole_state(account)
+
+    first = asyncio.create_task(tool.reconcile(client_order_id="c-1"))
+    second = asyncio.create_task(tool.reconcile(client_order_id="c-1"))
+    await client.called.wait()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gate.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True), timeout=5
+    )
+
+    assert [type(r) for r in results] == [OrderStillUnknownError, OrderStillUnknownError]
+    assert whole_state(account) == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_not_found_answers_around_a_fill() -> None:
+    account = await account_with(S.UNKNOWN)
+    first_gate, second_gate = asyncio.Event(), asyncio.Event()
+    gates = [first_gate, second_gate]
+
+    class OrderedClient(ReadClient):
+        async def get_order(self, order: OrderRef) -> OrderUpdate | None:
+            gate = gates[len(self.refs)]
+            self.refs.append(order)
+            await gate.wait()
+            return None
+
+    client = OrderedClient()
+    tool = reconciler(account, client)
+    first = asyncio.create_task(tool.reconcile(client_order_id="c-1"))
+    second = asyncio.create_task(tool.reconcile(client_order_id="c-1"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert len(client.refs) == 2
+
+    first_gate.set()  # processed while still UNKNOWN
+    first_result = await asyncio.gather(first, return_exceptions=True)
+    await concurrent_fill(account, "4")  # then a fill arrives
+    base = await account.revision()
+    second_gate.set()  # processed after the fill
+    second_result = await asyncio.gather(second, return_exceptions=True)
+
+    assert isinstance(first_result[0], OrderStillUnknownError)
+    assert isinstance(second_result[0], ExchangeStateMismatchError)
+    assert not isinstance(second_result[0], OrderStillUnknownError)
+    assert (await current(account)).status is S.PARTIALLY_FILLED
+    assert await account.revision() == base
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -872,7 +1016,9 @@ def test_reconciler_has_no_retry_or_background_machinery() -> None:
 
     assert not [n for n in ast.walk(tree) if isinstance(n, ast.For | ast.While | ast.AsyncFor)]
     awaited = [ast.unparse(n.value) for n in ast.walk(tree) if isinstance(n, ast.Await)]
-    assert awaited == ["self._client.get_order(ref)"]
+    network = [call for call in awaited if call.startswith("self._client.")]
+    assert network == ["self._client.get_order(ref)"]  # the only exchange call
+    assert set(awaited) - set(network) == {"self._classify_not_found(client_order_id, ref)"}
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

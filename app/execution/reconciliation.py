@@ -14,14 +14,19 @@
 
   Exactly one read per call: no retry, backoff, grace period or loop. A read
   error propagates and changes nothing. ``None`` (the exchange confirms no such
-  order) raises ``OrderStillUnknownError``: the order stays UNKNOWN and keeps its
-  exposure; deciding "not found -> FAILED" needs a separate grace policy. While
+  order) is classified against the order as it is when the answer is processed,
+  changing nothing: still UNKNOWN with the same exchange id ->
+  ``OrderStillUnknownError`` (it keeps its exposure; "not found -> FAILED" needs a
+  separate grace policy); anything newer (fills, another report, a new exchange
+  id) -> ``ExchangeStateMismatchError``. While
   the read is in flight the order may advance (fills): the report is then
   applied to that newer state by the same rules, so a stale answer is a
   mismatch, never a rollback.
 """
 
 from __future__ import annotations
+
+from typing import NoReturn
 
 from app.domain.clock import Clock
 from app.domain.enums import OrderStatus
@@ -80,6 +85,33 @@ class UnknownOrderReconciler:
         self._client = client
         self._clock = clock
 
+    async def _classify_not_found(self, client_order_id: str, ref: OrderRef) -> NoReturn:
+        """Raise for a "no such order" answer; never changes anything.
+
+        Still unresolved only if the order is STILL UNKNOWN with the same exchange
+        identity when the answer is processed. Any exchange fact observed locally
+        meanwhile (fills, another report, a newly known exchange id) contradicts
+        "not found": a reconciliation mismatch, not "still unknown".
+        """
+        async with self._account.account_lock() as locked:
+            current = locked.order(client_order_id)
+        if current is None:
+            raise AccountStateError(
+                f"local order {client_order_id} disappeared during reconciliation"
+            )
+        if (
+            current.status is OrderStatus.UNKNOWN
+            and current.exchange_order_id == ref.exchange_order_id
+        ):
+            raise OrderStillUnknownError(
+                f"exchange reports no order {client_order_id}; it stays unknown"
+            )
+        raise ExchangeStateMismatchError(
+            f"exchange reports no order {client_order_id}, but it is locally "
+            f"{current.status.value} (exchange id {current.exchange_order_id}) after "
+            "newer exchange facts; state kept"
+        )
+
     async def reconcile(self, *, client_order_id: str) -> Order:
         """Read the exchange state of the UNKNOWN order once and apply it."""
         require_text(client_order_id, "client_order_id")
@@ -100,9 +132,7 @@ class UnknownOrderReconciler:
         update = await self._client.get_order(ref)  # errors propagate; nothing changed
 
         if update is None:
-            raise OrderStillUnknownError(
-                f"exchange reports no order {client_order_id}; it stays unknown"
-            )
+            await self._classify_not_found(client_order_id, ref)
         try:
             report = exchange_state_from_update(update)
         except DomainValidationError as error:
