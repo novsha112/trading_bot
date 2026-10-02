@@ -150,15 +150,15 @@
 
 **Мета.** Надійне збереження стану й журналу.
 
-**Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізації ще немає.
+**Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізовано пп. 1–5 послідовності нижче (без SQL-адаптера, без exchange-recovery).
 
-**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–4):
+**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–5):
 1. Persistence contract — **задокументовано**.
 2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище — **реалізовано** (`app/persistence/codecs.py`, лише stdlib).
 3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit) — **реалізовано**; власника порту виправлено: Protocol, моделі й помилки — `app/execution/persistence.py`, адаптер — `app/persistence/memory.py` (execution не імпортує persistence). Інтегровано в п. 4.
 4. Refactor стану акаунта на prepare / commit / publish — **реалізовано** (усі runtime-мутації durable до публікації; store передається явно).
-   - Uncertain-commit poisoning — **реалізовано**: `StoreUncertainError` атомарно отруює агрегат, подальші мутації й workflow fail closed; без API скидання. Startup hydrate / recovery — ще ні.
-5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі).
+   - Uncertain-commit poisoning — **реалізовано**: `StoreUncertainError` атомарно отруює агрегат, подальші мутації й workflow fail closed; без API скидання; вихід — новий агрегат через hydrate (п. 5).
+5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі) — **реалізовано**: `InMemoryAccountState.hydrate(account_scope_id, store, clock)` — load → валідація execution-owned інваріантами (`app/execution/state_invariants.py`, спільні з in-memory store) → локальна класифікація (`app/execution/recovery.py`) → один durable commit (revision + 1) → новий агрегат. Без мережі, без readiness: hydrated ≠ recovered ≠ safe to trade.
 6. `SafetyController` (durable latch + runtime-умови → effective `TradingState`).
 7. SQLite + Alembic (SQLAlchemy 2.x async Core, WAL + `synchronous=FULL`).
 8. Можливість історії виконань (`get_executions` або еквівалент).

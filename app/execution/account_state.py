@@ -30,8 +30,8 @@ prepared or the store is called; workflows check ``ensure_mutations_allowed``
 right after taking the lock. Reads keep working on the last confirmed RAM
 snapshot, for diagnostics only. Poison is runtime-only (not durable, not the
 revision, not a TradingState) and has no reset API: the only way back is a new
-account state reloaded from durable storage (startup hydration does not exist
-yet; an account state starts empty). Definite failures, conflicts and
+account state reloaded from durable storage (``InMemoryAccountState.hydrate``;
+the constructor itself starts empty). Definite failures, conflicts and
 validation errors do not poison. A no-op (replay, identical
 fill, a known exchange id, a confirming report, an ambiguous outcome superseded
 by fills, the current position) does not commit. Store validation errors are
@@ -50,6 +50,12 @@ Intent idempotency: one record per ``intent_id``. Registering an intent equal
 unchanged: no new Order, client id or revision, whatever the new decision. A
 different intent under the same ``intent_id``, or an approved placement whose
 ``client_order_id`` is already taken, raises ``PlacementConflictError``.
+
+Startup (``InMemoryAccountState.hydrate``, docs/ARCHITECTURE.md 12): a new
+account state from the durable state; the locally provable crash classification
+(``app.execution.recovery``: NEW -> FAILED, SUBMITTING -> UNKNOWN) is committed
+in ONE change before the account state exists. Every position starts unknown.
+Hydrated is not recovered, recovered is not safe to trade.
 
 Positions: ``None`` (no entry) = unknown / not reconciled; ``0`` = known flat;
 ``> 0`` long, ``< 0`` short. A missing entry is never read as flat. Until
@@ -105,6 +111,7 @@ from datetime import datetime
 from decimal import Decimal, DecimalException
 from typing import Any, Final, TypeVar
 
+from app.domain.clock import Clock
 from app.domain.enums import OrderStatus
 from app.domain.errors import DomainValidationError, InvalidOrderTransition
 from app.domain.fill_math import accumulate_execution
@@ -117,9 +124,17 @@ from app.execution.models import ExchangeOrderState, PlacementRecord, Submission
 from app.execution.persistence import (
     AccountStateChange,
     AccountStateStore,
+    PersistedAccountState,
     PersistedOrderNotional,
     PersistedPosition,
     StoreUncertainError,
+)
+from app.execution.recovery import (
+    classify_orders_after_crash,
+    needs_crash_classification,
+    recovery_change,
+    recovery_time,
+    validate_persisted_account_state,
 )
 from app.portfolio.positions import PositionStateError, position_after_fill
 from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
@@ -782,6 +797,35 @@ class LockedAccountState:
             )
 
 
+def _require_store(store: AccountStateStore) -> AccountStateStore:
+    if not callable(getattr(store, "commit", None)) or not callable(getattr(store, "load", None)):
+        raise DomainValidationError("store must provide load() and commit()")
+    return store
+
+
+def _runtime_state(snapshot: PersistedAccountState, change: AccountStateChange | None) -> _State:
+    """The runtime state of a validated snapshot after its recovery ``change``.
+
+    Orders, placements, fills and exact notionals are taken as stored (nothing
+    is recomputed), the classified orders replace theirs in place (the
+    reservation order is kept). Positions are deliberately left out: every
+    position reads as unknown until exchange reconciliation.
+    """
+    orders = dict(snapshot.orders)
+    revision = snapshot.revision
+    if change is not None:
+        orders.update((order.client_order_id, order) for order in change.order_writes)
+        revision = change.new_revision
+    return _State(
+        orders=orders,
+        notionals=dict(snapshot.notionals),
+        placements=dict(snapshot.placements),
+        positions={},
+        fills=dict(snapshot.fills),
+        revision=revision,
+    )
+
+
 class InMemoryAccountState:
     """Local risk-relevant state of one account (orders, placements, positions,
     fills, revision), guarded by its single account lock."""
@@ -789,18 +833,64 @@ class InMemoryAccountState:
     __slots__ = ("_account_scope_id", "_holder", "_lock", "_poisoned", "_state", "_store")
 
     def __init__(self, *, account_scope_id: str, store: AccountStateStore) -> None:
+        """An EMPTY account state (revision 0, nothing known). Use ``hydrate`` to
+        start from the durable state of an account."""
         self._account_scope_id = require_text(account_scope_id, "account_scope_id")
-        if not callable(getattr(store, "commit", None)) or not callable(
-            getattr(store, "load", None)
-        ):
-            raise DomainValidationError("store must provide load() and commit()")
-        self._store = store
+        self._store = _require_store(store)
         self._lock = asyncio.Lock()
         self._holder: asyncio.Task[Any] | None = None
         self._state = _State()
         # Runtime-only (not durable, not revision, not TradingState): set when a
         # commit outcome is unknown; there is deliberately no API to clear it.
         self._poisoned = False
+
+    @classmethod
+    async def hydrate(
+        cls, *, account_scope_id: str, store: AccountStateStore, clock: Clock
+    ) -> InMemoryAccountState:
+        """A NEW account state built from the durable state of ``account_scope_id``.
+
+        ``store.load`` -> validation -> local crash classification
+        (``app.execution.recovery``: NEW -> FAILED, SUBMITTING -> UNKNOWN, all
+        other statuses kept) -> if anything changed, ONE durable commit at
+        revision + 1 with exactly the transitioned orders -> construction. The
+        clock is read once, and only when an order must be classified. No
+        account (``load`` returns None) gives an empty state, without a commit.
+
+        Every position is UNKNOWN in the runtime state, also one persisted as
+        known (the durable record is not rewritten): after a restart no
+        position is known until exchange position reconciliation.
+
+        Nothing is retried. A load, clock or store error (commit, conflict,
+        uncertain) propagates unchanged, a corrupt or foreign snapshot raises
+        ``AccountHydrationError``; in every failure case no account state is
+        created (none poisoned either: a later hydration re-reads the store).
+        Existing account states, poisoned or not, are never touched.
+
+        Hydrated is not recovered, and recovered is not safe to trade: UNKNOWN
+        orders, missing fills and positions still need exchange reconciliation;
+        there is no readiness flag. One writer per account scope is the
+        caller's invariant (no global recovery lock); the revision CAS rejects
+        a concurrent hydration's commit.
+        """
+        require_text(account_scope_id, "account_scope_id")
+        _require_store(store)
+        if not callable(getattr(clock, "now", None)):
+            raise DomainValidationError("clock must provide now()")
+        loaded = await store.load(account_scope_id=account_scope_id)
+        if loaded is None:
+            return cls(account_scope_id=account_scope_id, store=store)
+        snapshot = validate_persisted_account_state(loaded, account_scope_id=account_scope_id)
+        changed: tuple[Order, ...] = ()
+        if needs_crash_classification(snapshot.orders):
+            changed = classify_orders_after_crash(snapshot.orders, at=recovery_time(clock))
+        change = recovery_change(snapshot, changed)
+        if change is not None:
+            await store.commit(change)
+        # Constructed and published only after the recovery commit succeeded.
+        account = cls(account_scope_id=account_scope_id, store=store)
+        account._state = _runtime_state(snapshot, change)
+        return account
 
     @property
     def account_scope_id(self) -> str:
@@ -809,8 +899,8 @@ class InMemoryAccountState:
 
     @property
     def is_poisoned(self) -> bool:
-        """True after an uncertain durable commit; the only way back is a reload of
-        a new account state from durable storage (not available yet)."""
+        """True after an uncertain durable commit; the only way back is a NEW
+        account state from ``hydrate`` (this one stays poisoned)."""
         return self._poisoned
 
     @asynccontextmanager

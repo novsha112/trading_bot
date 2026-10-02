@@ -114,6 +114,7 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.risk.models",
             "app.execution.models",
             "app.execution.persistence",
+            "app.execution.recovery",
             "app.portfolio.positions",
         }
     ),
@@ -151,9 +152,23 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     # Execution-owned persistence port: domain and execution's own models only
     # (never an adapter, codecs, driver or runtime layer).
     "execution.persistence": frozenset({"app.domain", "app.execution.models"}),
+    # Execution-owned invariants of a durable account (shared by adapters and
+    # hydration): domain, execution models and the port only.
+    "execution.state_invariants": frozenset(
+        {"app.domain", "app.execution.models", "app.execution.persistence"}
+    ),
+    # Local crash classification at startup: no exchange abstraction, no network.
+    "execution.recovery": frozenset(
+        {"app.domain", "app.execution.persistence", "app.execution.state_invariants"}
+    ),
     # Reference store adapter: implements the execution-owned port.
     "persistence.memory": frozenset(
-        {"app.domain", "app.execution.models", "app.execution.persistence"}
+        {
+            "app.domain",
+            "app.execution.models",
+            "app.execution.persistence",
+            "app.execution.state_invariants",
+        }
     ),
 }
 

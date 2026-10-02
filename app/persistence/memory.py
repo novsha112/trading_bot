@@ -20,7 +20,9 @@ as a whole, or not at all:
    carries the intent's terms; a fill belongs to an existing order (same symbol
    and side, compatible exchange id); every order has exactly one notional, zero
    exactly when nothing is filled; a dangling reference is a
-   ``StoreValidationError``.
+   ``StoreValidationError``. These reference invariants are execution-owned
+   (``app.execution.state_invariants``): this adapter reuses them, startup
+   hydration applies the same checks to a loaded snapshot.
 
 Transition legality stays with the domain / account layer: the store never
 replays the state machine and never computes values.
@@ -56,6 +58,7 @@ from app.execution.persistence import (
     StoreUncertainError,
     StoreValidationError,
 )
+from app.execution.state_invariants import check_account_references, identical
 
 _T = TypeVar("_T")
 
@@ -87,11 +90,6 @@ class _Account:
         )
 
 
-def _identical(left: object, right: object) -> bool:
-    """Equal and equally represented (exact Decimal digits / exponent / sign)."""
-    return left == right and repr(left) == repr(right)
-
-
 def _no_duplicates(items: tuple[_T, ...], identity: str, label: str) -> None:
     seen: set[object] = set()
     for item in items:
@@ -105,7 +103,7 @@ def _write_immutable(store: dict[str, _T], key: str, item: _T, label: str) -> No
     existing = store.get(key)
     if existing is None:
         store[key] = item
-    elif not _identical(existing, item):
+    elif not identical(existing, item):
         raise StoreConflictError(f"{label} {key!r} is already stored with different data")
 
 
@@ -118,79 +116,11 @@ def _write_order(orders: dict[str, Order], order: Order) -> None:
             f"order {order.client_order_id} version {order.version} is older than the "
             f"stored version {existing.version}"
         )
-    elif not _identical(existing, order):
+    elif not identical(existing, order):
         raise StoreConflictError(
             f"order {order.client_order_id} version {order.version} is already stored "
             "with different data"
         )
-
-
-_INTENT_TERMS = (
-    "strategy_id",
-    "symbol",
-    "side",
-    "order_type",
-    "price",
-    "qty",
-    "time_in_force",
-    "reduce_only",
-)
-
-
-def _check_references(account: _Account) -> None:
-    placed: dict[str, str] = {}
-    for record in account.placements.values():
-        cid = record.client_order_id
-        if cid is None:
-            continue
-        if cid in placed:
-            raise StoreConflictError(
-                f"client_order_id {cid} belongs to intents {placed[cid]} and {record.intent_id}"
-            )
-        placed[cid] = record.intent_id
-        order = account.orders.get(cid)
-        if order is None:
-            raise StoreValidationError(f"approved placement {record.intent_id}: no order {cid}")
-        for term in _INTENT_TERMS:
-            if not _identical(getattr(order, term), getattr(record.intent, term)):
-                raise StoreValidationError(
-                    f"order {cid} {term} does not match its placement {record.intent_id}"
-                )
-    exchange_ids: dict[str, str] = {}
-    for order in account.orders.values():
-        if order.exchange_order_id is not None:
-            other = exchange_ids.setdefault(order.exchange_order_id, order.client_order_id)
-            if other != order.client_order_id:
-                raise StoreConflictError(
-                    f"exchange_order_id {order.exchange_order_id} belongs to orders "
-                    f"{other} and {order.client_order_id}"
-                )
-        notional = account.notionals.get(order.client_order_id)
-        if notional is None:
-            raise StoreValidationError(f"order {order.client_order_id} has no filled notional")
-        if (notional == 0) != (order.filled_qty == 0):
-            raise StoreValidationError(
-                f"order {order.client_order_id}: filled notional {notional} is inconsistent "
-                f"with filled_qty {order.filled_qty}"
-            )
-    for cid in account.notionals:
-        if cid not in account.orders:
-            raise StoreValidationError(f"filled notional for unknown order {cid}")
-    for fill in account.fills.values():
-        if fill.client_order_id is None:
-            raise StoreValidationError(f"fill {fill.exec_id} has no client_order_id")
-        order = account.orders.get(fill.client_order_id)
-        if order is None:
-            raise StoreValidationError(f"fill {fill.exec_id}: no order {fill.client_order_id}")
-        if order.symbol != fill.symbol or order.side is not fill.side:
-            raise StoreValidationError(
-                f"fill {fill.exec_id} does not match order {order.client_order_id}"
-            )
-        if order.exchange_order_id not in (None, fill.exchange_order_id):
-            raise StoreValidationError(
-                f"fill {fill.exec_id} exchange_order_id {fill.exchange_order_id} differs "
-                f"from order {order.client_order_id}"
-            )
 
 
 def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
@@ -217,7 +147,12 @@ def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
         account.positions[position.symbol] = position
     for notional in change.notional_writes:
         account.notionals[notional.client_order_id] = notional.filled_notional
-    _check_references(account)
+    check_account_references(
+        placements=account.placements,
+        orders=account.orders,
+        fills=account.fills,
+        notionals=account.notionals,
+    )
     account.revision = change.new_revision
     return account
 

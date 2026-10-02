@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULES = (
     "app.execution.account_state",
     "app.execution.persistence",
+    "app.execution.state_invariants",
+    "app.execution.recovery",
     "app.persistence.memory",
     "app.services.placement",
     "app.execution.submitter",
