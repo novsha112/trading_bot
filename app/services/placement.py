@@ -108,6 +108,8 @@ class PlacementCoordinator:
         if type(intent) is not PlaceOrderIntent:
             raise DomainValidationError("intent must be a PlaceOrderIntent")
         async with self._account.account_lock() as locked:
+            # A poisoned account fails before replay, Risk, id generation or clock.
+            locked.ensure_mutations_allowed()
             replay = locked.replay_of(intent)
             if replay is not None:
                 return replay

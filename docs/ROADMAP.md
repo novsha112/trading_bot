@@ -156,7 +156,8 @@
 1. Persistence contract — **задокументовано**.
 2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище — **реалізовано** (`app/persistence/codecs.py`, лише stdlib).
 3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit) — **реалізовано**; власника порту виправлено: Protocol, моделі й помилки — `app/execution/persistence.py`, адаптер — `app/persistence/memory.py` (execution не імпортує persistence). Інтегровано в п. 4.
-4. Refactor стану акаунта на prepare / commit / publish — **реалізовано** (усі runtime-мутації durable до публікації; store передається явно; startup hydrate / recovery і poison flag — ще ні).
+4. Refactor стану акаунта на prepare / commit / publish — **реалізовано** (усі runtime-мутації durable до публікації; store передається явно).
+   - Uncertain-commit poisoning — **реалізовано**: `StoreUncertainError` атомарно отруює агрегат, подальші мутації й workflow fail closed; без API скидання. Startup hydrate / recovery — ще ні.
 5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі).
 6. `SafetyController` (durable latch + runtime-умови → effective `TradingState`).
 7. SQLite + Alembic (SQLAlchemy 2.x async Core, WAL + `synchronous=FULL`).

@@ -700,7 +700,9 @@ async def test_ack_persistence_failure_never_resends(failure: CommitFailure) -> 
     order = await account.order("c-1")
     assert order is not None
     assert (order.status, order.exchange_order_id) == (S.SUBMITTING, None)  # RAM: previous state
-    with pytest.raises(Exception, match="submitting"):
+    # Definite: the order is not NEW any more; uncertain: the account is poisoned.
+    again = "submitting" if failure is CommitFailure.DEFINITE else "poisoned"
+    with pytest.raises(Exception, match=again):
         await sender.submit(client_order_id="c-1")
     assert len(client.placed) == 1  # never sent again
 

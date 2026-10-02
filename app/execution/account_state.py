@@ -22,10 +22,17 @@ only after it returned publishes the new snapshot. Until then no reader sees the
 change: readers need the lock, which the mutation holds through the commit.
 The durable commit is the ONLY I/O awaited under the account lock; network
 calls are never awaited under it. A store error propagates and leaves the
-published state unchanged. After ``StoreUncertainError`` the durable state may
-be ahead of RAM (e.g. SUBMITTING durable, NEW in RAM): the caller must stop
-mutating this account and reload it; there is no runtime poison flag yet and no
-startup hydration (an account state starts empty). A no-op (replay, identical
+published state unchanged. ``StoreUncertainError`` (the durable state may now be
+ahead of RAM, e.g. SUBMITTING durable, NEW in RAM) additionally POISONS the
+account, atomically under the lock: the original error propagates, and every
+later mutation fails with ``AccountStatePoisonedError`` before any change is
+prepared or the store is called; workflows check ``ensure_mutations_allowed``
+right after taking the lock. Reads keep working on the last confirmed RAM
+snapshot, for diagnostics only. Poison is runtime-only (not durable, not the
+revision, not a TradingState) and has no reset API: the only way back is a new
+account state reloaded from durable storage (startup hydration does not exist
+yet; an account state starts empty). Definite failures, conflicts and
+validation errors do not poison. A no-op (replay, identical
 fill, a known exchange id, a confirming report, an ambiguous outcome superseded
 by fills, the current position) does not commit. Store validation errors are
 invariant bugs and propagate as such.
@@ -112,6 +119,7 @@ from app.execution.persistence import (
     AccountStateStore,
     PersistedOrderNotional,
     PersistedPosition,
+    StoreUncertainError,
 )
 from app.portfolio.positions import PositionStateError, position_after_fill
 from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
@@ -185,6 +193,12 @@ class MissingFillsError(AccountStateError):
     applied first (Order and position stay consistent); nothing was changed."""
 
 
+class AccountStatePoisonedError(AccountStateError):
+    """A durable commit of this account had an unknown outcome earlier: the store
+    may be ahead of RAM, so no further mutation (or workflow meant to mutate) is
+    allowed until the account is reloaded from durable state."""
+
+
 class SubmissionOutcomeConflictError(AccountStateError):
     """A definite transport outcome (not sent / rejected) contradicts exchange
     progress already observed for the order; the stronger state was kept."""
@@ -239,6 +253,30 @@ class LockedAccountState:
             raise AccountLockError("handle used after the account lock was released")
         return self._owner._state
 
+    @property
+    def is_poisoned(self) -> bool:
+        """True after an uncertain durable commit: reads still work (the last
+        confirmed RAM snapshot, for diagnostics only) but mutations fail."""
+        self._live()
+        return self._owner._poisoned
+
+    def ensure_mutations_allowed(self) -> None:
+        """Raise ``AccountStatePoisonedError`` if this account is poisoned. Workflows
+        that would mutate the account (placement, submission, reconciliation) call
+        it right after taking the lock, before any evaluation, id, clock or
+        network use."""
+        self._live()
+        if self._owner._poisoned:
+            raise AccountStatePoisonedError(
+                f"account {self._owner.account_scope_id} is poisoned by an uncertain "
+                "durable commit: reload it from durable state before any mutation"
+            )
+
+    def _mutable(self) -> _State:
+        """The single gate of every mutation: live handle and not poisoned."""
+        self.ensure_mutations_allowed()
+        return self._live()
+
     def _change(self, state: _State, *, new_revision: int, **writes: Any) -> AccountStateChange:
         return AccountStateChange(
             account_scope_id=self._owner.account_scope_id,
@@ -254,8 +292,14 @@ class LockedAccountState:
         published state stays ``current``; after ``StoreUncertainError`` the
         durable state may be ahead of RAM: the caller must stop mutating and
         reload (no runtime poison flag yet)."""
-        self._live()
-        await self._owner._store.commit(change)
+        self._mutable()
+        try:
+            await self._owner._store.commit(change)
+        except StoreUncertainError:
+            # Still under the account lock: no other task can act on RAM that may
+            # now be behind the durable state. The prepared state is discarded.
+            self._owner._poisoned = True
+            raise
         if self._owner._state is not current:  # pragma: no cover - lock invariant
             raise AccountStateError("account state changed during a commit")
         self._owner._state = prepared
@@ -322,7 +366,7 @@ class LockedAccountState:
         ``at`` is the reservation time (the caller's clock, not before the intent
         was created). Returns the recorded result on a replay.
         """
-        state = self._live()
+        state = self._mutable()
         self._require_inputs(intent, decision, expected_revision, approved=True)
         require_text(client_order_id, "client_order_id")
         require_utc(at, "at")
@@ -382,7 +426,7 @@ class LockedAccountState:
         self, *, intent: PlaceOrderIntent, decision: RiskDecision, expected_revision: int
     ) -> PlacementRecord:
         """Record a rejected intent: no Order, no revision change."""
-        state = self._live()
+        state = self._mutable()
         self._require_inputs(intent, decision, expected_revision, approved=False)
         replay = self._replay(state, intent)
         if replay is not None:
@@ -401,7 +445,7 @@ class LockedAccountState:
 
         +1 revision when the value changes; setting the current value is a no-op.
         """
-        state = self._live()
+        state = self._mutable()
         require_text(symbol, "symbol")
         if qty is not None and (type(qty) is not Decimal or not qty.is_finite()):
             raise DomainValidationError("position qty must be a finite, exact Decimal or None")
@@ -437,7 +481,7 @@ class LockedAccountState:
     async def mark_submitting(self, client_order_id: str, *, at: datetime) -> Order:
         """Write-ahead ``NEW -> SUBMITTING`` before a placement request may be sent
         (docs/ARCHITECTURE.md 7.2); +1 revision. Nothing is sent here."""
-        state = self._live()
+        state = self._mutable()
         order = self._existing(state, client_order_id)
         updated = transition(order, OrderStatus.SUBMITTING, at=at)
         return await self._publish_order(state, updated)
@@ -455,7 +499,7 @@ class LockedAccountState:
         never sent / definitely not accepted (NEW, FAILED, REJECTED). The caller
         matches the ack's ``client_order_id`` to this order.
         """
-        state = self._live()
+        state = self._mutable()
         order = self._existing(state, client_order_id)
         require_text(exchange_order_id, "exchange_order_id")
         if order.status in _ACK_CONTRADICTING_STATUSES:
@@ -484,7 +528,7 @@ class LockedAccountState:
         nothing, while NOT_SENT / REJECTED contradict the observed facts and raise
         ``SubmissionOutcomeConflictError``; the state is never rolled back.
         """
-        state = self._live()
+        state = self._mutable()
         order = self._existing(state, client_order_id)
         if type(outcome) is not SubmissionOutcome:
             raise DomainValidationError("outcome must be a SubmissionOutcome")
@@ -515,7 +559,7 @@ class LockedAccountState:
         ``exchange_order_id``; an identical report is a no-op. +1 revision only
         for a real change.
         """
-        state = self._live()
+        state = self._mutable()
         if type(report) is not ExchangeOrderState:
             raise DomainValidationError("report must be an ExchangeOrderState")
         order = self._existing(state, report.client_order_id)
@@ -585,7 +629,7 @@ class LockedAccountState:
         exchange time becomes the order's ``last_exchange_update_ts``. Returns the
         order after the fill (the current order for an identical replay).
         """
-        state = self._live()
+        state = self._mutable()
         if type(fill) is not Fill:
             raise DomainValidationError("fill must be a domain Fill")
         require_utc(at, "at")
@@ -742,7 +786,7 @@ class InMemoryAccountState:
     """Local risk-relevant state of one account (orders, placements, positions,
     fills, revision), guarded by its single account lock."""
 
-    __slots__ = ("_account_scope_id", "_holder", "_lock", "_state", "_store")
+    __slots__ = ("_account_scope_id", "_holder", "_lock", "_poisoned", "_state", "_store")
 
     def __init__(self, *, account_scope_id: str, store: AccountStateStore) -> None:
         self._account_scope_id = require_text(account_scope_id, "account_scope_id")
@@ -754,11 +798,20 @@ class InMemoryAccountState:
         self._lock = asyncio.Lock()
         self._holder: asyncio.Task[Any] | None = None
         self._state = _State()
+        # Runtime-only (not durable, not revision, not TradingState): set when a
+        # commit outcome is unknown; there is deliberately no API to clear it.
+        self._poisoned = False
 
     @property
     def account_scope_id(self) -> str:
         """The account scope of every durable change (the single source of truth)."""
         return self._account_scope_id
+
+    @property
+    def is_poisoned(self) -> bool:
+        """True after an uncertain durable commit; the only way back is a reload of
+        a new account state from durable storage (not available yet)."""
+        return self._poisoned
 
     @asynccontextmanager
     async def account_lock(self) -> AsyncIterator[LockedAccountState]:

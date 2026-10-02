@@ -26,8 +26,8 @@ it is visible. A store error before the network leaves the order NEW and sends
 nothing. A store error after the network propagates (the transport exception,
 if any, stays as its ``__context__``); the published order keeps its previous
 state, the request is never re-sent and the exchange is never "rolled back".
-After ``StoreUncertainError`` the account state must not be mutated further
-until reloaded (no runtime poison flag yet).
+``StoreUncertainError`` poisons the account state: later submissions fail with
+``AccountStatePoisonedError`` before the clock, the marker or the network.
 
 Time: the submission time is one clock read in phase A. The outcome time is read
 in phase C, but a clock failure or an invalid / earlier value there falls back
@@ -87,6 +87,8 @@ class OrderSubmitter:
         its outcome."""
         require_text(client_order_id, "client_order_id")
         async with self._account.account_lock() as locked:
+            # A poisoned account fails before the clock, the marker or the network.
+            locked.ensure_mutations_allowed()
             order = locked.order(client_order_id)
             if order is None:
                 raise AccountStateError(f"no local order {client_order_id}")

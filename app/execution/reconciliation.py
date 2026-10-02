@@ -117,6 +117,8 @@ class UnknownOrderReconciler:
         """Read the exchange state of the UNKNOWN order once and apply it."""
         require_text(client_order_id, "client_order_id")
         async with self._account.account_lock() as locked:
+            # The read is meant to mutate the account: a poisoned account stops here.
+            locked.ensure_mutations_allowed()
             order = locked.order(client_order_id)
             if order is None:
                 raise AccountStateError(f"no local order {client_order_id}")
