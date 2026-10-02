@@ -1,6 +1,7 @@
 """Persistence (docs/ARCHITECTURE.md 11, 11.0).
 
-Pure storage codecs (exact Decimal, UTC datetime) and the account state store
-contract with its deterministic in-memory reference implementation. No database
-driver or migrations yet; the execution layer does not use the store yet.
+Storage adapters of the execution-owned persistence port
+(``app.execution.persistence``) and physical-storage codecs: pure codecs (exact
+Decimal, UTC datetime) and the deterministic in-memory reference store. No
+database driver or migrations yet; the execution layer does not use a store yet.
 """

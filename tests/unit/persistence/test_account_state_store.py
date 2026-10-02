@@ -17,25 +17,22 @@ from app.domain.fills import Fill
 from app.domain.intents import PlaceOrderIntent
 from app.domain.order_state import transition
 from app.domain.orders import Order
+from app.execution import persistence as port_module
 from app.execution.models import PlacementRecord
-from app.persistence import memory as memory_module
-from app.persistence import models as models_module
-from app.persistence import protocols as protocols_module
-from app.persistence.errors import (
+from app.execution.persistence import (
+    AccountStateChange,
+    AccountStateStore,
+    PersistedAccountState,
+    PersistedOrderNotional,
+    PersistedPosition,
     PersistenceStoreError,
     StoreCommitError,
     StoreConflictError,
     StoreUncertainError,
     StoreValidationError,
 )
+from app.persistence import memory as memory_module
 from app.persistence.memory import CommitFailure, InMemoryAccountStateStore
-from app.persistence.models import (
-    AccountStateChange,
-    PersistedAccountState,
-    PersistedOrderNotional,
-    PersistedPosition,
-)
-from app.persistence.protocols import AccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, RiskReason
 
 D = Decimal
@@ -907,11 +904,11 @@ def _imports(module: Any) -> set[str]:
 
 
 def test_store_modules_have_no_driver_codec_or_runtime_dependencies() -> None:
-    for module in (models_module, protocols_module, memory_module):
+    for module in (port_module, memory_module):
         for name in _imports(module):
             assert not name.startswith(
                 ("app.exchanges", "app.services", "app.risk.manager", "app.config")
             ), name
             assert name.split(".")[0] not in {"sqlalchemy", "sqlite3", "random", "time"}, name
         assert "app.persistence.codecs" not in _imports(module)  # codecs belong to a DB adapter
-    assert "app.persistence.memory" not in _imports(protocols_module)
+    assert not any(name.startswith("app.persistence") for name in _imports(port_module))

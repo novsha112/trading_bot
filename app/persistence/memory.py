@@ -1,5 +1,6 @@
-"""Deterministic in-memory ``AccountStateStore``: the reference implementation and
-test fake of the store contract. NOT durable storage (lost with the process).
+"""Deterministic in-memory ``AccountStateStore``: the reference adapter and test
+fake of the execution-owned persistence port (``app.execution.persistence``).
+NOT durable storage (lost with the process).
 
 It models the future database constraints within each ``account_scope_id``:
 unique ``intent_id`` (placements), ``client_order_id`` (orders, notionals and
@@ -46,16 +47,14 @@ from typing import TypeVar
 from app.domain.fills import Fill
 from app.domain.orders import Order
 from app.execution.models import PlacementRecord
-from app.persistence.errors import (
+from app.execution.persistence import (
+    AccountStateChange,
+    PersistedAccountState,
+    PersistedPosition,
     StoreCommitError,
     StoreConflictError,
     StoreUncertainError,
     StoreValidationError,
-)
-from app.persistence.models import (
-    AccountStateChange,
-    PersistedAccountState,
-    PersistedPosition,
 )
 
 _T = TypeVar("_T")

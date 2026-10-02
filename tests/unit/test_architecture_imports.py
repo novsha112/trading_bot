@@ -35,8 +35,8 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     # portfolio never import execution.
     "execution": frozenset({"domain", "exchanges", "risk", "portfolio"}),
     "portfolio": frozenset({"domain"}),
-    # Persisted account aggregate reuses execution's PlacementRecord; execution
-    # never imports persistence.
+    # Adapters implement the execution-owned persistence port; execution never
+    # imports persistence (dependency inversion).
     "persistence": frozenset({"domain", "execution"}),
     # Orchestration / infrastructure packages: restrictions will be refined as
     # their modules appear.
@@ -140,20 +140,12 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "execution.timing": frozenset({"app.domain"}),
     # Storage codecs: no app module at all (not even the domain).
     "persistence.codecs": frozenset(),
-    # Store contract: errors stand alone; models reuse domain / execution records;
-    # the Protocol knows only the models; the in-memory store implements them.
-    "persistence.errors": frozenset(),
-    "persistence.models": frozenset(
-        {"app.domain", "app.execution.models", "app.persistence.errors"}
-    ),
-    "persistence.protocols": frozenset({"app.persistence.models"}),
+    # Execution-owned persistence port: domain and execution's own models only
+    # (never an adapter, codecs, driver or runtime layer).
+    "execution.persistence": frozenset({"app.domain", "app.execution.models"}),
+    # Reference store adapter: implements the execution-owned port.
     "persistence.memory": frozenset(
-        {
-            "app.domain",
-            "app.execution.models",
-            "app.persistence.errors",
-            "app.persistence.models",
-        }
+        {"app.domain", "app.execution.models", "app.execution.persistence"}
     ),
 }
 
@@ -1179,49 +1171,69 @@ def test_persistence_codecs_allowed_imports(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("relative", "source"),
     [
+        # The execution package never imports persistence, from any module.
+        ("execution/account_state.py", "from app.persistence.memory import X\n"),
         (
-            "persistence/protocols.py",
+            "execution/persistence.py",
             "from app.persistence.memory import InMemoryAccountStateStore\n",
         ),
-        ("persistence/models.py", "from app.execution.account_state import InMemoryAccountState\n"),
-        ("persistence/models.py", "from app.persistence.codecs import encode_decimal\n"),
+        ("execution/persistence.py", "from app.persistence.codecs import encode_decimal\n"),
+        ("execution/submitter.py", "import app.persistence\n"),
+        ("execution/reconciliation.py", "from app.persistence import codecs\n"),
+        ("execution/models.py", "from app.persistence.memory import CommitFailure\n"),
+        ("execution/new_module.py", "from app.persistence.memory import X\n"),
+        # The port needs no runtime layer, adapter or library.
+        (
+            "execution/persistence.py",
+            "from app.execution.account_state import InMemoryAccountState\n",
+        ),
+        ("execution/persistence.py", "from app.exchanges.models import OrderRequest\n"),
+        ("execution/persistence.py", "from app.exchanges.simulated import SimulatedExchange\n"),
+        ("execution/persistence.py", "from app.services.placement import X\n"),
+        ("execution/persistence.py", "from app.risk.manager import evaluate\n"),
+        ("execution/persistence.py", "from app.config.settings import EnvSettings\n"),
+        ("execution/persistence.py", "import sqlalchemy\n"),
+        ("execution/persistence.py", "import aiosqlite\n"),
+        # The memory adapter stays an adapter.
         ("persistence/memory.py", "from app.persistence.codecs import encode_decimal\n"),
+        ("persistence/memory.py", "from app.execution.account_state import InMemoryAccountState\n"),
         ("persistence/memory.py", "from app.risk.manager import evaluate\n"),
-        ("persistence/memory.py", "from app.exchanges.simulated import SimulatedExchange\n"),
         ("persistence/memory.py", "from app.services.placement import X\n"),
-        ("persistence/memory.py", "from app.config.settings import EnvSettings\n"),
         ("persistence/memory.py", "import sqlalchemy\n"),
-        ("persistence/errors.py", "from app.domain.errors import DomainError\n"),
-        ("execution/account_state.py", "from app.persistence.protocols import AccountStateStore\n"),
     ],
 )
-def test_persistence_store_violations(tmp_path: Path, relative: str, source: str) -> None:
+def test_persistence_port_violations(tmp_path: Path, relative: str, source: str) -> None:
     root = tmp_path / "app"
     _write(root, relative, source)
 
     assert find_violations(root), source
 
 
-def test_persistence_store_allowed_imports(tmp_path: Path) -> None:
+def test_persistence_port_allowed_imports(tmp_path: Path) -> None:
     root = tmp_path / "app"
-    _write(root, "persistence/errors.py", "from __future__ import annotations\n")
     _write(
         root,
-        "persistence/models.py",
-        "from app.domain.orders import Order\n"
-        "from app.execution.models import PlacementRecord\n"
-        "from app.persistence.errors import StoreValidationError\n",
-    )
-    _write(
-        root,
-        "persistence/protocols.py",
-        "from typing import Protocol\nfrom app.persistence.models import AccountStateChange\n",
+        "execution/persistence.py",
+        "from typing import Protocol\nfrom app.domain.orders import Order\n"
+        "from app.execution.models import PlacementRecord\n",
     )
     _write(
         root,
         "persistence/memory.py",
-        "import asyncio\nfrom app.persistence.models import AccountStateChange\n"
-        "from app.persistence.errors import StoreConflictError\n",
+        "import asyncio\nfrom app.domain.fills import Fill\n"
+        "from app.execution.models import PlacementRecord\n"
+        "from app.execution.persistence import AccountStateChange, StoreConflictError\n",
     )
 
     assert find_violations(root) == []
+
+
+def test_real_execution_package_never_imports_persistence() -> None:
+    execution = APP_ROOT / "execution"
+    for path in sorted(execution.rglob("*.py")):
+        module = _module_name(path, APP_ROOT)
+        imports, _ = _imported_modules(
+            path.read_text(encoding="utf-8"), module, is_package=path.name == "__init__.py"
+        )
+        offending = [name for name in imports if name.split(".")[:2] == ["app", "persistence"]]
+        assert offending == [], (module, offending)

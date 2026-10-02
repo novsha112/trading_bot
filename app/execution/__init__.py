@@ -3,5 +3,7 @@
 The in-memory account state (docs/ARCHITECTURE.md 7.0, the account-level
 serialization boundary), the single-attempt order submission lifecycle (7.2)
 and single-shot UNKNOWN reconciliation (7.3) through the ``TradingClient``
-abstraction. No retries, recovery, full reconciliation or persistence yet.
+abstraction, and the account-state persistence port (``persistence.py``) that
+storage adapters implement; this package never imports ``app.persistence``. No
+retries, recovery, full reconciliation or store integration yet.
 """

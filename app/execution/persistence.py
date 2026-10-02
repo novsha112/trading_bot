@@ -1,8 +1,18 @@
-"""Persisted representation of the risk-relevant account aggregate.
+"""The account-state persistence port, owned by the execution layer.
 
-Reuses the domain and execution models as they are (``PlacementRecord``,
-``Order``, ``Fill``); only what has no model yet is defined here:
+The execution / account-state layer defines what it needs from durable storage;
+storage adapters implement it (dependency inversion, docs/ARCHITECTURE.md 11.0)::
 
+    domain <- execution (this port) <- app.persistence adapters (memory, later SQL)
+
+``app.execution`` never imports ``app.persistence``. The port uses the standard
+library, the domain and execution's own models only.
+
+* ``AccountStateStore``: one transactional boundary for the whole risk-relevant
+  account aggregate (not per-table repositories). NOT a multi-writer
+  coordination mechanism: the account aggregate serializes its mutations (one
+  writer per account scope in V1); ``expected_revision`` is a compare-and-set
+  guard against stale state.
 * ``PersistedPosition``: an explicit position marker. ``known=False`` -> ``qty``
   is None; ``known=True`` -> ``qty`` is an exact finite ``Decimal`` (0 included).
   An unknown position is never encoded by absence.
@@ -10,9 +20,12 @@ Reuses the domain and execution models as they are (``PlacementRecord``,
   (``sum(price * qty)`` of its fills): an exact, finite ``Decimal`` >= 0.
 * ``AccountStateChange``: one atomic change set, guarded by ``expected_revision``.
 * ``PersistedAccountState``: an immutable snapshot of one account's durable state.
+* Errors of the port: ``PersistenceStoreError`` and its four outcomes, so callers
+  handle them without importing an adapter.
 
 Values are kept as the exact objects given: no arithmetic, rounding or encoding
-(codecs belong to a physical database adapter).
+(codecs belong to a physical database adapter). ``PlacementRecord``, ``Order``
+and ``Fill`` are reused as they are.
 """
 
 from __future__ import annotations
@@ -21,12 +34,35 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from app.domain.fills import Fill
 from app.domain.orders import Order
 from app.execution.models import PlacementRecord
-from app.persistence.errors import StoreValidationError
+
+
+class PersistenceStoreError(Exception):
+    """Base class of account state store errors."""
+
+
+class StoreValidationError(PersistenceStoreError):
+    """The change set is malformed (types, revisions, references); nothing was
+    written. A caller bug, never a storage condition."""
+
+
+class StoreConflictError(PersistenceStoreError):
+    """The change contradicts the durable state (stale ``expected_revision``, or
+    an identity already stored with different data); nothing was written."""
+
+
+class StoreCommitError(PersistenceStoreError):
+    """The commit definitely did not happen: the durable state is unchanged."""
+
+
+class StoreUncertainError(PersistenceStoreError):
+    """The outcome of the commit is unknown (it may have been applied in full).
+    The caller must treat its in-memory state as unusable until it reloads."""
+
 
 _T = TypeVar("_T")
 
@@ -170,3 +206,21 @@ class PersistedAccountState:
         # Defensive read-only copies: later changes to the given mappings are not seen.
         for name in ("placements", "orders", "fills", "positions", "notionals"):
             object.__setattr__(self, name, _frozen(getattr(self, name)))
+
+
+class AccountStateStore(Protocol):
+    async def load(self, *, account_scope_id: str) -> PersistedAccountState | None:
+        """The committed state of the account, or None if nothing was ever committed."""
+        ...
+
+    async def commit(self, change: AccountStateChange) -> None:
+        """Apply the whole change atomically, or nothing.
+
+        Raises:
+            StoreValidationError: malformed change (checked before anything else).
+            StoreConflictError: stale ``expected_revision`` or an identity already
+                stored with different data.
+            StoreCommitError: the commit definitely did not happen.
+            StoreUncertainError: the outcome is unknown; it may be fully applied.
+        """
+        ...

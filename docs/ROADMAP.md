@@ -155,7 +155,7 @@
 **Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–3):
 1. Persistence contract — **задокументовано**.
 2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище — **реалізовано** (`app/persistence/codecs.py`, лише stdlib).
-3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit) — **реалізовано** (`app/persistence/{protocols,models,errors,memory}.py`; ще не інтегровано зі станом акаунта).
+3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit) — **реалізовано**; власника порту виправлено: Protocol, моделі й помилки — `app/execution/persistence.py`, адаптер — `app/persistence/memory.py` (execution не імпортує persistence). Зі станом акаунта ще не інтегровано.
 4. Refactor стану акаунта на prepare / commit / publish.
 5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі).
 6. `SafetyController` (durable latch + runtime-умови → effective `TradingState`).
