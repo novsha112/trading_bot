@@ -150,11 +150,25 @@
 
 **Мета.** Надійне збереження стану й журналу.
 
+**Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізації ще немає.
+
+**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано лише п. 1):
+1. Persistence contract — **задокументовано**.
+2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище.
+3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit).
+4. Refactor стану акаунта на prepare / commit / publish.
+5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі).
+6. `SafetyController` (durable latch + runtime-умови → effective `TradingState`).
+7. SQLite + Alembic (SQLAlchemy 2.x async Core, WAL + `synchronous=FULL`).
+8. Можливість історії виконань (`get_executions` або еквівалент).
+9. `RecoveryCoordinator` (startup-послідовність ARCHITECTURE 12).
+10. PostgreSQL і hardening (advisory lock / file lock / lease).
+
 **Що реалізуємо.**
 - SQLAlchemy 2.x async, Alembic; SQLite (`aiosqlite`) і PostgreSQL (`asyncpg`).
 - Таблиці з розділу 11 ARCHITECTURE; унікальні ключі (`client_order_id`, `exec_id`).
-- Репозиторії: orders (+ order_events), fills, positions/balances snapshots, strategy_state (JSON + `schema_version`), grid_levels, bot/risk/reconciliation events, kill_switch_state.
-- Транзакційний запис «ордер + подія переходу».
+- `AccountStateStore` — одна транзакційна межа агрегату акаунта (placements, orders, fills, positions, revision); журнали (order / bot / risk / reconciliation events, snapshots, strategy_state, grid_levels, kill_switch_state) — append-only поруч.
+- Транзакційний запис за межами з ARCHITECTURE 11.0 (напр., fill + ордер + notional + позиція + revision).
 
 **Файли.** `app/persistence/{db,tables,unit_of_work}.py`; `app/persistence/repositories/*.py`; `migrations/`; `alembic.ini`.
 
@@ -310,7 +324,7 @@
 **Мета.** Бот коректно відновлюється після будь-якого рестарту і не торгує, якщо його стан не збігається з біржею.
 
 **Що реалізуємо.**
-- Послідовність запуску з розділу 12 ARCHITECTURE (буферизація private stream під час снапшоту).
+- Послідовність запуску з розділу 12 ARCHITECTURE (буферизація private stream під час снапшоту) і recovery-класифікація з 11.0; повний recovery залежить від можливості історії виконань (Phase 4, п. 8), без неї — PAUSED.
 - `Reconciler`: порівняння ордерів, позицій, балансу, fills; таблиця реакцій з розділу 13 ARCHITECTURE; `ReconciliationEvent`.
 - Тригери: старт, reconnect private stream, періодичний, після `FAILED` з `UNKNOWN`, ручний (CLI).
 - Персистентний стан `SimulatedExchange` для paper, щоб recovery перевірялося на paper до testnet.

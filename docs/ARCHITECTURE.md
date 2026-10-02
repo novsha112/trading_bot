@@ -700,11 +700,77 @@ risk:
 
 ## 11. Persistence
 
-- **SQLAlchemy 2.x** (async) + **Alembic**. SQLite (`aiosqlite`) для розробки, backtest і paper; PostgreSQL (`asyncpg`) для testnet-довгих прогонів і production.
-- Репозиторії — тонкі класи по одному на агрегат. Ніякої бізнес-логіки в репозиторіях.
+- **SQLAlchemy 2.x async Core** (без ORM для доменних сутностей) + **Alembic**. SQLite (`aiosqlite`) для розробки й durable-локальних запусків; PostgreSQL (`asyncpg`) для testnet-довгих прогонів і production. Залежності ще не додано (див. 11.0).
+- Ризик-релевантний стан акаунта зберігається **однією транзакційною межею** `AccountStateStore` (11.0), а не набором незалежних репозиторіїв. Журнали (`*_events`, snapshots, `strategy_state`) — окремі append-only записи; бізнес-логіки в persistence немає.
 - API-секрети в БД не зберігаються.
 
+### 11.0 Durable стан акаунта і recovery contract (затверджено; реалізації немає)
+
+Мета: після будь-якого падіння процесу бот **ніколи не вважає exposure меншою за реально можливу**.
+
+**Модель persistence (V1).** `prepare immutable next state → durable transaction commit → publish next state to RAM`. RAM ніколи не публікується раніше за успішний durable commit.
+- Definite commit failure (точно не закомічено): RAM лишається старим; операція завершується помилкою.
+- Uncertain commit outcome (результат commit невідомий): стан акаунта вважається **unusable / poisoned** — подальші мутації заборонені до reload / recovery з durable store; effective `TradingState` лишається PAUSED.
+
+**Write-ahead (обов'язковий інваріант).** `durable SUBMITTING commit` — **до** того, як може початися `place_order`. Якщо durable store не підтвердив SUBMITTING, мережева відправка заборонена. Звідси доказово: `durable NEW після рестарту → відправка не починалася → recovery NEW → FAILED` (за умов: єдиний шлях до `place_order` — `OrderSubmitter`; один writer; `client_order_id` ніколи не перевикористовується).
+
+**Порядок DB / RAM для мутації:** `account lock → прочитати поточний стан / revision → підготувати незмінний наступний стан → await durable commit, поки account lock утримується → при успіху опублікувати стан у RAM → unlock`. `await` commit БД під account lock дозволений і потрібний для серіалізації; `await` мережі під account lock як і раніше заборонений.
+
+**Межа мережі й БД.** `DB SUBMITTING → network → DB outcome`. Розподіленої транзакції з біржею немає; розрив між БД і біржею закриває консервативний стан **UNKNOWN**.
+
+**Атомарні транзакції** (кожен рядок — одна транзакція):
+
+| Операція | Зміни |
+|---|---|
+| схвалена резервація | `PlacementRecord` + `Order(NEW)` + revision |
+| маркер відправки | `Order(SUBMITTING)` + revision |
+| fill | Fill / `exec_id` + Order + точний виконаний notional + позиція + revision |
+| звіт біржі / результат відправки / ack | статус і метадані Order + revision |
+
+Order і позицію від одного fill **не можна** зберігати окремими транзакціями.
+
+**Revision.** Збережена revision акаунта — монотонно зростаюча версія закомічених змін локального ризик-релевантного стану; після рестарту не скидається. Commit — CAS за `expected_revision`. V1: один процес / один writer; writer token у кожній мутації зараз не проєктується.
+
+**Один writer.** Обмеження V1: **один writer-процес на `account_scope_id`**; два writers — непідтримувана конфігурація й помилка розгортання. Майбутнє посилення (не частина першої реалізації): PostgreSQL advisory lock, SQLite process / file lock, lease / takeover policy.
+
+**Архітектура.** Обрано `AccountStateStore` Protocol — одна транзакційна persistence-межа агрегату акаунта (ордери, placements, fills, позиції, revision). Не кілька незалежних репозиторіїв для мутацій Order / Fill / Position; не event sourcing. Стан акаунта не виконує SQL (dependency inversion).
+
+**Decimal.** Ризик-критичні Decimal ніколи не зберігаються як float (зокрема SQLite `NUMERIC` / `REAL`). Логічне представлення — **канонічний lossless decimal-текст** для qty, price, `avg_fill_price`, виконаного notional, позиції й збережених Decimal-полів exposure. Кодек приймає лише exact finite `Decimal`, відхиляє NaN / Infinity і робить round-trip без залежності від глобального decimal-контексту (експонента й хвостові нулі зберігаються).
+
+**Час.** Збережені мітки — UTC aware instants; naive datetime заборонені. SQLite — канонічний UTC-текст; PostgreSQL — `timestamptz`. Біржові та локальні мітки — окремі поля.
+
+**Позиція.** Durable-представлення **явно** розрізняє unknown / known flat / known long / known short; «немає рядка = unknown» не є єдиним механізмом. Логічно: `known: bool`, `qty: Decimal | None` з інваріантом `known=False → qty=None`, `known=True → qty` — скінченний Decimal (включно з 0). Після рестарту навіть збережене `known=True` **не** робить runtime-позицію актуальною: recovery тимчасово робить runtime-view невідомим до звірки з біржею.
+
+**Durable ідентичність** (переживає рестарт): `intent_id`, `client_order_id`, `exec_id`, `exchange_order_id`. Концептуальні обмеження: `UNIQUE(account_scope_id, intent_id)`, `UNIQUE(account_scope_id, client_order_id)`, `UNIQUE(account_scope_id, exec_id)`, `UNIQUE(account_scope_id, exchange_order_id) WHERE exchange_order_id IS NOT NULL`. Повтор intent після рестарту не викликає нову оцінку Risk (зберігаються й відхилені placements); повтор `exec_id` не застосовує fill удруге.
+
+**`client_order_id`.** Майбутній production-генератор — криптографічно стійкий випадковий ідентифікатор зі стабільним префіксом бота, у межах обмежень адаптера біржі; унікальність у БД — defense in depth. Простий збережений лічильник не є єдиним джерелом унікальності (стирання dev-БД призвело б до повтору id на біржі). Генератор ще не реалізовано.
+
+**Аудит політики.** `policy_id` — content-addressed або однозначно пов'язаний з хешем канонічного вмісту політики. Збережений placement / `RiskDecision` містить ідентичність / хеш політики, `snapshot_id`, reasons, результат exposure і сам intent: історичне рішення лишається поясненим після зміни поточної конфігурації.
+
+**TradingState.** Напрям: майбутній `SafetyController` володіє effective `TradingState` і поєднує durable / ручний safety latch з runtime-умовами (recovery, здоров'я store, reconciliation). Перша persistence-реалізація `SafetyController` не містить.
+
+**Пропущені fills.** `MissingFillsError` не можна обходити синтезом fills з `OrderUpdate`. Повний startup recovery потребує можливості історії виконань (`get_executions` або еквівалент). Доки її немає: `missing fills виявлено → recovery неповний → PAUSED`. Це не блокує реалізацію persistence foundation; Bybit-ендпоінт історії тут не проєктується.
+
+**Неоднозначність API позицій.** Відсутність символу в майбутньому `get_positions()` поки **не** трактується як flat: контракт адаптера має явно це гарантувати, перш ніж recovery зможе вважати відсутність запису відомим нулем.
+
+**UNKNOWN + not found.** Grace-політика не визначена; лишається поточна семантика: `UNKNOWN + authoritative not-found → нерозв'язаний UNKNOWN`, доки окрема політика не доведе безпечне звільнення резервації.
+
+**Довговічність SQLite.** Режим, що претендує на crash durability: `journal_mode=WAL`, `synchronous=FULL`. In-memory paper durability не обіцяє; persistent paper можна додати пізніше.
+
+**Логічна схема** (без DDL; DEC — канонічний decimal-текст, TS — UTC):
+
+| Сутність | Ключ | Головне |
+|---|---|---|
+| `accounts` | `account_scope_id` | revision (CAS), durable safety latch, мітки часу |
+| `policies` | `policy_id` | хеш і канонічний вміст політики |
+| `placements` | (`account_scope_id`, `intent_id`) | усі поля intent; рішення (approved, reasons, `snapshot_id`, `policy_id`, exposure DEC); `client_order_id` (NULL для відхилених), unique |
+| `orders` | (`account_scope_id`, `client_order_id`) | усі поля `Order` (DEC, TS, `version`); виконаний notional DEC; `exchange_order_id` unique, якщо не NULL |
+| `fills` | (`account_scope_id`, `exec_id`) | повний payload Fill; FK на ордер |
+| `positions` | (`account_scope_id`, `symbol`) | `known` bool, `qty` DEC NULL з інваріантом known ↔ qty |
+
 ### Таблиці
+
+Загальний перелік, включно з журналами. Для ризик-релевантного стану акаунта (placements, orders, fills, positions, accounts, policies) визначальні логічна схема й обмеження з 11.0 (наприклад, унікальність `exec_id` у межах `account_scope_id`).
 
 | Таблиця | Зміст | Особливості |
 |---|---|---|
@@ -726,6 +792,7 @@ risk:
 
 Якщо запис у БД неможливий, бот не може гарантувати write-ahead для ордерів. Тому:
 - помилка запису перед відправкою ордера → ордер **не відправляється**;
+- невизначений результат commit → стан акаунта poisoned, мутації заборонені до reload / recovery, effective `PAUSED` (11.0);
 - серія помилок БД → `PAUSED` + сповіщення (сповіщення працюють без БД).
 
 ---
@@ -737,18 +804,25 @@ risk:
 ```text
 1. Завантажити і валідувати конфігурацію; записати config hash (без секретів).
 2. Preflight (розділ 16.3 для live; спрощений для testnet/paper).
-3. Перевірити kill_switch_state: якщо HALTED → лишатися в HALTED.
-4. Завантажити локальний стан: активні ордери, в т.ч. SUBMITTING/UNKNOWN, стан стратегії, останній exec_id/час.
+3. Перевірити kill_switch_state: якщо HALTED → лишатися в HALTED; інакше effective PAUSED до кінця recovery.
+4. Завантажити durable-стан, відтворити його доменними конструкторами (перевірка інваріантів; невалідний запис → старт зупиняється) і класифікувати (11.0):
+   NEW → FAILED (доведено write-ahead), SUBMITTING → UNKNOWN, UNKNOWN → UNKNOWN;
+   OPEN / PARTIALLY_FILLED / CANCELING — потенційно застарілі, exposure зберігається, потрібна reconciliation;
+   біржово-підтверджені термінальні стани не повертаються в активні через рестарт;
+   runtime-позиції невідомі до звірки з біржею (збережене значення — лише «останнє локальне»).
 5. Підключити private stream і БУФЕРИЗУВАТИ події (ще не застосовувати).
 6. Отримати снапшот з біржі: open orders, positions, balances, fills з моменту останнього відомого.
 7. Reconciliation (розділ 13). Результат: OK або розбіжність.
-8. Застосувати пропущені fills → перебудувати портфель.
+8. Застосувати пропущені fills → перебудувати портфель (потрібна можливість історії виконань;
+   без неї пропущені fills → recovery неповний → PAUSED; fills ніколи не синтезуються з OrderUpdate).
 9. Застосувати буфер подій зі стріму (з дедуплікацією).
 10. Відновити стратегію: restore_state(snapshot) + звірка з фактичними ордерами.
 11. Стратегія повертає «бажаний» набір ордерів; різниця з фактичним → intents через Risk.
 12. TradingState = RUNNING тільки якщо кроки 6–10 пройшли без невирішених розбіжностей.
-    Інакше PAUSED + сповіщення.
+    Інакше PAUSED + сповіщення. Біржа недоступна або reconciliation неповна → PAUSED.
 ```
+
+Відсутність символу у відповіді позицій біржі не означає flat, доки контракт адаптера цього явно не гарантує (11.0).
 
 Стан стратегії в пам'яті, що лишився з минулого запуску, ніколи не використовується без звірки з біржею.
 
