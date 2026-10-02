@@ -205,8 +205,10 @@
 
 **Мета.** Обов'язковий шар, що може зупинити торгівлю незалежно від стратегії.
 
+**Стан.** Затверджено межу й контракт V1 (ARCHITECTURE 9.0: approve / reject без зміни intent, чисте ядро, snapshot без equity / cash / mark). Реалізація V1 розпочинається на гілці `feature/risk-manager`; фаза **не** завершена.
+
 **Що реалізуємо.**
-- Pre-trade перевірки (tick/step/min, max order qty, max position з урахуванням активних і `UNKNOWN` ордерів, capital allocation, max open orders, max leverage, вільна маржа, max loss per trade).
+- Pre-trade перевірки (max order qty, max position з урахуванням активних і `UNKNOWN` ордерів, capital allocation, max open orders, max leverage, вільна маржа, max loss per trade). Tick / step / min — окремий instrument preflight, не Risk.
 - Portfolio-перевірки: exposure, max drawdown, daily loss limit, відстань до ліквідації.
 - Системні: stale data, розрив private stream, частота API-помилок, частка відхилених ордерів.
 - `TradingState` (RUNNING / REDUCE_ONLY / PAUSED / HALTED) з явною таблицею «порушення → стан» з конфігурації.
@@ -216,7 +218,7 @@
 
 **Файли.** `app/risk/{manager,checks,limits,trading_state,kill_switch,liquidation}.py`; `app/portfolio/{portfolio,position_tracker,pnl}.py`; `scripts/kill_switch.py` (CLI).
 
-**Тести.** Кожен ліміт: нижче / на межі / вище; RiskManager ніколи не збільшує qty; ордер у `UNKNOWN` враховано в експозиції; daily loss скидається на межі доби (UTC, з fake clock); kill switch скасовує ордери через `FakeExchange` навіть коли стратегія «зависла»; латч переживає рестарт; розрахунок ліквідації на прикладах, порахованих вручну (long / short, різні tiers); PnL портфеля з комісіями й funding.
+**Тести.** Кожен ліміт: нижче / на межі / вище; RiskManager ніколи не змінює intent; ордер у `UNKNOWN` враховано в експозиції; daily loss скидається на межі доби (UTC, з fake clock); kill switch скасовує ордери через `FakeExchange` навіть коли стратегія «зависла»; латч переживає рестарт; розрахунок ліквідації на прикладах, порахованих вручну (long / short, різні tiers); PnL портфеля з комісіями й funding.
 
 **Критерії завершення.** Будь-яке критичне порушення → нові ордери зупинені (перевірено тестом); kill switch працює без участі стратегії.
 

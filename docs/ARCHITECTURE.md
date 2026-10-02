@@ -54,6 +54,9 @@
    (positions, PnL)                      │
                                          │ list[Intent]
                                          ▼
+                                 InstrumentPreflight ──► reject → RiskEvent
+                                         │ (tick/step/min/max/min_notional)
+                                         ▼
                                  RiskManager.evaluate()  ──► reject → RiskEvent
                                          │ approved
                                          ▼
@@ -108,7 +111,7 @@ app/
 | `exchanges` | Перетворення доменних запитів в API біржі й назад; auth; rate limit; нормалізацію помилок | Рішення, що торгувати |
 | `market_data` | Підписки, reconnect, heartbeat, stale-детекцію, валідацію послідовності | Торгові рішення |
 | `strategies` | Генерацію `Intent` на основі ринку і власного стану | Виклики API, ризик-ліміти акаунта |
-| `risk` | Затвердження / відхилення / зменшення intents; ліміти; TradingState; KillSwitch | Генерацію торгових ідей |
+| `risk` | Затвердження / відхилення intents (V1 — без зміни intent); ліміти; TradingState; KillSwitch | Генерацію торгових ідей; перевірки `InstrumentSpec` (окремий preflight) |
 | `execution` | Життєвий цикл ордерів, ідемпотентність, submit/cancel, обробку невідомих результатів | Вибір ціни чи обсягу |
 | `portfolio` | Позиції, баланси, realized/unrealized PnL, комісії, funding | Відправку ордерів |
 | `persistence` | Збереження та читання стану і журналу подій | Бізнес-рішення |
@@ -131,9 +134,11 @@ app/
    b. RiskManager перевіряє глобальні умови (stale data, TradingState)
    c. Strategy.on_market(event, ctx) → list[Intent]
 3. Для кожного Intent:
-   a. RiskManager.evaluate(intent, portfolio, open_orders) → RiskDecision
-   b. APPROVED / REDUCED → ExecutionEngine.submit(intent)
-      REJECTED            → RiskEvent (журнал, лог; сповіщення, якщо критично)
+   a. InstrumentPreflight: tick / step / min / max qty / min notional за InstrumentSpec
+      (невідповідний intent відхиляється до Risk)
+   b. RiskManager.evaluate(intent, snapshot, policy) → RiskDecision (розділ 9.0)
+   c. approved → ExecutionEngine.submit(intent) без змін intent
+      rejected → RiskEvent (журнал, лог; сповіщення, якщо критично)
 4. ExecutionEngine:
    a. створює Order(NEW, client_order_id), персистить
    b. переводить у SUBMITTING, персистить (write-ahead)
@@ -158,10 +163,10 @@ app/
 | Хто | Може | Не може |
 |---|---|---|
 | Strategy | Задати ціну, кількість, сторону, `reduce_only`, `time_in_force` (включно з `POST_ONLY`), тег рівня сітки | Звертатися до біржі |
-| RiskManager | Відхилити; **зменшити** кількість; додати `reduce_only` | Збільшити кількість, змінити ціну чи сторону |
+| RiskManager | Затвердити або відхилити (V1) | Змінювати intent: кількість (ні збільшити, ні зменшити), ціну, сторону, `reduce_only`. Обрізання розміру — можлива майбутня окрема функція |
 | ExecutionEngine | Нічого не змінює в суті ордера | Округлювати, змінювати ціну чи кількість |
 
-**Округлення до `tick_size` / `qty_step`** робить стратегія через доменні хелпери `InstrumentSpec`. Рівні сітки мусять бути детермінованими і однаковими після рестарту. RiskManager тільки **перевіряє** відповідність і відхиляє невідповідний intent. Тихого округлення на нижчих рівнях немає, бо воно ховає помилки розрахунку розміру.
+**Округлення до `tick_size` / `qty_step`** робить стратегія через доменні хелпери `InstrumentSpec`. Рівні сітки мусять бути детермінованими і однаковими після рестарту. Окремий instrument preflight (не RiskManager) тільки **перевіряє** відповідність і відхиляє невідповідний intent; RiskManager ці перевірки не дублює. Тихого округлення на нижчих рівнях немає, бо воно ховає помилки розрахунку розміру.
 
 ---
 
@@ -193,7 +198,7 @@ app/
 |---|---|
 | `PlaceOrderIntent` | `intent_id`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force` (`GTC` / `IOC` / `FOK` / `POST_ONLY`; окремого `post_only` немає), `reduce_only`, `tag` (наприклад, `grid:L07:buy`), `created_at` |
 | `CancelOrderIntent` | `intent_id`, `strategy_id`, `client_order_id`, `reason` |
-| `RiskDecision` | `intent_id`, `verdict` (APPROVED / REDUCED / REJECTED), `approved_qty`, `reasons[]`, `checks[]` |
+| `RiskDecision` | `intent_id`, `snapshot_id`, `policy_id`, `approved` (так / ні; `approved ⇔ reasons == ()`), `reasons` (коди `RiskReason`), `exposure` (розклад на зменшення / збільшення і worst-case). V1 без REDUCED / `approved_qty` (розділ 9.0) |
 | `Order` | `client_order_id`, `exchange_order_id?`, `strategy_id`, `symbol`, `side`, `order_type`, `price`, `qty`, `time_in_force`, `reduce_only`, `status`, `filled_qty`, `avg_fill_price`, `created_at`, `updated_at`, `last_exchange_update_ts`, `version`. Зв'язок з `intent_id` — відкрите питання Phase 5 |
 | `OrderUpdate` | нормалізований звіт біржі про ордер: `client_order_id`, `exchange_order_id`, `status`, `cum_filled_qty`, `avg_price`, `reject_reason`, `exchange_ts` |
 | `Fill` | `exec_id` (унікальний), `client_order_id`, `exchange_order_id`, `symbol`, `side`, `price`, `qty`, `fee?`, `fee_asset?`, `is_maker?`, `exchange_ts` (див. нижче про невідомі метадані) |
@@ -585,9 +590,30 @@ NEW ──► SUBMITTING ──► OPEN ──► PARTIALLY_FILLED ──► FIL
 
 ## 9. Risk Manager
 
-### 9.1 Три рівні перевірок
+### 9.0 Межа і контракт V1 (затверджено; реалізація — Phase 6, не завершена)
 
-1. **Pre-trade (кожен intent).** Відповідність tick/step/min_qty/min_notional; максимальна кількість на ордер; максимальна позиція з урахуванням активних **і** `SUBMITTING`/`UNKNOWN` ордерів; максимальний capital allocation на стратегію; максимальна кількість одночасних ордерів; `max_loss_per_trade` (для Grid — втрата на рівні worst-case, див. 9.4); максимальне плече; достатність вільної маржі.
+- **Потік:** `Strategy → PlaceOrderIntent → instrument preflight → RiskManager → Execution`. Вхід Risk — доменний `PlaceOrderIntent` (exchange-neutral); Risk не імпортує реалізації бірж і не бачить `OrderRequest`. `CancelOrderIntent` через Risk не йде: скасування ризик лише зменшує й доступне завжди.
+- **Лише approve / reject.** Risk не змінює intent: не зменшує й не збільшує кількість, не додає `reduce_only`, не змінює ціну чи сторону; немає REDUCED і `approved_qty`. Надмірний intent відхиляється.
+- **Перевірки `InstrumentSpec`** (tick, qty step, min / max qty біржі, min notional) — окремий preflight-контракт, Risk їх не дублює.
+- **Чисте детерміноване ядро:** `evaluate(intent, snapshot, policy) -> RiskDecision` без Clock, мережі, mutable-стану й логування; snapshot і policy — незмінні й подаються явно (Risk сам ні в біржу, ні в симулятор не ходить). Арифметика `Decimal` — у явних контекстах (знак / модуль — `copy_negate` / `copy_abs`), результат не залежить від глобального контексту.
+- **Snapshot V1:** `snapshot_id`, `symbol`, `trading_state`, `position_qty` (знакова; `None` = невідомо, `0` = відомо FLAT), `open_orders` (`None` = невідомо, порожньо = відомо немає) з потенційно активними ордерами символу, включно з `SUBMITTING` / `UNKNOWN` (повний залишок). **Немає** cash, equity, mark і часу / свіжості — вони з'являться разом із чесною семантикою свіжості оцінки.
+- **Розклад intent** за знаковою позицією `q` і знаковим `d` (BUY +, SELL −), а не за стороною: `reducing = min(|d|, |q|)` при протилежних знаках, інакше 0; `increasing = |d| − reducing`. SELL при SHORT — збільшення. Розворот (LONG 5, SELL 8) має обидві частини: зменшення 5 і збільшення 3.
+- **Ліміти V1:**
+  - `max_order_qty`, `max_order_notional` (per-symbol) — fat-finger ліміти **нового ордера**: для звичайного intent застосовуються до **всього** `qty` і `limit price × qty`, а не лише до частини, що збільшує (LONG 5, SELL 100 при ліміті 10 → відмова). **Валідний reduce-only звільнений** від обох: виконання зобов'язане обмежити fill позицією, яку можна зменшити. MARKET без опорної ціни при увімкненому ліміті номіналу → відмова.
+  - `max_position_qty` (per-symbol) — **worst-case** майбутня позиція: поточна + усі відкриті не-reduce-only ордери свого боку + новий не-reduce-only intent; протилежні відкриті ордери не нетуються (вважаються невиконаними), reduce-only ордери worst-case не збільшують. Відкриті ордери **враховуються обов'язково** (інакше два BUY 10 при ліміті 10 пройшли б обидва).
+  - `max_open_orders` (глобальний) — для **всіх** нових розміщень, включно з reduce-only.
+  - Ліміти кількості — per-symbol (одиниці базового активу різні); символ без лімітів у політиці → відмова. `None` = ліміт явно вимкнено; значень за замовчуванням немає.
+  - Поза V1: equity / min equity, cash, номінал позиції за mark, загальна експозиція, leverage / margin / ліквідація, daily loss / drawdown, свіжість даних.
+- **TradingState:** RUNNING — усе за лімітами; REDUCE_ONLY — лише intents з `reduce_only=True` (звичайний «закриваючий» BUY / SELL відхиляється: позиція може змінитися до виконання й ордер розверне її); PAUSED — жодних розміщень; HALTED (активний kill switch) — жодних розміщень стратегії, включно з reduce-only; аварійне закриття — окремий майбутній механізм; скасування поза Risk доступне завжди. Персистентний латч і дії kill switch поки не реалізовані.
+- **Reduce-only:** невідома позиція → відмова; FLAT / немає позиції → відмова; не той бік → відмова; валідний, але більший за позицію → дозволено (виконання обмежує fill і не допускає розвороту).
+- **Fail closed:** невідомий потрібний стан → відмова (невідома позиція — будь-яке розміщення; невідомі відкриті ордери — коли їх потребує увімкнений ліміт); неможливий точний розрахунок → відмова.
+- **Помилки:** відмова — очікуваний результат `RiskDecision` з машинними кодами `RiskReason`, не exception; exception лише для некоректного входу (типи, невідповідність symbol, некоректні snapshot / policy).
+- **Аудит:** рішення містить `intent_id`, `snapshot_id`, `policy_id`, `reasons`, `exposure`; persistence / логування — пізніше.
+- **Конкурентність:** чисте ядро гонку двох рішень над одним snapshot не вирішує. Серіалізація й резервування — в orchestration / execution: оцінка, створення `Order(NEW)` і включення його у відкриті ордери наступного snapshot відбуваються послідовно (одна черга подій або блокування на акаунт). Не реалізовано.
+
+### 9.1 Три рівні перевірок (цільова картина; V1 — див. 9.0)
+
+1. **Pre-trade (кожен intent).** Відповідність tick/step/min_qty/min_notional — окремий instrument preflight перед Risk; у Risk: максимальна кількість на ордер; максимальна позиція з урахуванням активних **і** `SUBMITTING`/`UNKNOWN` ордерів; максимальний capital allocation на стратегію; максимальна кількість одночасних ордерів; `max_loss_per_trade` (для Grid — втрата на рівні worst-case, див. 9.4); максимальне плече; достатність вільної маржі.
 2. **Portfolio (при кожній зміні стану).** Загальна експозиція, drawdown від піку equity, денний збиток, відстань до ліквідації.
 3. **Системні circuit breakers.** Застарілі дані, розрив private stream, серія API-помилок, частка відхилених ордерів, невирішена розбіжність reconciliation.
 
