@@ -10,7 +10,9 @@ lock, so orders and positions can only be read and changed together::
         revision / orders / position   # one consistent state
         build snapshot, evaluate       # pure, outside this module
         locked.register_approved(...) / locked.register_rejected(...)
-        locked.mark_submitting(...) / locked.apply_fill(...) / locked.set_position_qty(...)
+        locked.mark_submitting(...) / locked.record_ack(...)
+        locked.record_submission_outcome(...) / locked.apply_fill(...)
+        locked.set_position_qty(...)
 
 Lock design: one non-reentrant ``asyncio.Lock``. Mutations exist only on the
 ``LockedAccountState`` handle yielded by ``account_lock()``; its methods are
@@ -43,10 +45,20 @@ notional, the position, the applied fill and the revision are then committed
 together, or nothing changes. An identical ``exec_id`` replay changes nothing;
 the same ``exec_id`` with different data raises ``FillConflictError``.
 
+Submission (driven by ``OrderSubmitter``): ``mark_submitting`` is the write-ahead
+``NEW -> SUBMITTING`` before any request may be sent; ``record_ack`` stores the
+exchange order id as metadata on any sent order (never a status change, never a
+rollback); ``record_submission_outcome`` decides only a SUBMITTING order (not
+sent -> FAILED, rejected -> REJECTED, ambiguous -> UNKNOWN). Confirmed exchange
+progress beats a transport outcome: an ambiguous outcome for an order already
+advanced by fills changes nothing; a definite one raises
+``SubmissionOutcomeConflictError`` and keeps the state.
+
 Revision: starts at 0 and versions the whole local risk-relevant state. +1 for
-an approved reservation, an order transition (``mark_submitting``: write-ahead
-``NEW -> SUBMITTING``, nothing is sent), an applied fill and a changed position;
-nothing for a rejected record, a replay or setting a position to its current
+an approved reservation, an order transition (``mark_submitting``, a recorded
+outcome), a newly recorded exchange order id, an applied fill and a changed
+position; nothing for a rejected record, a replay, a repeated ack, an outcome
+that the observed state already supersedes or setting a position to its current
 value. Every new placement must name the current revision (``expected_revision``) or raises
 ``StaleRevisionError``. Client order ids are supplied by the caller and only
 validated here; nothing is generated. No exchange, network or storage.
@@ -66,15 +78,25 @@ from app.domain.errors import DomainValidationError
 from app.domain.fill_math import accumulate_execution
 from app.domain.fills import Fill
 from app.domain.intents import PlaceOrderIntent
-from app.domain.order_state import transition
+from app.domain.order_state import record_exchange_order_id, transition
 from app.domain.orders import Order
 from app.domain.validation import require_text, require_utc
-from app.execution.models import PlacementRecord
+from app.execution.models import PlacementRecord, SubmissionOutcome
 from app.portfolio.positions import PositionStateError, position_after_fill
 from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
 
 _INITIAL_VERSION: Final = 0
 _NO_FILL: Final = Decimal(0)
+# Statuses an outcome of the placement request may still decide: only SUBMITTING.
+_OUTCOME_TARGET: Final = {
+    SubmissionOutcome.NOT_SENT: OrderStatus.FAILED,
+    SubmissionOutcome.REJECTED: OrderStatus.REJECTED,
+    SubmissionOutcome.AMBIGUOUS: OrderStatus.UNKNOWN,
+}
+# An acknowledgement contradicts these: never sent, or definitely not accepted.
+_ACK_CONTRADICTING_STATUSES: Final = frozenset(
+    {OrderStatus.NEW, OrderStatus.FAILED, OrderStatus.REJECTED}
+)
 # Local statuses in which an exchange execution can arrive (docs/ARCHITECTURE.md 8):
 # NEW was never sent, terminal orders are final.
 FILLABLE_STATUSES: Final = frozenset(
@@ -111,6 +133,16 @@ class FillApplicationError(AccountStateError):
 
 class FillConflictError(FillApplicationError):
     """An ``exec_id`` was already applied with different data."""
+
+
+class OrderAckMismatchError(AccountStateError):
+    """An acknowledgement does not belong to the local order (other client or
+    exchange id, or an order that was never sent / definitely not accepted)."""
+
+
+class SubmissionOutcomeConflictError(AccountStateError):
+    """A definite transport outcome (not sent / rejected) contradicts exchange
+    progress already observed for the order; the stronger state was kept."""
 
 
 def _require_revision(value: object) -> int:
@@ -296,13 +328,77 @@ class LockedAccountState:
         """Write-ahead ``NEW -> SUBMITTING`` before a placement request may be sent
         (docs/ARCHITECTURE.md 7.2); +1 revision. Nothing is sent here."""
         state = self._live()
-        order = state.orders.get(require_text(client_order_id, "client_order_id"))
-        if order is None:
-            raise AccountStateError(f"no local order {client_order_id}")
+        order = self._existing(state, client_order_id)
         updated = transition(order, OrderStatus.SUBMITTING, at=at)
         state.orders[client_order_id] = updated
         state.revision += 1
         return updated
+
+    def record_ack(self, client_order_id: str, *, exchange_order_id: str, at: datetime) -> Order:
+        """Record an acknowledgement's ``exchange_order_id``: metadata enrichment,
+        never a status change (an ack does not prove OPEN).
+
+        Applies to any sent order (SUBMITTING and every later state, including a
+        state already advanced by fills), so a late ack never rolls an order back.
+        +1 revision only when the id is new. Raises ``OrderAckMismatchError``
+        (nothing changed) for a different known exchange id or an order that was
+        never sent / definitely not accepted (NEW, FAILED, REJECTED). The caller
+        matches the ack's ``client_order_id`` to this order.
+        """
+        state = self._live()
+        order = self._existing(state, client_order_id)
+        require_text(exchange_order_id, "exchange_order_id")
+        if order.status in _ACK_CONTRADICTING_STATUSES:
+            raise OrderAckMismatchError(
+                f"ack for order {order.client_order_id} in status {order.status.value}"
+            )
+        if order.exchange_order_id not in (None, exchange_order_id):
+            raise OrderAckMismatchError(
+                f"ack exchange_order_id {exchange_order_id} differs from "
+                f"{order.exchange_order_id} of order {order.client_order_id}"
+            )
+        updated = record_exchange_order_id(order, exchange_order_id, at=at)
+        if updated is not order:
+            state.orders[order.client_order_id] = updated
+            state.revision += 1
+        return updated
+
+    def record_submission_outcome(
+        self, client_order_id: str, outcome: SubmissionOutcome, *, at: datetime
+    ) -> Order:
+        """Apply the transport outcome of the placement request.
+
+        Only a SUBMITTING order is decided by it: NOT_SENT -> FAILED (releases the
+        reservation), REJECTED -> REJECTED (releases), AMBIGUOUS -> UNKNOWN (stays
+        active); +1 revision. Confirmed exchange progress is stronger than any
+        transport outcome: for an order already past SUBMITTING, AMBIGUOUS changes
+        nothing, while NOT_SENT / REJECTED contradict the observed facts and raise
+        ``SubmissionOutcomeConflictError``; the state is never rolled back.
+        """
+        state = self._live()
+        order = self._existing(state, client_order_id)
+        if type(outcome) is not SubmissionOutcome:
+            raise DomainValidationError("outcome must be a SubmissionOutcome")
+        if order.status is OrderStatus.SUBMITTING:
+            updated = transition(order, _OUTCOME_TARGET[outcome], at=at)
+            state.orders[order.client_order_id] = updated
+            state.revision += 1
+            return updated
+        if order.status is OrderStatus.NEW:
+            raise AccountStateError(f"order {order.client_order_id} was never marked SUBMITTING")
+        if outcome is SubmissionOutcome.AMBIGUOUS:
+            return order  # the observed exchange state already says more
+        raise SubmissionOutcomeConflictError(
+            f"{outcome.value} for order {order.client_order_id} contradicts its observed "
+            f"status {order.status.value} (filled {order.filled_qty}); state kept"
+        )
+
+    @staticmethod
+    def _existing(state: _State, client_order_id: str) -> Order:
+        order = state.orders.get(require_text(client_order_id, "client_order_id"))
+        if order is None:
+            raise AccountStateError(f"no local order {client_order_id}")
+        return order
 
     def apply_fill(self, fill: Fill, *, at: datetime) -> Order:
         """Apply one confirmed execution to its order and the position, atomically.

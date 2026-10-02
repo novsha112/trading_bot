@@ -105,6 +105,20 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "execution.account_state": frozenset(
         {"app.domain", "app.risk.models", "app.execution.models", "app.portfolio.positions"}
     ),
+    # Pure request mapping: the Order and the exchange-neutral DTO only.
+    "execution.requests": frozenset({"app.domain", "app.exchanges.models"}),
+    # Submission: exchange abstractions only (no adapter, simulator, Risk, services).
+    "execution.submitter": frozenset(
+        {
+            "app.domain",
+            "app.exchanges.models",
+            "app.exchanges.errors",
+            "app.exchanges.protocols",
+            "app.execution.account_state",
+            "app.execution.models",
+            "app.execution.requests",
+        }
+    ),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -1020,5 +1034,42 @@ def test_portfolio_allowed_imports(tmp_path: Path) -> None:
         "execution/account_state.py",
         "from app.portfolio.positions import position_after_fill\n",
     )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        ("execution/submitter.py", "from app.exchanges.bybit.private_rest import X\n"),
+        ("execution/submitter.py", "from app.exchanges.simulated import SimulatedExchange\n"),
+        ("execution/submitter.py", "from app.risk.manager import evaluate\n"),
+        ("execution/submitter.py", "from app.config.settings import EnvSettings\n"),
+        ("execution/submitter.py", "from app.services.placement import X\n"),
+        ("execution/submitter.py", "from app.persistence import X\n"),
+        ("execution/requests.py", "from app.exchanges.protocols import TradingClient\n"),
+        ("execution/requests.py", "from app.exchanges.bybit.order_mapping import X\n"),
+    ],
+)
+def test_submitter_violations(tmp_path: Path, relative: str, source: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    assert find_violations(root), source
+
+
+def test_submitter_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "execution/submitter.py",
+        "from app.domain.clock import Clock\n"
+        "from app.exchanges.errors import ExchangeNotSentError\n"
+        "from app.exchanges.models import OrderAck\n"
+        "from app.exchanges.protocols import TradingClient\n"
+        "from app.execution.account_state import InMemoryAccountState\n"
+        "from app.execution.requests import order_request_from_order\n",
+    )
+    _write(root, "execution/requests.py", "from app.exchanges.models import OrderRequest\n")
 
     assert find_violations(root) == []

@@ -12,13 +12,19 @@ import pytest
 
 from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 from app.domain.errors import DomainError, DomainValidationError, InvalidOrderTransition
-from app.domain.order_state import ALLOWED_TRANSITIONS, TERMINAL_STATUSES, transition
+from app.domain.order_state import (
+    ALLOWED_TRANSITIONS,
+    TERMINAL_STATUSES,
+    record_exchange_order_id,
+    transition,
+)
 from app.domain.orders import Order
 
 D = Decimal
 S = OrderStatus
 T0 = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 PRICE = D("65000")
+NAIVE_T = datetime(2026, 1, 15, 12, 0)  # noqa: DTZ001 - deliberately naive
 
 # The contract, written out independently of the implementation (docs/ARCHITECTURE.md, s. 8).
 EXPECTED: dict[OrderStatus, set[OrderStatus]] = {
@@ -360,3 +366,47 @@ def test_exchange_order_id_cannot_change() -> None:
 
 def test_invalid_transition_is_domain_error() -> None:
     assert issubclass(InvalidOrderTransition, DomainError)
+
+
+# --- exchange order id (acknowledgement metadata) -------------------------------------------
+
+
+@pytest.mark.parametrize("status", [S.SUBMITTING, S.OPEN, S.PARTIALLY_FILLED, S.UNKNOWN, S.FILLED])
+def test_record_exchange_order_id_is_metadata_not_a_transition(status: OrderStatus) -> None:
+    o = make_order(status, SOURCE_FILL[status])
+
+    updated = record_exchange_order_id(o, "o-9", at=T0 + timedelta(seconds=1))
+
+    assert (updated.status, updated.filled_qty) == (o.status, o.filled_qty)
+    assert updated.exchange_order_id == "o-9"
+    assert updated.version == o.version + 1
+    assert updated.updated_at == T0 + timedelta(seconds=1)
+
+
+def test_record_exchange_order_id_is_idempotent_for_the_same_id() -> None:
+    o = make_order(S.SUBMITTING, exchange_order_id="o-9")
+
+    assert record_exchange_order_id(o, "o-9", at=T0 + timedelta(seconds=1)) is o
+
+
+def test_record_exchange_order_id_cannot_replace_a_known_id() -> None:
+    o = make_order(S.SUBMITTING, exchange_order_id="o-9")
+
+    with pytest.raises(InvalidOrderTransition, match="cannot change"):
+        record_exchange_order_id(o, "o-10", at=T0 + timedelta(seconds=1))
+
+
+def test_record_exchange_order_id_cannot_move_time_backwards() -> None:
+    o = make_order(S.SUBMITTING)
+
+    with pytest.raises(InvalidOrderTransition, match="backwards"):
+        record_exchange_order_id(o, "o-9", at=T0 - timedelta(seconds=1))
+
+
+@pytest.mark.parametrize(
+    ("value", "at", "match"),
+    [("", T0, "exchange_order_id"), (" o-9", T0, "exchange_order_id"), ("o-9", NAIVE_T, "at")],
+)
+def test_record_exchange_order_id_validates_arguments(value: str, at: datetime, match: str) -> None:
+    with pytest.raises(DomainValidationError, match=match):
+        record_exchange_order_id(make_order(S.SUBMITTING), value, at=at)

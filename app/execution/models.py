@@ -1,5 +1,7 @@
 """Execution-local records (not domain models).
 
+``SubmissionOutcome`` classifies the transport result of a placement request.
+
 ``PlacementRecord`` links one ``PlaceOrderIntent`` to the outcome registered for
 it: the Risk decision and, when approved, the ``client_order_id`` of the local
 ``Order(NEW)`` reservation. It keeps the intent itself (immutable) as the identity
@@ -10,11 +12,23 @@ not carry ``intent_id``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
 from app.domain.validation import require_text
 from app.risk.models import RiskDecision
+
+
+class SubmissionOutcome(StrEnum):
+    """What the transport outcome of one placement request proves."""
+
+    NOT_SENT = "not_sent"
+    """Definitely never reached the exchange -> FAILED."""
+    REJECTED = "rejected"
+    """The exchange definitively refused it -> REJECTED."""
+    AMBIGUOUS = "ambiguous"
+    """It may exist on the exchange -> UNKNOWN (stays active)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

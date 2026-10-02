@@ -188,3 +188,36 @@ def transition(
         updated_at=at,
         version=order.version + 1,
     )
+
+
+def record_exchange_order_id(order: Order, exchange_order_id: str, *, at: datetime) -> Order:
+    """Record the exchange's order id (an acknowledgement): metadata, not a status.
+
+    Keeps ``status``, increments ``version`` by 1 and sets ``updated_at`` to ``at``.
+    Recording the id the order already has returns the order unchanged (no new
+    version); a different, already known id cannot replace it.
+
+    Raises:
+        InvalidOrderTransition: a different ``exchange_order_id`` is already known,
+            or time moves backwards.
+        DomainValidationError: invalid argument.
+    """
+    require_text(exchange_order_id, "exchange_order_id")
+    require_utc(at, "at")
+    if order.exchange_order_id == exchange_order_id:
+        return order
+    if order.exchange_order_id is not None:
+        raise InvalidOrderTransition(
+            f"exchange_order_id cannot change: {order.exchange_order_id} -> {exchange_order_id}"
+        )
+    if at < order.updated_at:
+        raise InvalidOrderTransition(
+            f"time cannot move backwards: at={at.isoformat()} < "
+            f"updated_at={order.updated_at.isoformat()}"
+        )
+    return dataclasses.replace(
+        order,
+        exchange_order_id=exchange_order_id,
+        updated_at=at,
+        version=order.version + 1,
+    )
