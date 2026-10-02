@@ -66,6 +66,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "services": frozenset(),
     # Pure position rules on domain types.
     "portfolio": frozenset(),
+    # Storage codecs: standard library only (no driver, ORM or other library).
+    "persistence.codecs": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -134,6 +136,8 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     ),
     # Fallback-safe local change time: the domain clock only.
     "execution.timing": frozenset({"app.domain"}),
+    # Storage codecs: no app module at all (not even the domain).
+    "persistence.codecs": frozenset(),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -1121,5 +1125,35 @@ def test_reconciliation_allowed_imports(tmp_path: Path) -> None:
         "from app.execution.timing import change_time\n",
     )
     _write(root, "execution/timing.py", "from app.domain.clock import Clock\n")
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from app.domain.validation import require_utc\n",
+        "from app.execution.account_state import X\n",
+        "from app.risk.models import RiskDecision\n",
+        "from app.exchanges.models import OrderRequest\n",
+        "from app.config.settings import EnvSettings\n",
+        "import sqlalchemy\n",
+        "import pydantic\n",
+    ],
+)
+def test_persistence_codecs_violations(tmp_path: Path, source: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "persistence/codecs.py", source)
+
+    assert find_violations(root), source
+
+
+def test_persistence_codecs_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "persistence/codecs.py",
+        "import re\nfrom datetime import UTC, datetime\nfrom decimal import Context, Decimal\n",
+    )
 
     assert find_violations(root) == []

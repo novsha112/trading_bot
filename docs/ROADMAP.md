@@ -152,9 +152,9 @@
 
 **Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізації ще немає.
 
-**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано лише п. 1):
+**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–2):
 1. Persistence contract — **задокументовано**.
-2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище.
+2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище — **реалізовано** (`app/persistence/codecs.py`, лише stdlib).
 3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit).
 4. Refactor стану акаунта на prepare / commit / publish.
 5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі).
