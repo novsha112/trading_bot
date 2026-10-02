@@ -160,10 +160,10 @@
    - Uncertain-commit poisoning — **реалізовано**: `StoreUncertainError` атомарно отруює агрегат, подальші мутації й workflow fail closed; без API скидання; вихід — новий агрегат через hydrate (п. 5).
 5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі) — **реалізовано**: `InMemoryAccountState.hydrate(account_scope_id, store, clock)` — load → валідація execution-owned інваріантами (`app/execution/state_invariants.py`, спільні з in-memory store) → локальна класифікація (`app/execution/recovery.py`) → один durable commit (revision + 1) → новий агрегат. Без мережі, без readiness: hydrated ≠ recovered ≠ safe to trade.
 6. `SafetyController` (runtime-умови → effective `TradingState`) — **реалізовано** (`app/execution/safety.py`): requested vs effective, fail-closed PAUSED за замовчуванням, монотонні recovery gates (біржові лише після hydrated), poison → PAUSED, HALTED абсолютний; coordinator бере effective-стан із контролера (`place(intent=...)`). Runtime-only; durable HALT latch — окремо пізніше.
-   - Safety-hardening відправки — **реалізовано**: `OrderSubmitter` перевіряє effective state перед write-ahead і повторно безпосередньо перед `place_order`; заборонена відправка → durable `FAILED` + `SafetyBlockRecord` (точно не відправлено); біржові gates закриваються атомарно (`mark_exchange_reconciled()`). Recovery contract / exchange DTO V2 / `RecoveryCoordinator` — ще ні.
+   - Safety-hardening відправки — **реалізовано**: `OrderSubmitter` перевіряє effective state перед write-ahead і повторно безпосередньо перед `place_order`; заборонена відправка → durable `FAILED` + `SafetyBlockRecord` (точно не відправлено); біржові gates закриваються атомарно (`mark_exchange_reconciled()`). Exchange recovery contract — **задокументовано** (ARCHITECTURE 13); exchange DTO V2 / `RecoveryCoordinator` — ще ні.
 7. SQLite + Alembic (SQLAlchemy 2.x async Core, WAL + `synchronous=FULL`).
-8. Можливість історії виконань (`get_executions` або еквівалент).
-9. `RecoveryCoordinator` (startup-послідовність ARCHITECTURE 12).
+8. Можливість історії виконань — входить у послідовність exchange recovery (Phase 10, ARCHITECTURE 13.16).
+9. `RecoveryCoordinator` (startup-послідовність ARCHITECTURE 12) — входить у ту саму послідовність.
 10. PostgreSQL і hardening (advisory lock / file lock / lease).
 
 **Що реалізуємо.**
@@ -325,16 +325,28 @@
 
 **Мета.** Бот коректно відновлюється після будь-якого рестарту і не торгує, якщо його стан не збігається з біржею.
 
+**Стан.** Нормативний контракт exchange recovery — ARCHITECTURE 13 (задокументовано; коду ще немає). Затверджена послідовність (кожен пункт — окремий commit з тестами; safety-hardening відправки вже виконано):
+1. exchange recovery DTO / protocol (`ExchangeStateReader`; симулятор реалізує для тестів);
+2. стабільний namespace `client_order_id`;
+3. чисте зіставлення / класифікація recovery;
+4. відновлення виконань / fills;
+5. reconciliation позицій + workflow прийняття baseline;
+6. open-order discovery;
+7. `RecoveryCoordinator` + final verification;
+8. Bybit read-адаптер + fixtures / testnet-валідація;
+9. private stream + runtime health;
+10. live preflight (live без здорового private stream не підтримується).
+
 **Що реалізуємо.**
 - Послідовність запуску з розділу 12 ARCHITECTURE (буферизація private stream під час снапшоту) і recovery-класифікація з 11.0; повний recovery залежить від можливості історії виконань (Phase 4, п. 8), без неї — PAUSED.
-- `Reconciler`: порівняння ордерів, позицій, балансу, fills; таблиця реакцій з розділу 13 ARCHITECTURE; `ReconciliationEvent`.
+- `Reconciler`: порівняння ордерів, позицій, fills за контрактом ARCHITECTURE 13 (foreign / lost-managed / conflict → блок, без автоматичного імпорту чи cancel); `ReconciliationEvent`.
 - Тригери: старт, reconnect private stream, періодичний, після `FAILED` з `UNKNOWN`, ручний (CLI).
 - Персистентний стан `SimulatedExchange` для paper, щоб recovery перевірялося на paper до testnet.
 - Відновлення стану Grid з `strategy_state` + звірка з фактичними ордерами.
 
 **Файли.** `app/services/{recovery,reconciliation}.py`; `app/paper_trading/sim_state_store.py`; `scripts/reconcile.py`.
 
-**Тести (матриця сценаріїв).** Пропущений fill під час простою; ордер скасований зовні; сторонній ордер на символі; наш ордер, якого немає локально; позиція не пояснюється fills → PAUSED; `UNKNOWN` у БД при старті; розрив private stream і пропущені події → resync; `kill -9` у момент між SUBMITTING і ack; kill switch у HALTED переживає рестарт.
+**Тести (матриця сценаріїв).** Пропущений fill під час простою; ордер скасований зовні; сторонній ордер на символі (і на неочікуваному символі scope) → PAUSED; наш ордер, якого немає локально → PAUSED; неповна пагінація / історія → PAUSED; дубль і конфлікт `exec_id`; гонки між snapshots → final verification; позиція не пояснюється fills → PAUSED; `UNKNOWN` у БД при старті; розрив private stream і пропущені події → resync; `kill -9` у момент між SUBMITTING і ack; kill switch у HALTED переживає рестарт.
 
 **Критерії завершення.** На paper: серія примусових рестартів (включно з `kill -9`) у випадкові моменти не приводить ні до дублів, ні до невиявлених розбіжностей; усі розбіжності мають `ReconciliationEvent`.
 
