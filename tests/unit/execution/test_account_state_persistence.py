@@ -37,6 +37,7 @@ from app.execution.persistence import (
     StoreValidationError,
 )
 from app.execution.reconciliation import UnknownOrderReconciler
+from app.execution.safety import SafetyController
 from app.execution.submitter import OrderSubmitter
 from app.persistence.memory import CommitFailure, InMemoryAccountStateStore
 from app.risk.models import (
@@ -232,6 +233,18 @@ async def durable(store: Any) -> tuple[Any, ...] | None:
 
 async def assert_ram_matches_store(account: InMemoryAccountState, store: Any) -> None:
     assert await durable(store) == ram(account)
+
+
+def ready_safety(account: InMemoryAccountState) -> SafetyController:
+    """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_orders_reconciled()
+    safety.mark_positions_reconciled()
+    safety.mark_open_orders_reconciled()
+    safety.mark_fills_complete()
+    safety.request_state(TradingState.RUNNING)
+    return safety
 
 
 # --- construction ---------------------------------------------------------------------------
@@ -784,6 +797,7 @@ async def test_coordinator_store_failure_leaves_no_reservation(failure: CommitFa
     ids = Ids()
     coord = PlacementCoordinator(
         account_state=account,
+        safety=ready_safety(account),
         policy=RiskPolicy(
             policy_id="p",
             max_open_orders=None,
@@ -801,7 +815,7 @@ async def test_coordinator_store_failure_leaves_no_reservation(failure: CommitFa
     with pytest.raises(
         StoreCommitError if failure is CommitFailure.DEFINITE else StoreUncertainError
     ):
-        await coord.place(intent=intent(), trading_state=TradingState.RUNNING)
+        await coord.place(intent=intent())
 
     assert ids.calls == 1  # the generated id is simply unused
     assert await account.placement("i-1") is None

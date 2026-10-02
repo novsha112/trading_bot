@@ -6,7 +6,8 @@ and single-shot UNKNOWN reconciliation (7.3) through the ``TradingClient``
 abstraction, and the account-state persistence port (``persistence.py``) that
 storage adapters implement; every account mutation is committed through it
 before it is published, and startup hydration (``recovery.py``) rebuilds it
-from durable state with the locally provable crash classification only. This
-package never imports ``app.persistence``. No retries, exchange recovery or full
-reconciliation yet.
+from durable state with the locally provable crash classification only; the
+runtime ``SafetyController`` (``safety.py``) gates the effective trading state
+on recovery readiness and poison. This package never imports
+``app.persistence``. No retries, exchange recovery or full reconciliation yet.
 """

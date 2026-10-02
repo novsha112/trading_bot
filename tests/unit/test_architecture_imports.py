@@ -161,6 +161,9 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "execution.recovery": frozenset(
         {"app.domain", "app.execution.persistence", "app.execution.state_invariants"}
     ),
+    # Runtime safety: Risk's TradingState and the account state's public poison
+    # flag only (no exchange, persistence adapter, services, simulator or config).
+    "execution.safety": frozenset({"app.domain", "app.risk.models", "app.execution.account_state"}),
     # Reference store adapter: implements the execution-owned port.
     "persistence.memory": frozenset(
         {

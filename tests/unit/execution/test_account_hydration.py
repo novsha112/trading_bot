@@ -48,6 +48,7 @@ from app.execution.recovery import (
     recovery_change,
     validate_persisted_account_state,
 )
+from app.execution.safety import SafetyController
 from app.persistence.memory import CommitFailure, InMemoryAccountStateStore
 from app.risk.models import (
     ACTIVE_ORDER_STATUSES,
@@ -263,6 +264,18 @@ def ram(account: InMemoryAccountState) -> tuple[Any, ...]:
 
 def reprs(items: Mapping[str, object]) -> dict[str, str]:
     return {key: repr(value) for key, value in items.items()}
+
+
+def ready_safety(account: InMemoryAccountState) -> SafetyController:
+    """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_orders_reconciled()
+    safety.mark_positions_reconciled()
+    safety.mark_open_orders_reconciled()
+    safety.mark_fills_complete()
+    safety.request_state(TradingState.RUNNING)
+    return safety
 
 
 async def reserve(locked: LockedAccountState, intent_id: str, cid: str, **terms: Any) -> None:
@@ -847,8 +860,10 @@ async def test_every_referenced_symbol_reads_unknown_after_recovery() -> None:
 async def test_risk_sees_unknown_position_after_hydrate() -> None:
     store = await crashed_store()
     account = await hydrate(store)
+    # Even with every gate (wrongly) confirmed, the hydrated position stays unknown.
     coordinator = PlacementCoordinator(
         account_state=account,
+        safety=ready_safety(account),
         policy=RiskPolicy(
             policy_id="p",
             max_open_orders=None,
@@ -862,7 +877,7 @@ async def test_risk_sees_unknown_position_after_hydrate() -> None:
         client_order_id_generator=_NoIds(),
     )
 
-    record = await coordinator.place(intent=intent("i-new"), trading_state=TradingState.RUNNING)
+    record = await coordinator.place(intent=intent("i-new"))
 
     assert not record.approved
     assert RiskReason.UNKNOWN_POSITION in record.decision.reasons
@@ -1060,10 +1075,14 @@ async def test_coordinator_replay_after_hydrate_needs_no_risk_id_clock_or_store(
             return f"c-{intent.intent_id}"
 
     before = PlacementCoordinator(
-        account_state=first, policy=risk_policy, clock=Clock(T0), client_order_id_generator=Ids()
+        account_state=first,
+        safety=ready_safety(first),
+        policy=risk_policy,
+        clock=Clock(T0),
+        client_order_id_generator=Ids(),
     )
-    approved = await before.place(intent=intent("i-1"), trading_state=TradingState.RUNNING)
-    rejected = await before.place(intent=intent("i-2"), trading_state=TradingState.RUNNING)
+    approved = await before.place(intent=intent("i-1"))
+    rejected = await before.place(intent=intent("i-2"))
     assert approved.approved
     assert not rejected.approved
 
@@ -1077,12 +1096,20 @@ async def test_coordinator_replay_after_hydrate_needs_no_risk_id_clock_or_store(
         raise AssertionError("Risk must not run for a replay")
 
     monkeypatch.setattr("app.services.placement.evaluate", spy)
+    # A fresh controller of the hydrated account: recovery incomplete, PAUSED.
+    safety = SafetyController(account_state=account)
+    safety.request_state(TradingState.RUNNING)
+    assert safety.effective_state is TradingState.PAUSED
     after = PlacementCoordinator(
-        account_state=account, policy=risk_policy, clock=clock, client_order_id_generator=_NoIds()
+        account_state=account,
+        safety=safety,
+        policy=risk_policy,
+        clock=clock,
+        client_order_id_generator=_NoIds(),
     )
 
-    assert await after.place(intent=intent("i-1"), trading_state=TradingState.RUNNING) == approved
-    assert await after.place(intent=intent("i-2"), trading_state=TradingState.RUNNING) == rejected
+    assert await after.place(intent=intent("i-1")) == approved
+    assert await after.place(intent=intent("i-2")) == rejected
     assert calls == []
     assert clock.calls == 0
     assert store.changes == []

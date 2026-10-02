@@ -150,16 +150,16 @@
 
 **Мета.** Надійне збереження стану й журналу.
 
-**Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізовано пп. 1–5 послідовності нижче (без SQL-адаптера, без exchange-recovery).
+**Стан.** Контракт durable-стану й recovery задокументовано (ARCHITECTURE 11.0): prepare → durable commit → publish, write-ahead SUBMITTING, атомарні транзакції, revision з CAS, один writer, lossless decimal-текст, UTC, явний known / unknown позиції, durable ідентичності. Реалізовано пп. 1–6 послідовності нижче (без SQL-адаптера, без exchange-recovery).
 
-**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–5):
+**Затверджена послідовність** (кожен пункт — окремий commit з тестами; виконано пп. 1–6):
 1. Persistence contract — **задокументовано**.
 2. Кодеки: Decimal ↔ канонічний текст, UTC ↔ сховище — **реалізовано** (`app/persistence/codecs.py`, лише stdlib).
 3. `AccountStateStore` Protocol + in-memory durable fake (з ін'єкцією збоїв commit) — **реалізовано**; власника порту виправлено: Protocol, моделі й помилки — `app/execution/persistence.py`, адаптер — `app/persistence/memory.py` (execution не імпортує persistence). Інтегровано в п. 4.
 4. Refactor стану акаунта на prepare / commit / publish — **реалізовано** (усі runtime-мутації durable до публікації; store передається явно).
    - Uncertain-commit poisoning — **реалізовано**: `StoreUncertainError` атомарно отруює агрегат, подальші мутації й workflow fail closed; без API скидання; вихід — новий агрегат через hydrate (п. 5).
 5. Recovery-класифікація (NEW → FAILED, SUBMITTING → UNKNOWN, runtime-позиції невідомі) — **реалізовано**: `InMemoryAccountState.hydrate(account_scope_id, store, clock)` — load → валідація execution-owned інваріантами (`app/execution/state_invariants.py`, спільні з in-memory store) → локальна класифікація (`app/execution/recovery.py`) → один durable commit (revision + 1) → новий агрегат. Без мережі, без readiness: hydrated ≠ recovered ≠ safe to trade.
-6. `SafetyController` (durable latch + runtime-умови → effective `TradingState`).
+6. `SafetyController` (runtime-умови → effective `TradingState`) — **реалізовано** (`app/execution/safety.py`): requested vs effective, fail-closed PAUSED за замовчуванням, монотонні recovery gates (біржові лише після hydrated), poison → PAUSED, HALTED абсолютний; coordinator бере effective-стан із контролера (`place(intent=...)`). Runtime-only; durable HALT latch — окремо пізніше.
 7. SQLite + Alembic (SQLAlchemy 2.x async Core, WAL + `synchronous=FULL`).
 8. Можливість історії виконань (`get_executions` або еквівалент).
 9. `RecoveryCoordinator` (startup-послідовність ARCHITECTURE 12).
@@ -190,7 +190,7 @@
 
 **Мета.** Контрольований життєвий цикл ордерів без дублів і втрати стану.
 
-**Стан.** Розпочато foundation (ARCHITECTURE 7.0): in-memory `InMemoryAccountState` — єдиний власник ордерів, позицій, застосованих fills і revision під одним lock акаунта (резервація `Order(NEW)`, write-ahead `NEW → SUBMITTING`, атомарне застосування fill до ордера й позиції) — і `PlacementCoordinator` (`app/services/placement.py`: атомарне `snapshot → evaluate → reserve`, позиція читається з того самого стану). Додано foundation відправки (`OrderSubmitter`, ARCHITECTURE 7.2): write-ahead `NEW → SUBMITTING` до мережі, один `place_order` поза lock без повторів, класифікація результату (FAILED / REJECTED / UNKNOWN), ack як метадані, пріоритет підтвердженого прогресу над транспортним результатом. Додано foundation застосування звітів біржі й одноразового розв'язання `UNKNOWN` (ARCHITECTURE 7.3): `ExchangeOrderState`, `apply_exchange_state` без синтезу fills і без регресу підтвердженого прогресу, `UnknownOrderReconciler` з одним `get_order` поза lock. Без повторів / backoff / grace-політики для not found, cancel flow, recovery після рестарту, persistence, повної reconciliation (open orders, позиції, баланси), приватного торгового адаптера Bybit, власника `TradingState` і інтеграції з paper / backtest. Фаза **не** завершена.
+**Стан.** Розпочато foundation (ARCHITECTURE 7.0): in-memory `InMemoryAccountState` — єдиний власник ордерів, позицій, застосованих fills і revision під одним lock акаунта (резервація `Order(NEW)`, write-ahead `NEW → SUBMITTING`, атомарне застосування fill до ордера й позиції) — і `PlacementCoordinator` (`app/services/placement.py`: атомарне `snapshot → evaluate → reserve`, позиція читається з того самого стану). Додано foundation відправки (`OrderSubmitter`, ARCHITECTURE 7.2): write-ahead `NEW → SUBMITTING` до мережі, один `place_order` поза lock без повторів, класифікація результату (FAILED / REJECTED / UNKNOWN), ack як метадані, пріоритет підтвердженого прогресу над транспортним результатом. Додано foundation застосування звітів біржі й одноразового розв'язання `UNKNOWN` (ARCHITECTURE 7.3): `ExchangeOrderState`, `apply_exchange_state` без синтезу fills і без регресу підтвердженого прогресу, `UnknownOrderReconciler` з одним `get_order` поза lock. Без повторів / backoff / grace-політики для not found, cancel flow, recovery після рестарту, persistence, повної reconciliation (open orders, позиції, баланси), приватного торгового адаптера Bybit, durable latch / таблиці «порушення → стан» для `TradingState` (runtime-власник — `SafetyController`) і інтеграції з paper / backtest. Фаза **не** завершена.
 
 **Що реалізуємо.**
 - `ClientOrderIdGenerator` (префікс бота, унікальність, персистентний лічильник).

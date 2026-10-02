@@ -2,16 +2,20 @@
 
 Under ONE account lock (``InMemoryAccountState.account_lock``):
 
-1. replay check by ``intent_id`` (before any evaluation, id or clock read): an
-   equal recorded intent returns its ``PlacementRecord``; different data raises
-   ``PlacementConflictError``;
-2. revision R, the position of the intent's symbol, its active orders and the
+0. ``ensure_mutations_allowed``: a poisoned account fails first, even a replay;
+1. replay check by ``intent_id`` (before any safety read, evaluation, id or
+   clock read): an equal recorded intent returns its ``PlacementRecord``;
+   different data raises ``PlacementConflictError``. A replay creates no new
+   risk, so an incomplete recovery (effective PAUSED) does not block it;
+2. ONE ``SafetyController`` snapshot gives the effective ``TradingState``
+   (requested state, recovery gates, poison); the caller never supplies it;
+3. revision R, the position of the intent's symbol, its active orders and the
    account order count are read from the held handle: one consistent local
    state (fills change orders and positions under the same lock);
    ``snapshot_id = "<account_scope_id>:<R>"``;
-3. ``build_risk_snapshot`` -> ``evaluate`` (pure);
-4. rejected -> ``register_rejected`` (no Order, revision stays R);
-5. approved -> ``client_order_id`` from the generator, then ``clock.now()``, then
+4. ``build_risk_snapshot`` -> ``evaluate`` (pure);
+5. rejected -> ``register_rejected`` (no Order, revision stays R);
+6. approved -> ``client_order_id`` from the generator, then ``clock.now()``, then
    ``register_approved``: the ``Order(NEW)`` is visible before the lock is
    released and the revision becomes R + 1.
 
@@ -20,9 +24,11 @@ record, and for an approval the ``Order(NEW)``, become visible only after it
 succeeded); nothing is sent anywhere: the result is the ``PlacementRecord``. A
 store error propagates and leaves no reservation (a generated id is then simply
 unused). The position is never taken from the caller (an unknown position stays
-``None`` -> UNKNOWN_POSITION); ``TradingState`` has no owner yet and is still
-passed per placement. The account scope comes from the account state and must
-not contain ``:``, the delimiter of the snapshot id.
+``None`` -> UNKNOWN_POSITION). The effective state is read once per placement;
+a safety change after that read (e.g. a pause after the Risk approval) is a
+future runtime-health concern, not handled here. The account scope comes from
+the account state and must not contain ``:``, the delimiter of the snapshot id;
+the safety controller must cover the same account state.
 
 Failures: an exactly unrepresentable snapshot (``ExposureCalculationError``)
 is a ``PlacementPreparationError`` (cause chained), not a Risk rejection; other
@@ -41,9 +47,10 @@ from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
 from app.execution.account_state import InMemoryAccountState
 from app.execution.models import PlacementRecord
+from app.execution.safety import SafetyController
 from app.risk.exposure import ExposureCalculationError
 from app.risk.manager import evaluate
-from app.risk.models import RiskPolicy, TradingState
+from app.risk.models import RiskPolicy
 from app.risk.snapshots import build_risk_snapshot
 
 _SNAPSHOT_ID_DELIMITER: Final = ":"
@@ -62,12 +69,13 @@ class PlacementPreparationError(RuntimeError):
 class PlacementCoordinator:
     """Serializes placements of one account scope through its account-state lock."""
 
-    __slots__ = ("_account", "_account_scope_id", "_clock", "_ids", "_policy")
+    __slots__ = ("_account", "_account_scope_id", "_clock", "_ids", "_policy", "_safety")
 
     def __init__(
         self,
         *,
         account_state: InMemoryAccountState,
+        safety: SafetyController,
         policy: RiskPolicy,
         clock: Clock,
         client_order_id_generator: ClientOrderIdGenerator,
@@ -81,6 +89,10 @@ class PlacementCoordinator:
             raise DomainValidationError(
                 f"account_scope_id must not contain {_SNAPSHOT_ID_DELIMITER!r}, got {scope!r}"
             )
+        if type(safety) is not SafetyController:
+            raise DomainValidationError("safety must be a SafetyController")
+        if safety.account_state is not account_state:
+            raise DomainValidationError("safety must cover the same account_state")
         if type(policy) is not RiskPolicy:
             raise DomainValidationError("policy must be a RiskPolicy")
         if not callable(getattr(clock, "now", None)):
@@ -89,9 +101,15 @@ class PlacementCoordinator:
             raise DomainValidationError("client_order_id_generator must provide next_id()")
         self._account_scope_id = scope
         self._account = account_state
+        self._safety = safety
         self._policy = policy
         self._clock = clock
         self._ids = client_order_id_generator
+
+    @property
+    def safety(self) -> SafetyController:
+        """The controller whose effective state every new placement uses."""
+        return self._safety
 
     @property
     def account_scope_id(self) -> str:
@@ -102,7 +120,6 @@ class PlacementCoordinator:
         self,
         *,
         intent: PlaceOrderIntent,
-        trading_state: TradingState,
     ) -> PlacementRecord:
         """Evaluate ``intent`` and reserve it if approved, atomically per account."""
         if type(intent) is not PlaceOrderIntent:
@@ -113,6 +130,8 @@ class PlacementCoordinator:
             replay = locked.replay_of(intent)
             if replay is not None:
                 return replay
+            # One safety read per placement (requested state, gates, poison).
+            trading_state = self._safety.snapshot().effective_state
             revision = locked.revision
             try:
                 snapshot = build_risk_snapshot(

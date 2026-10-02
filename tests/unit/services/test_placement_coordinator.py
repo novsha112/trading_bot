@@ -19,9 +19,15 @@ from app.domain.errors import DomainValidationError
 from app.domain.fills import Fill
 from app.domain.intents import PlaceOrderIntent
 from app.domain.orders import Order
-from app.execution.account_state import InMemoryAccountState, PlacementConflictError
+from app.execution.account_state import (
+    AccountStatePoisonedError,
+    InMemoryAccountState,
+    PlacementConflictError,
+)
 from app.execution.models import PlacementRecord
-from app.persistence.memory import InMemoryAccountStateStore
+from app.execution.persistence import StoreUncertainError
+from app.execution.safety import SafetyController
+from app.persistence.memory import CommitFailure, InMemoryAccountStateStore
 from app.risk.exposure import ExposureCalculationError
 from app.risk.manager import evaluate
 from app.risk.models import (
@@ -144,15 +150,32 @@ def intent(intent_id: str = "i-1", **overrides: Any) -> PlaceOrderIntent:
     return PlaceOrderIntent(**{**values, **overrides})
 
 
+def ready_safety(
+    account: InMemoryAccountState, requested: TradingState = RUNNING
+) -> SafetyController:
+    """A controller with every recovery gate confirmed: effective == requested."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_orders_reconciled()
+    safety.mark_positions_reconciled()
+    safety.mark_open_orders_reconciled()
+    safety.mark_fills_complete()
+    safety.request_state(requested)
+    return safety
+
+
 def coordinator(
     *,
     account: InMemoryAccountState | None = None,
+    safety: SafetyController | None = None,
     risk_policy: RiskPolicy | None = None,
     clock: Clock | None = None,
     ids: ClientOrderIdGenerator | None = None,
 ) -> PlacementCoordinator:
+    account = new_account(SCOPE) if account is None else account
     return PlacementCoordinator(
-        account_state=new_account(SCOPE) if account is None else account,
+        account_state=account,
+        safety=ready_safety(account) if safety is None else safety,
         policy=policy() if risk_policy is None else risk_policy,
         clock=CountingClock() if clock is None else clock,
         client_order_id_generator=SequenceIds() if ids is None else ids,
@@ -200,9 +223,13 @@ async def place(
     coord: PlacementCoordinator,
     source: PlaceOrderIntent,
     *,
-    trading_state: TradingState = RUNNING,
+    trading_state: TradingState | None = None,
 ) -> PlacementRecord:
-    return await coord.place(intent=source, trading_state=trading_state)
+    """Place ``source``; ``trading_state`` is first requested on the (fully
+    recovered) controller, so it is also the effective state."""
+    if trading_state is not None:
+        coord.safety.request_state(trading_state)
+    return await coord.place(intent=source)
 
 
 async def registry_state(account: InMemoryAccountState) -> tuple[Any, ...]:
@@ -240,9 +267,11 @@ def test_account_scope_id_is_validated_by_the_account_state(value: object) -> No
 
 @pytest.mark.parametrize("value", ["acct:1", ":", "a:"])
 def test_snapshot_delimiter_in_the_account_scope_is_rejected(value: str) -> None:
+    account = new_account(value)
     with pytest.raises(DomainValidationError, match="must not contain"):
         PlacementCoordinator(
-            account_state=new_account(value),
+            account_state=account,
+            safety=SafetyController(account_state=account),
             policy=policy(),
             clock=CountingClock(),
             client_order_id_generator=SequenceIds(),
@@ -253,14 +282,17 @@ def test_snapshot_delimiter_in_the_account_scope_is_rejected(value: str) -> None
     ("field", "value", "match"),
     [
         ("account_state", object(), "account_state"),
+        ("safety", object(), "safety"),
         ("policy", object(), "policy"),
         ("clock", object(), "clock"),
         ("client_order_id_generator", object(), "client_order_id_generator"),
     ],
 )
 def test_dependencies_are_validated(field: str, value: object, match: str) -> None:
+    account = new_account()
     arguments: dict[str, Any] = {
-        "account_state": new_account(),
+        "account_state": account,
+        "safety": SafetyController(account_state=account),
         "policy": policy(),
         "clock": CountingClock(),
         "client_order_id_generator": SequenceIds(),
@@ -272,8 +304,10 @@ def test_dependencies_are_validated(field: str, value: object, match: str) -> No
 
 @pytest.mark.parametrize("value", ["acct-1", "desk/a", "ACCT_7.main"])
 def test_valid_account_scope_ids(value: str) -> None:
+    account = new_account(value)
     coord = PlacementCoordinator(
-        account_state=new_account(value),
+        account_state=account,
+        safety=SafetyController(account_state=account),
         policy=policy(),
         clock=CountingClock(),
         client_order_id_generator=SequenceIds(),
@@ -289,6 +323,7 @@ async def test_scope_with_a_slash_keeps_the_snapshot_format() -> None:
     await set_position(account, "ETHUSDT", FLAT)
     coord = PlacementCoordinator(
         account_state=account,
+        safety=ready_safety(account),
         policy=policy(),
         clock=CountingClock(),
         client_order_id_generator=SequenceIds(),
@@ -320,7 +355,6 @@ async def test_non_intent_is_rejected_before_the_lock() -> None:
     with pytest.raises(DomainValidationError, match="PlaceOrderIntent"):
         await coordinator(account=account).place(
             intent="i-1",  # type: ignore[arg-type]
-            trading_state=RUNNING,
         )
 
     assert await account.revision() == SEEDED
@@ -416,11 +450,13 @@ async def test_rejected_placement_is_recorded_without_reservation(
 async def test_place_has_no_position_argument() -> None:
     parameters = inspect.signature(PlacementCoordinator.place).parameters
 
-    assert set(parameters) == {"self", "intent", "trading_state"}
+    assert set(parameters) == {"self", "intent"}
+    coord = coordinator(account=await flat_account())
     with pytest.raises(TypeError):
-        await coordinator(account=await flat_account()).place(  # type: ignore[call-arg]
-            intent=intent(), trading_state=RUNNING, position_qty=FLAT
-        )
+        await coord.place(intent=intent(), position_qty=FLAT)  # type: ignore[call-arg]
+    # The caller can no longer supply a trading state either.
+    with pytest.raises(TypeError):
+        await coord.place(intent=intent(), trading_state=RUNNING)  # type: ignore[call-arg]
 
 
 @pytest.mark.asyncio
@@ -793,17 +829,18 @@ async def test_preparation_error_is_scoped_to_the_symbol_snapshot() -> None:
     assert record.decision.snapshot_id == f"acct-1:{SEEDED + 1}"
 
 
-@pytest.mark.parametrize("trading_state", ["running", None, 1])
+@pytest.mark.parametrize("trading_state", ["running", None, 1, True])
 @pytest.mark.asyncio
-async def test_invalid_trading_state_propagates_as_validation_error(
+async def test_invalid_requested_state_is_rejected_and_nothing_is_placed(
     trading_state: Any, evaluate_calls: list[str]
 ) -> None:
     account = await flat_account()
     ids, clock = SequenceIds(), CountingClock()
-    coord = coordinator(account=account, ids=ids, clock=clock)
+    coord = coordinator(account=account, ids=ids, clock=clock, safety=ready_safety(account))
 
-    with pytest.raises(DomainValidationError, match="trading_state"):
-        await place(coord, intent(), trading_state=trading_state)
+    with pytest.raises(DomainValidationError, match="TradingState"):
+        coord.safety.request_state(trading_state)
+    assert coord.safety.snapshot().requested_state is RUNNING
 
     assert await account.placement("i-1") is None
     assert await account.revision() == SEEDED
@@ -1023,3 +1060,173 @@ def test_coordinator_has_no_network_identity_or_time_dependencies() -> None:
     assert not {name.split(".")[0] for name in imports} & banned
     for word in ("place_order", "TradingClient", "exchanges", "datetime.now", "sleep("):
         assert word not in source, word
+
+
+# --- safety controller ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def risk_states(monkeypatch: pytest.MonkeyPatch) -> list[TradingState]:
+    """The trading_state of every RiskSnapshot the coordinator evaluates."""
+    seen: list[TradingState] = []
+    real = evaluate
+
+    def spy(**kwargs: Any) -> Any:
+        seen.append(kwargs["snapshot"].trading_state)
+        return real(**kwargs)
+
+    monkeypatch.setattr(placement_module, "evaluate", spy)
+    return seen
+
+
+def test_safety_must_cover_the_same_account() -> None:
+    account = new_account()
+    with pytest.raises(DomainValidationError, match="same account_state"):
+        PlacementCoordinator(
+            account_state=account,
+            safety=SafetyController(account_state=new_account()),
+            policy=policy(),
+            clock=CountingClock(),
+            client_order_id_generator=SequenceIds(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_recovery_makes_risk_see_paused(risk_states: list[TradingState]) -> None:
+    account = await flat_account()
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_orders_reconciled()
+    safety.mark_positions_reconciled()
+    safety.mark_open_orders_reconciled()  # fills not complete yet
+    safety.request_state(RUNNING)
+    ids, clock = SequenceIds(), CountingClock()
+    coord = coordinator(account=account, safety=safety, ids=ids, clock=clock)
+
+    record = await coord.place(intent=intent())
+
+    assert risk_states == [TradingState.PAUSED]
+    assert record.approved is False
+    assert record.decision.reasons == (RiskReason.TRADING_PAUSED,)
+    assert await registry_state(account) == (SEEDED, (), (), 0)
+    assert (ids.calls, clock.calls) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_default_controller_makes_risk_see_paused(risk_states: list[TradingState]) -> None:
+    account = await flat_account()
+    coord = coordinator(account=account, safety=SafetyController(account_state=account))
+
+    record = await coord.place(intent=intent())
+
+    assert risk_states == [TradingState.PAUSED]
+    assert record.decision.reasons == (RiskReason.TRADING_PAUSED,)
+
+
+@pytest.mark.parametrize("requested", [RUNNING, TradingState.REDUCE_ONLY])
+@pytest.mark.asyncio
+async def test_complete_recovery_passes_the_requested_state_to_risk(
+    requested: TradingState, risk_states: list[TradingState]
+) -> None:
+    account = await flat_account()
+    coord = coordinator(account=account, safety=ready_safety(account, requested))
+
+    record = await coord.place(intent=intent())
+
+    assert risk_states == [requested]
+    if requested is RUNNING:
+        assert record.approved is True
+    else:
+        assert record.decision.reasons == (RiskReason.REDUCE_ONLY_STATE,)
+
+
+@pytest.mark.asyncio
+async def test_completing_the_last_gate_lets_the_next_placement_run(
+    risk_states: list[TradingState],
+) -> None:
+    account = await flat_account()
+    safety = SafetyController(account_state=account)
+    safety.request_state(RUNNING)
+    safety.mark_hydrated()
+    safety.mark_fills_complete()
+    safety.mark_open_orders_reconciled()
+    safety.mark_orders_reconciled()
+    coord = coordinator(account=account, safety=safety)
+
+    first = await coord.place(intent=intent("i-1"))
+    safety.mark_positions_reconciled()
+    second = await coord.place(intent=intent("i-2"))
+
+    assert risk_states == [TradingState.PAUSED, RUNNING]
+    assert first.approved is False
+    assert second.approved is True
+
+
+@pytest.mark.asyncio
+async def test_poison_after_recovery_pauses_and_placement_fails_closed_before_risk(
+    risk_states: list[TradingState],
+) -> None:
+    store = InMemoryAccountStateStore()
+    account = InMemoryAccountState(account_scope_id=SCOPE, store=store)
+    async with account.account_lock() as locked:
+        await locked.set_position_qty("BTCUSDT", FLAT)
+    safety = ready_safety(account)
+    coord = coordinator(account=account, safety=safety)
+    assert safety.effective_state is RUNNING
+    store.inject_commit_failure(CommitFailure.UNCERTAIN)
+    async with account.account_lock() as locked:
+        with pytest.raises(StoreUncertainError):
+            await locked.set_position_qty("ETHUSDT", FLAT)
+
+    effective = safety.effective_state
+    assert effective is TradingState.PAUSED
+    # The RiskSnapshot a placement would build from it is rejected as paused...
+    async with account.account_lock() as locked:
+        snapshot = build_risk_snapshot(
+            snapshot_id=f"{SCOPE}:{locked.revision}",
+            symbol="BTCUSDT",
+            trading_state=effective,
+            position_qty=locked.position_qty("BTCUSDT"),
+            orders=locked.active_orders("BTCUSDT"),
+            account_open_order_count=locked.account_active_order_count(),
+        )
+    decision = evaluate(intent=intent(), snapshot=snapshot, policy=policy())
+    assert decision.reasons == (RiskReason.TRADING_PAUSED,)
+    # ...and the coordinator does not even get that far: poison fails first.
+    with pytest.raises(AccountStatePoisonedError):
+        await coord.place(intent=intent())
+    assert risk_states == []
+
+
+@pytest.mark.asyncio
+async def test_replay_is_returned_while_recovery_is_incomplete(
+    risk_states: list[TradingState], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = await flat_account()
+    safety = ready_safety(account)
+    coord = coordinator(account=account, safety=safety)
+    approved = await coord.place(intent=intent("i-1"))
+    assert approved.approved is True
+
+    # Same account, a new (incomplete) session controller: effective PAUSED.
+    fresh = SafetyController(account_state=account)
+    fresh.request_state(RUNNING)
+    reads: list[int] = []
+    real_snapshot = SafetyController.snapshot
+
+    def counting_snapshot(self: SafetyController) -> Any:
+        reads.append(1)
+        return real_snapshot(self)
+
+    monkeypatch.setattr(SafetyController, "snapshot", counting_snapshot)
+    ids, clock = SequenceIds(), CountingClock()
+    paused = coordinator(account=account, safety=fresh, ids=ids, clock=clock)
+
+    assert await paused.place(intent=intent("i-1")) is approved
+    assert reads == []  # a replay never consults safety
+    assert risk_states == [RUNNING]  # only the original evaluation
+    assert (ids.calls, clock.calls) == (0, 0)
+
+    record = await paused.place(intent=intent("i-2"))
+    assert reads == [1]  # one safety read per new placement
+    assert record.decision.reasons == (RiskReason.TRADING_PAUSED,)

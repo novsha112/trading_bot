@@ -20,6 +20,7 @@ MODULES = (
     "app.execution.state_invariants",
     "app.execution.recovery",
     "app.persistence.memory",
+    "app.execution.safety",
     "app.services.placement",
     "app.execution.submitter",
     "app.execution.reconciliation",

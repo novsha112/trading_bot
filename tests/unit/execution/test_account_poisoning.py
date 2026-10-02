@@ -35,6 +35,7 @@ from app.execution.persistence import (
     StoreValidationError,
 )
 from app.execution.reconciliation import UnknownOrderReconciler
+from app.execution.safety import SafetyController
 from app.execution.submitter import OrderSubmitter
 from app.persistence.memory import CommitFailure, InMemoryAccountStateStore
 from app.risk.manager import evaluate
@@ -152,6 +153,18 @@ def report(status: OrderStatus, filled: str = "0") -> ExchangeOrderState:
         avg_fill_price=D("100") if D(filled) > 0 else None,
         exchange_ts=T1,
     )
+
+
+def ready_safety(account: InMemoryAccountState) -> SafetyController:
+    """Every recovery gate confirmed and RUNNING requested: effective RUNNING."""
+    safety = SafetyController(account_state=account)
+    safety.mark_hydrated()
+    safety.mark_orders_reconciled()
+    safety.mark_positions_reconciled()
+    safety.mark_open_orders_reconciled()
+    safety.mark_fills_complete()
+    safety.request_state(TradingState.RUNNING)
+    return safety
 
 
 async def reserve(locked: LockedAccountState, intent_id: str = "i-1", cid: str = "c-1") -> None:
@@ -571,12 +584,16 @@ async def test_uncertain_reservation_poisons_and_the_coordinator_stops_first(
         await locked.set_position_qty("BTCUSDT", FLAT)
     ids, clock = Ids(), Clock()
     coord = PlacementCoordinator(
-        account_state=account, policy=policy(), clock=clock, client_order_id_generator=ids
+        account_state=account,
+        safety=ready_safety(account),
+        policy=policy(),
+        clock=clock,
+        client_order_id_generator=ids,
     )
     store.fail_next()
 
     with pytest.raises(StoreUncertainError):
-        await coord.place(intent=intent(), trading_state=TradingState.RUNNING)
+        await coord.place(intent=intent())
 
     assert account.is_poisoned is True
     assert await account.placement("i-1") is None  # RAM: no reservation
@@ -587,7 +604,7 @@ async def test_uncertain_reservation_poisons_and_the_coordinator_stops_first(
 
     for source in (intent(), intent("i-2")):  # the same intent and a new one
         with pytest.raises(AccountStatePoisonedError):
-            await coord.place(intent=source, trading_state=TradingState.RUNNING)
+            await coord.place(intent=source)
 
     assert (len(evaluations), ids.calls, clock.calls, store.attempts) == counts
 
