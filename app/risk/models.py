@@ -121,7 +121,12 @@ class RiskSnapshot:
     position_qty: Decimal | None
     """Signed net position: > 0 long, < 0 short, 0 known flat; None = unknown."""
     open_orders: tuple[OpenOrderExposure, ...] | None
-    """Active orders of ``symbol``; () = known none; None = unknown."""
+    """Active orders of ``symbol`` only (for worst-case position exposure);
+    () = known none; None = unknown."""
+    account_open_order_count: int | None
+    """Active orders of the whole account, all symbols (for the global
+    ``max_open_orders``); 0 = known none; None = unknown. Not tied to
+    ``len(open_orders)``: other symbols may have active orders too."""
 
     def __post_init__(self) -> None:
         require_text(self.snapshot_id, "snapshot_id")
@@ -135,6 +140,17 @@ class RiskSnapshot:
             for item in self.open_orders:
                 if not isinstance(item, OpenOrderExposure):
                     raise DomainValidationError("open_orders must contain only OpenOrderExposure")
+        count = self.account_open_order_count
+        if count is not None:
+            if type(count) is not int or count < 0:
+                raise DomainValidationError(
+                    f"account_open_order_count must be an int >= 0 or None, got {count!r}"
+                )
+            if self.open_orders is not None and count < len(self.open_orders):
+                raise DomainValidationError(
+                    f"account_open_order_count ({count}) is below the {len(self.open_orders)} "
+                    f"active orders of {self.symbol}"
+                )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

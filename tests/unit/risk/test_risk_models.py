@@ -73,6 +73,7 @@ def snapshot(**overrides: Any) -> RiskSnapshot:
         "trading_state": TradingState.RUNNING,
         "position_qty": D("0"),
         "open_orders": (),
+        "account_open_order_count": 10,
     }
     return RiskSnapshot(**{**values, **overrides})
 
@@ -274,7 +275,71 @@ def test_snapshot_trading_state_must_be_the_enum(value: object) -> None:
 def test_snapshot_has_no_cash_equity_mark_or_time() -> None:
     names = {f.name for f in dataclasses.fields(RiskSnapshot)}
 
-    assert names == {"snapshot_id", "symbol", "trading_state", "position_qty", "open_orders"}
+    assert names == {
+        "snapshot_id",
+        "symbol",
+        "trading_state",
+        "position_qty",
+        "open_orders",
+        "account_open_order_count",
+    }
+
+
+@pytest.mark.parametrize("count", [None, 0, 1, 10**9])
+def test_account_open_order_count_known_or_unknown(count: int | None) -> None:
+    # Unknown (None) is distinct from a known zero.
+    assert snapshot(account_open_order_count=count).account_open_order_count == count
+
+
+@pytest.mark.parametrize("count", [True, False, -1, D("1"), 1.0, "1"])
+def test_account_open_order_count_invalid(count: object) -> None:
+    with pytest.raises(DomainValidationError, match="account_open_order_count"):
+        snapshot(account_open_order_count=count)
+
+
+def test_account_open_order_count_has_no_default() -> None:
+    with pytest.raises(TypeError):
+        RiskSnapshot(  # type: ignore[call-arg]
+            snapshot_id="s",
+            symbol="BTCUSDT",
+            trading_state=TradingState.RUNNING,
+            position_qty=D("0"),
+            open_orders=(),
+        )
+
+
+@pytest.mark.parametrize("count", [2, 7])
+def test_account_count_may_exceed_symbol_orders(count: int) -> None:
+    # Other symbols may have active orders too: the counts are not tied together.
+    s = snapshot(open_orders=(order(), order(side=Side.SELL)), account_open_order_count=count)
+
+    assert len(s.open_orders or ()) == 2
+    assert s.account_open_order_count == count
+
+
+def test_account_count_below_symbol_orders_is_inconsistent() -> None:
+    with pytest.raises(DomainValidationError, match="account_open_order_count"):
+        snapshot(open_orders=(order(), order(side=Side.SELL)), account_open_order_count=1)
+
+
+@pytest.mark.parametrize("count", [0, None])
+def test_no_relation_is_checked_when_symbol_orders_are_unknown(count: int | None) -> None:
+    s = snapshot(open_orders=None, account_open_order_count=count)
+
+    assert (s.open_orders, s.account_open_order_count) == (None, count)
+
+
+def test_known_symbol_orders_with_unknown_account_count() -> None:
+    s = snapshot(open_orders=(), account_open_order_count=None)
+
+    assert s.account_open_order_count is None
+
+
+def test_account_open_order_count_is_immutable() -> None:
+    s = snapshot(account_open_order_count=3)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        s.account_open_order_count = 4  # type: ignore[misc]
 
 
 # --- SymbolRiskLimits -----------------------------------------------------------------
@@ -489,7 +554,11 @@ def test_models_keep_exact_values_under_a_low_precision_context() -> None:
     def build() -> tuple[object, ...]:
         return (
             order(remaining_qty=D("3.333"), price=D("101.37")),
-            snapshot(position_qty=D("-7.777"), open_orders=(order(remaining_qty=D("5.555")),)),
+            snapshot(
+                position_qty=D("-7.777"),
+                open_orders=(order(remaining_qty=D("5.555")),),
+                account_open_order_count=3,
+            ),
             limits(max_order_qty=D("3.333"), max_order_notional=D("123456.789")),
             policy(symbols={"BTCUSDT": limits(max_position_qty=D("7.777"))}),
             exposure(reducing_qty=D("3.333"), increasing_qty=D("4.444"), worst_long_qty=D("7.777")),
