@@ -106,8 +106,16 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "exchanges.simulated_accounting": frozenset({"app.domain"}),
     # Reservation registry: local state only, no exchange contracts or network.
     "execution.models": frozenset({"app.domain", "app.risk.models"}),
+    # Account state: domain, Risk models, portfolio rules and its own persistence
+    # port (never a persistence adapter).
     "execution.account_state": frozenset(
-        {"app.domain", "app.risk.models", "app.execution.models", "app.portfolio.positions"}
+        {
+            "app.domain",
+            "app.risk.models",
+            "app.execution.models",
+            "app.execution.persistence",
+            "app.portfolio.positions",
+        }
     ),
     # Pure request mapping: the Order and the exchange-neutral DTO only.
     "execution.requests": frozenset({"app.domain", "app.exchanges.models"}),

@@ -22,6 +22,7 @@ from app.execution.account_state import (
     FillConflictError,
     InMemoryAccountState,
 )
+from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision
 
 D = Decimal
@@ -34,6 +35,13 @@ FLAT = D("0")
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
+    """An account state on a fresh in-memory reference store."""
+    return InMemoryAccountState(
+        account_scope_id=account_scope_id, store=InMemoryAccountStateStore()
+    )
 
 
 def intent(intent_id: str, **overrides: Any) -> PlaceOrderIntent:
@@ -88,10 +96,10 @@ async def account_with(
     **intent_overrides: Any,
 ) -> InMemoryAccountState:
     """One reserved order (SUBMITTING by default) and the BTCUSDT position."""
-    account = InMemoryAccountState()
+    account = new_account()
     await add_order(account, client_order_id, submitted=submitted, **intent_overrides)
     async with account.account_lock() as locked:
-        locked.set_position_qty("BTCUSDT", position)
+        await locked.set_position_qty("BTCUSDT", position)
     return account
 
 
@@ -100,7 +108,7 @@ async def add_order(
 ) -> None:
     source = intent(f"i-{client_order_id}", **overrides)
     async with account.account_lock() as locked:
-        locked.register_approved(
+        await locked.register_approved(
             intent=source,
             decision=RiskDecision(
                 intent_id=source.intent_id,
@@ -115,12 +123,12 @@ async def add_order(
             at=T0,
         )
         if submitted:
-            locked.mark_submitting(client_order_id, at=T0)
+            await locked.mark_submitting(client_order_id, at=T0)
 
 
 async def apply(account: InMemoryAccountState, item: Fill, *, at: datetime = T2) -> Order:
     async with account.account_lock() as locked:
-        return locked.apply_fill(item, at=at)
+        return await locked.apply_fill(item, at=at)
 
 
 def whole_state(account: InMemoryAccountState) -> tuple[Any, ...]:
@@ -147,7 +155,7 @@ def inject(account: InMemoryAccountState, order: Order) -> None:
 
 @pytest.mark.asyncio
 async def test_position_is_unknown_until_set() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     assert await account.position_qty("BTCUSDT") is None
     assert await account.revision() == 0
@@ -156,10 +164,10 @@ async def test_position_is_unknown_until_set() -> None:
 @pytest.mark.parametrize("qty", ["0", "2.5", "-2.5"])
 @pytest.mark.asyncio
 async def test_known_flat_long_and_short_positions(qty: str) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        locked.set_position_qty("BTCUSDT", D(qty))
+        await locked.set_position_qty("BTCUSDT", D(qty))
         assert locked.revision == 1
 
     assert await account.position_qty("BTCUSDT") == D(qty)
@@ -168,12 +176,12 @@ async def test_known_flat_long_and_short_positions(qty: str) -> None:
 
 @pytest.mark.asyncio
 async def test_position_revision_changes_only_with_the_value() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     revisions: list[int] = []
 
     async with account.account_lock() as locked:
         for value in (None, D("0"), D("0.0"), D("1"), D("1"), None, None):
-            locked.set_position_qty("BTCUSDT", value)
+            await locked.set_position_qty("BTCUSDT", value)
             revisions.append(locked.revision)
 
     assert revisions == [0, 1, 1, 2, 2, 3, 3]
@@ -186,11 +194,11 @@ async def test_position_revision_changes_only_with_the_value() -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_position_is_rejected(symbol: str, qty: object, match: str) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match=match):
-            locked.set_position_qty(symbol, qty)  # type: ignore[arg-type]
+            await locked.set_position_qty(symbol, qty)  # type: ignore[arg-type]
         assert locked.revision == 0
 
 
@@ -203,7 +211,7 @@ async def test_mark_submitting_is_a_write_ahead_transition() -> None:
     before = await account.revision()
 
     async with account.account_lock() as locked:
-        order = locked.mark_submitting("c-1", at=T1)
+        order = await locked.mark_submitting("c-1", at=T1)
 
     assert (order.status, order.version, order.updated_at) == (S.SUBMITTING, 1, T1)
     assert await account.order("c-1") == order
@@ -218,9 +226,9 @@ async def test_mark_submitting_rejects_unknown_and_repeated_orders() -> None:
 
     async with account.account_lock() as locked:
         with pytest.raises(AccountStateError, match="c-9"):
-            locked.mark_submitting("c-9", at=T1)
+            await locked.mark_submitting("c-9", at=T1)
         with pytest.raises(InvalidOrderTransition, match="submitting -> submitting"):
-            locked.mark_submitting("c-1", at=T1)
+            await locked.mark_submitting("c-1", at=T1)
 
     assert whole_state(account) == before
 
@@ -311,7 +319,7 @@ async def test_signed_position_change(position: str, side: Side, qty: str, expec
 async def test_fill_changes_only_its_own_symbol() -> None:
     account = await account_with()
     async with account.account_lock() as locked:
-        locked.set_position_qty("ETHUSDT", D("-2"))
+        await locked.set_position_qty("ETHUSDT", D("-2"))
 
     await apply(account, fill(qty="1"))
 
@@ -548,9 +556,9 @@ async def test_invalid_fill_arguments(item: object, at: datetime) -> None:
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="Fill"):
-            locked.apply_fill(item, at=at)  # type: ignore[arg-type]
+            await locked.apply_fill(item, at=at)  # type: ignore[arg-type]
         with pytest.raises(DomainValidationError, match="at"):
-            locked.apply_fill(fill(), at=datetime(2026, 1, 15, 12, 0))  # noqa: DTZ001
+            await locked.apply_fill(fill(), at=datetime(2026, 1, 15, 12, 0))  # noqa: DTZ001
 
     assert whole_state(account) == before
 

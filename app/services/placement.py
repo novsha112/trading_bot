@@ -15,11 +15,14 @@ Under ONE account lock (``InMemoryAccountState.account_lock``):
    ``register_approved``: the ``Order(NEW)`` is visible before the lock is
    released and the revision becomes R + 1.
 
-Nothing is awaited inside the lock and nothing is sent anywhere: the result is
-the ``PlacementRecord``. The position is never taken from the caller (an unknown
-position stays ``None`` -> UNKNOWN_POSITION); ``TradingState`` has no owner yet
-and is still passed per placement. ``account_scope_id`` must not contain ``:``,
-the delimiter of the snapshot id.
+The only await inside the lock is the durable commit of the registration (the
+record, and for an approval the ``Order(NEW)``, become visible only after it
+succeeded); nothing is sent anywhere: the result is the ``PlacementRecord``. A
+store error propagates and leaves no reservation (a generated id is then simply
+unused). The position is never taken from the caller (an unknown position stays
+``None`` -> UNKNOWN_POSITION); ``TradingState`` has no owner yet and is still
+passed per placement. The account scope comes from the account state and must
+not contain ``:``, the delimiter of the snapshot id.
 
 Failures: an exactly unrepresentable snapshot (``ExposureCalculationError``)
 is a ``PlacementPreparationError`` (cause chained), not a Risk rejection; other
@@ -36,7 +39,6 @@ from typing import Final, Protocol
 from app.domain.clock import Clock
 from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
-from app.domain.validation import require_text
 from app.execution.account_state import InMemoryAccountState
 from app.execution.models import PlacementRecord
 from app.risk.exposure import ExposureCalculationError
@@ -65,19 +67,20 @@ class PlacementCoordinator:
     def __init__(
         self,
         *,
-        account_scope_id: str,
         account_state: InMemoryAccountState,
         policy: RiskPolicy,
         clock: Clock,
         client_order_id_generator: ClientOrderIdGenerator,
     ) -> None:
-        scope = require_text(account_scope_id, "account_scope_id")
+        if type(account_state) is not InMemoryAccountState:
+            raise DomainValidationError("account_state must be an InMemoryAccountState")
+        # The account state owns the scope (every durable change carries it); the
+        # snapshot id format needs it free of the delimiter.
+        scope = account_state.account_scope_id
         if _SNAPSHOT_ID_DELIMITER in scope:
             raise DomainValidationError(
                 f"account_scope_id must not contain {_SNAPSHOT_ID_DELIMITER!r}, got {scope!r}"
             )
-        if type(account_state) is not InMemoryAccountState:
-            raise DomainValidationError("account_state must be an InMemoryAccountState")
         if type(policy) is not RiskPolicy:
             raise DomainValidationError("policy must be a RiskPolicy")
         if not callable(getattr(clock, "now", None)):
@@ -92,6 +95,7 @@ class PlacementCoordinator:
 
     @property
     def account_scope_id(self) -> str:
+        """The scope of the account state (its single source of truth)."""
         return self._account_scope_id
 
     async def place(
@@ -124,12 +128,12 @@ class PlacementCoordinator:
                 ) from error
             decision = evaluate(intent=intent, snapshot=snapshot, policy=self._policy)
             if not decision.approved:
-                return locked.register_rejected(
+                return await locked.register_rejected(
                     intent=intent, decision=decision, expected_revision=revision
                 )
             client_order_id = self._ids.next_id(intent=intent)
             at = self._clock.now()
-            return locked.register_approved(
+            return await locked.register_approved(
                 intent=intent,
                 decision=decision,
                 client_order_id=client_order_id,

@@ -26,6 +26,7 @@ from app.execution.account_state import (
     StaleRevisionError,
 )
 from app.execution.models import PlacementRecord
+from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, RiskReason
 
 D = Decimal
@@ -34,6 +35,13 @@ T1 = T0 + timedelta(seconds=1)
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
+    """An account state on a fresh in-memory reference store."""
+    return InMemoryAccountState(
+        account_scope_id=account_scope_id, store=InMemoryAccountStateStore()
+    )
 
 
 def intent(intent_id: str = "i-1", **overrides: Any) -> PlaceOrderIntent:
@@ -75,7 +83,7 @@ def rejected(source: PlaceOrderIntent, snapshot_id: str = "acct:0") -> RiskDecis
     )
 
 
-def reserve(
+async def reserve(
     locked: LockedAccountState,
     source: PlaceOrderIntent,
     client_order_id: str,
@@ -83,7 +91,7 @@ def reserve(
     expected_revision: int | None = None,
     at: datetime = T1,
 ) -> PlacementRecord:
-    return locked.register_approved(
+    return await locked.register_approved(
         intent=source,
         decision=approved(source),
         client_order_id=client_order_id,
@@ -92,8 +100,8 @@ def reserve(
     )
 
 
-def reject(locked: LockedAccountState, source: PlaceOrderIntent) -> PlacementRecord:
-    return locked.register_rejected(
+async def reject(locked: LockedAccountState, source: PlaceOrderIntent) -> PlacementRecord:
+    return await locked.register_rejected(
         intent=source, decision=rejected(source), expected_revision=locked.revision
     )
 
@@ -103,7 +111,7 @@ def reject(locked: LockedAccountState, source: PlaceOrderIntent) -> PlacementRec
 
 @pytest.mark.asyncio
 async def test_initial_state_is_empty() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     assert await account.revision() == 0
     assert await account.active_orders("BTCUSDT") == ()
@@ -117,11 +125,11 @@ async def test_initial_state_is_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_approved_reservation_creates_new_order_and_bumps_revision() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
 
     async with account.account_lock() as locked:
-        record = reserve(locked, source, "c-1")
+        record = await reserve(locked, source, "c-1")
         assert locked.revision == 1
 
     expected_order = Order(
@@ -157,7 +165,7 @@ async def test_approved_reservation_creates_new_order_and_bumps_revision() -> No
 
 @pytest.mark.asyncio
 async def test_market_and_reduce_only_terms_are_copied() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent(
         order_type=OrderType.MARKET,
         price=None,
@@ -168,7 +176,7 @@ async def test_market_and_reduce_only_terms_are_copied() -> None:
     )
 
     async with account.account_lock() as locked:
-        reserve(locked, source, "c-1")
+        await reserve(locked, source, "c-1")
 
     order = await account.order("c-1")
     assert order is not None
@@ -183,10 +191,10 @@ async def test_market_and_reduce_only_terms_are_copied() -> None:
 
 @pytest.mark.asyncio
 async def test_reservation_time_may_equal_intent_time() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent(), "c-1", at=T0)
+        await reserve(locked, intent(), "c-1", at=T0)
 
     order = await account.order("c-1")
     assert order is not None
@@ -195,11 +203,11 @@ async def test_reservation_time_may_equal_intent_time() -> None:
 
 @pytest.mark.asyncio
 async def test_reservation_before_intent_time_is_rejected() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="before"):
-            reserve(locked, intent(), "c-1", at=T0 - timedelta(microseconds=1))
+            await reserve(locked, intent(), "c-1", at=T0 - timedelta(microseconds=1))
         assert locked.revision == 0
 
 
@@ -208,11 +216,11 @@ async def test_reservation_before_intent_time_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_rejected_placement_is_recorded_without_order_or_revision() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
 
     async with account.account_lock() as locked:
-        record = reject(locked, source)
+        record = await reject(locked, source)
 
     assert record == PlacementRecord(intent=source, decision=rejected(source), client_order_id=None)
     assert record.approved is False
@@ -224,11 +232,11 @@ async def test_rejected_placement_is_recorded_without_order_or_revision() -> Non
 
 @pytest.mark.asyncio
 async def test_rejected_placement_does_not_change_existing_exposure() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent("i-1"), "c-1")
-        reject(locked, intent("i-2"))
+        await reserve(locked, intent("i-1"), "c-1")
+        await reject(locked, intent("i-2"))
 
     assert await account.revision() == 1
     assert len(await account.active_orders("BTCUSDT")) == 1
@@ -240,13 +248,13 @@ async def test_rejected_placement_does_not_change_existing_exposure() -> None:
 
 @pytest.mark.asyncio
 async def test_approved_replay_returns_the_same_record() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
 
     async with account.account_lock() as locked:
-        first = reserve(locked, source, "c-1")
+        first = await reserve(locked, source, "c-1")
         # A replay with a new client id and a stale revision is still a replay.
-        second = reserve(locked, intent(), "c-2", expected_revision=0)
+        second = await reserve(locked, intent(), "c-2", expected_revision=0)
         assert locked.revision == 1
 
     assert second is first
@@ -256,11 +264,11 @@ async def test_approved_replay_returns_the_same_record() -> None:
 
 @pytest.mark.asyncio
 async def test_rejected_replay_returns_the_same_record() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        first = reject(locked, intent())
-        second = reject(locked, intent())
+        first = await reject(locked, intent())
+        second = await reject(locked, intent())
 
     assert second is first
     assert await account.revision() == 0
@@ -268,13 +276,13 @@ async def test_rejected_replay_returns_the_same_record() -> None:
 
 @pytest.mark.asyncio
 async def test_intent_is_single_use_across_outcomes() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
 
     async with account.account_lock() as locked:
-        first = reject(locked, source)
+        first = await reject(locked, source)
         # A later approval of the same intent does not replace the recorded result.
-        second = reserve(locked, source, "c-1")
+        second = await reserve(locked, source, "c-1")
 
     assert second is first
     assert await account.order("c-1") is None
@@ -283,12 +291,12 @@ async def test_intent_is_single_use_across_outcomes() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_after_lock_release_returns_the_same_record() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        first = reserve(locked, intent(), "c-1")
+        first = await reserve(locked, intent(), "c-1")
     async with account.account_lock() as locked:
-        second = reserve(locked, intent(), "c-9")
+        second = await reserve(locked, intent(), "c-9")
 
     assert second is first
     assert await account.revision() == 1
@@ -314,14 +322,14 @@ async def test_replay_after_lock_release_returns_the_same_record() -> None:
 async def test_same_intent_id_with_different_data_is_a_conflict(
     overrides: dict[str, Any],
 ) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent(), "c-1")
+        await reserve(locked, intent(), "c-1")
         with pytest.raises(PlacementConflictError, match="i-1"):
-            reserve(locked, intent(**overrides), "c-2", at=T1 + timedelta(seconds=1))
+            await reserve(locked, intent(**overrides), "c-2", at=T1 + timedelta(seconds=1))
         with pytest.raises(PlacementConflictError, match="i-1"):
-            reject(locked, intent(**overrides))
+            await reject(locked, intent(**overrides))
         assert locked.revision == 1
 
     assert await account.order("c-2") is None
@@ -330,22 +338,22 @@ async def test_same_intent_id_with_different_data_is_a_conflict(
 @pytest.mark.asyncio
 async def test_numerically_equal_decimals_are_the_same_intent() -> None:
     # Identity is field equality: Decimal compares by value, not representation.
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        first = reserve(locked, intent(price=D("100.5")), "c-1")
-        second = reserve(locked, intent(price=D("100.50")), "c-2")
+        first = await reserve(locked, intent(price=D("100.5")), "c-1")
+        second = await reserve(locked, intent(price=D("100.50")), "c-2")
 
     assert second is first
 
 
 @pytest.mark.asyncio
 async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         assert locked.replay_of(intent()) is None
-        record = reject(locked, intent())
+        record = await reject(locked, intent())
         assert locked.replay_of(intent()) is record
         with pytest.raises(PlacementConflictError, match="i-1"):
             locked.replay_of(intent(qty=D("2")))
@@ -362,12 +370,12 @@ async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
 
 @pytest.mark.asyncio
 async def test_client_order_id_of_another_intent_is_a_conflict() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent("i-1"), "c-1")
+        await reserve(locked, intent("i-1"), "c-1")
         with pytest.raises(PlacementConflictError, match="c-1"):
-            reserve(locked, intent("i-2"), "c-1")
+            await reserve(locked, intent("i-2"), "c-1")
         assert locked.revision == 1
 
     assert await account.placement("i-2") is None
@@ -377,11 +385,11 @@ async def test_client_order_id_of_another_intent_is_a_conflict() -> None:
 @pytest.mark.parametrize("client_order_id", ["", " c-1", "c-1 ", 7, None])
 @pytest.mark.asyncio
 async def test_invalid_client_order_id_is_rejected(client_order_id: object) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="client_order_id"):
-            reserve(locked, intent(), client_order_id)  # type: ignore[arg-type]
+            await reserve(locked, intent(), client_order_id)  # type: ignore[arg-type]
         assert locked.revision == 0
 
     assert await account.placement("i-1") is None
@@ -399,11 +407,11 @@ def test_registry_does_not_generate_identifiers() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_must_belong_to_the_intent() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="intent_id"):
-            locked.register_approved(
+            await locked.register_approved(
                 intent=intent("i-1"),
                 decision=approved(intent("i-2")),
                 client_order_id="c-1",
@@ -411,19 +419,19 @@ async def test_decision_must_belong_to_the_intent() -> None:
                 at=T1,
             )
         with pytest.raises(DomainValidationError, match="intent_id"):
-            locked.register_rejected(
+            await locked.register_rejected(
                 intent=intent("i-1"), decision=rejected(intent("i-2")), expected_revision=0
             )
 
 
 @pytest.mark.asyncio
 async def test_decision_outcome_must_match_the_operation() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="approved"):
-            locked.register_approved(
+            await locked.register_approved(
                 intent=source,
                 decision=rejected(source),
                 client_order_id="c-1",
@@ -431,7 +439,9 @@ async def test_decision_outcome_must_match_the_operation() -> None:
                 at=T1,
             )
         with pytest.raises(DomainValidationError, match="rejected"):
-            locked.register_rejected(intent=source, decision=approved(source), expected_revision=0)
+            await locked.register_rejected(
+                intent=source, decision=approved(source), expected_revision=0
+            )
         assert locked.revision == 0
 
     assert await account.placement("i-1") is None
@@ -451,7 +461,7 @@ async def test_decision_outcome_must_match_the_operation() -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_arguments_are_rejected(field: str, value: object, match: str) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
     arguments: dict[str, Any] = {
         "intent": source,
@@ -463,7 +473,7 @@ async def test_invalid_arguments_are_rejected(field: str, value: object, match: 
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match=match):
-            locked.register_approved(**{**arguments, field: value})
+            await locked.register_approved(**{**arguments, field: value})
         assert locked.revision == 0
 
 
@@ -472,14 +482,14 @@ async def test_invalid_arguments_are_rejected(field: str, value: object, match: 
 
 @pytest.mark.asyncio
 async def test_stale_revision_is_rejected_without_changes() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent("i-1"), "c-1")
+        await reserve(locked, intent("i-1"), "c-1")
         with pytest.raises(StaleRevisionError, match="0"):
-            reserve(locked, intent("i-2"), "c-2", expected_revision=0)
+            await reserve(locked, intent("i-2"), "c-2", expected_revision=0)
         with pytest.raises(StaleRevisionError):
-            locked.register_rejected(
+            await locked.register_rejected(
                 intent=intent("i-3"), decision=rejected(intent("i-3")), expected_revision=0
             )
         assert locked.revision == 1
@@ -490,18 +500,18 @@ async def test_stale_revision_is_rejected_without_changes() -> None:
 
 @pytest.mark.asyncio
 async def test_revision_counts_only_reservations() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     revisions: list[int] = []
 
     async with account.account_lock() as locked:
         revisions.append(locked.revision)
-        reserve(locked, intent("i-1"), "c-1")
+        await reserve(locked, intent("i-1"), "c-1")
         revisions.append(locked.revision)
-        reject(locked, intent("i-2"))
+        await reject(locked, intent("i-2"))
         revisions.append(locked.revision)
-        reserve(locked, intent("i-1"), "c-1")  # replay
+        await reserve(locked, intent("i-1"), "c-1")  # replay
         revisions.append(locked.revision)
-        reserve(locked, intent("i-3"), "c-3")
+        await reserve(locked, intent("i-3"), "c-3")
         revisions.append(locked.revision)
 
     assert revisions == [0, 1, 1, 1, 2]
@@ -512,13 +522,13 @@ async def test_revision_counts_only_reservations() -> None:
 
 @pytest.mark.asyncio
 async def test_symbol_views_and_account_count_across_symbols() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        reserve(locked, intent("i-1"), "c-1")
-        reserve(locked, intent("i-2", symbol="ETHUSDT"), "c-2")
-        reserve(locked, intent("i-3", side=Side.SELL), "c-3")
-        reject(locked, intent("i-4", symbol="SOLUSDT"))
+        await reserve(locked, intent("i-1"), "c-1")
+        await reserve(locked, intent("i-2", symbol="ETHUSDT"), "c-2")
+        await reserve(locked, intent("i-3", side=Side.SELL), "c-3")
+        await reject(locked, intent("i-4", symbol="SOLUSDT"))
 
         btc = locked.active_orders("BTCUSDT")
         eth = locked.active_orders("ETHUSDT")
@@ -533,10 +543,10 @@ async def test_symbol_views_and_account_count_across_symbols() -> None:
 
 @pytest.mark.asyncio
 async def test_views_are_immutable_and_defensive() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
-        record = reserve(locked, intent(), "c-1")
+        record = await reserve(locked, intent(), "c-1")
         view = locked.active_orders("BTCUSDT")
 
     assert type(view) is tuple
@@ -546,7 +556,7 @@ async def test_views_are_immutable_and_defensive() -> None:
         record.client_order_id = "c-2"  # type: ignore[misc]
 
     async with account.account_lock() as locked:
-        reserve(locked, intent("i-2"), "c-2")
+        await reserve(locked, intent("i-2"), "c-2")
 
     assert len(view) == 1  # an earlier view does not change
     assert len(await account.active_orders("BTCUSDT")) == 2
@@ -557,7 +567,7 @@ async def test_views_are_immutable_and_defensive() -> None:
 @pytest.mark.parametrize("symbol", ["", " BTCUSDT", 7])
 @pytest.mark.asyncio
 async def test_invalid_symbol_view_is_rejected(symbol: object) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     with pytest.raises(DomainValidationError, match="symbol"):
         await account.active_orders(symbol)  # type: ignore[arg-type]
@@ -569,7 +579,7 @@ async def test_invalid_symbol_view_is_rejected(symbol: object) -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_lookup_ids_are_rejected(method: str, value: object) -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     with pytest.raises(DomainValidationError):
         await getattr(account, method)(value)
@@ -580,7 +590,7 @@ async def test_invalid_lookup_ids_are_rejected(method: str, value: object) -> No
 
 @pytest.mark.asyncio
 async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     a_inside = asyncio.Event()
     b_waiting = asyncio.Event()
     b_inside = asyncio.Event()
@@ -593,7 +603,7 @@ async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
             await asyncio.sleep(0)  # B is now blocked on the lock
             assert not b_inside.is_set()
             seen["a_revision"] = locked.revision
-            reserve(locked, intent("i-a"), "c-a", expected_revision=seen["a_revision"])
+            await reserve(locked, intent("i-a"), "c-a", expected_revision=seen["a_revision"])
 
     async def task_b() -> None:
         await a_inside.wait()
@@ -614,14 +624,14 @@ async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_reservations_do_not_lose_updates() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
     attempts = 20
 
     async def attempt(index: int) -> int:
         async with account.account_lock() as locked:
             revision = locked.revision
             await asyncio.sleep(0)  # yield inside the lock (e.g. a future persistence write)
-            reserve(locked, intent(f"i-{index}"), f"c-{index}", expected_revision=revision)
+            await reserve(locked, intent(f"i-{index}"), f"c-{index}", expected_revision=revision)
             return revision
 
     seen = await asyncio.wait_for(asyncio.gather(*(attempt(i) for i in range(attempts))), timeout=5)
@@ -633,12 +643,12 @@ async def test_concurrent_reservations_do_not_lose_updates() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_replays_of_one_intent_create_one_order() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async def attempt(index: int) -> PlacementRecord:
         async with account.account_lock() as locked:
             await asyncio.sleep(0)
-            return reserve(locked, intent("i-1"), f"c-{index}")
+            return await reserve(locked, intent("i-1"), f"c-{index}")
 
     records = await asyncio.wait_for(asyncio.gather(*(attempt(i) for i in range(10))), timeout=5)
 
@@ -649,12 +659,12 @@ async def test_concurrent_replays_of_one_intent_create_one_order() -> None:
 
 @pytest.mark.asyncio
 async def test_registration_inside_the_held_lock_does_not_deadlock() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async def flow() -> PlacementRecord:
         async with account.account_lock() as locked:
             _ = locked.revision, locked.active_orders("BTCUSDT")
-            return reserve(locked, intent(), "c-1")
+            return await reserve(locked, intent(), "c-1")
 
     record = await asyncio.wait_for(flow(), timeout=1)
 
@@ -663,7 +673,7 @@ async def test_registration_inside_the_held_lock_does_not_deadlock() -> None:
 
 @pytest.mark.asyncio
 async def test_reentering_the_lock_fails_fast_instead_of_deadlocking() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async def flow() -> None:
         async with account.account_lock():
@@ -679,7 +689,7 @@ async def test_reentering_the_lock_fails_fast_instead_of_deadlocking() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_cannot_be_used_after_release() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     async with account.account_lock() as locked:
         pass
@@ -687,7 +697,7 @@ async def test_handle_cannot_be_used_after_release() -> None:
     with pytest.raises(AccountLockError, match="released"):
         _ = locked.revision
     with pytest.raises(AccountLockError, match="released"):
-        reserve(locked, intent(), "c-1", expected_revision=0)
+        await reserve(locked, intent(), "c-1", expected_revision=0)
     with pytest.raises(AccountLockError, match="released"):
         locked.active_orders("BTCUSDT")
     assert await account.placement("i-1") is None
@@ -695,11 +705,11 @@ async def test_handle_cannot_be_used_after_release() -> None:
 
 @pytest.mark.asyncio
 async def test_lock_is_released_after_an_exception() -> None:
-    account = InMemoryAccountState()
+    account = new_account()
 
     with pytest.raises(StaleRevisionError):
         async with account.account_lock() as locked:
-            reserve(locked, intent(), "c-1", expected_revision=5)
+            await reserve(locked, intent(), "c-1", expected_revision=5)
 
     assert await asyncio.wait_for(account.revision(), timeout=1) == 0
 

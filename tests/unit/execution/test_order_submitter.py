@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_UP, Decimal, getcontext, localcontext
@@ -39,8 +40,10 @@ from app.execution.account_state import (
     SubmissionOutcomeConflictError,
 )
 from app.execution.models import SubmissionOutcome
+from app.execution.persistence import AccountStateChange, PersistedOrderNotional
 from app.execution.requests import order_request_from_order
 from app.execution.submitter import OrderAlreadySubmittedError, OrderSubmitter
+from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, TradingState
 from app.risk.snapshots import build_risk_snapshot
 
@@ -53,6 +56,13 @@ T3 = T0 + timedelta(seconds=3)
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
+    """An account state on a fresh in-memory reference store."""
+    return InMemoryAccountState(
+        account_scope_id=account_scope_id, store=InMemoryAccountStateStore()
+    )
 
 
 class SteppingClock:
@@ -144,11 +154,11 @@ def intent(**overrides: Any) -> PlaceOrderIntent:
 
 async def reserved_account(**overrides: Any) -> InMemoryAccountState:
     """Known flat BTCUSDT and one approved Order(NEW) "c-1"."""
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent(**overrides)
     async with account.account_lock() as locked:
-        locked.set_position_qty("BTCUSDT", D("0"))
-        locked.register_approved(
+        await locked.set_position_qty("BTCUSDT", D("0"))
+        await locked.register_approved(
             intent=source,
             decision=RiskDecision(
                 intent_id=source.intent_id,
@@ -330,7 +340,7 @@ async def test_ack_with_a_known_id_changes_nothing_more() -> None:
 
     async def fill_first(request: OrderRequest) -> None:
         async with account.account_lock() as locked:
-            locked.apply_fill(exchange_fill("e-1", "4"), at=T1)
+            await locked.apply_fill(exchange_fill("e-1", "4"), at=T1)
 
     base = await account.revision()
     order = await submitter(account, FakeClient(during=fill_first)).submit(client_order_id="c-1")
@@ -628,7 +638,7 @@ async def test_ack_with_another_exchange_id_after_a_fill_keeps_the_fill() -> Non
 
     async def fill_first(request: OrderRequest) -> None:
         async with account.account_lock() as locked:
-            locked.apply_fill(exchange_fill("e-1", "4", exchange_order_id="ex-7"), at=T1)
+            await locked.apply_fill(exchange_fill("e-1", "4", exchange_order_id="ex-7"), at=T1)
 
     client = FakeClient(during=fill_first)  # acks ex-1
 
@@ -651,12 +661,33 @@ async def test_ack_after_a_fill_does_not_roll_the_order_back(
     account = await reserved_account()
 
     async def fill_without_id(request: OrderRequest) -> None:
-        # White-box: a fill-advanced order whose exchange id is not known yet.
+        # White-box: a fill-advanced order whose exchange id is not known yet (no
+        # public path produces it: a real fill carries the id). Installed
+        # consistently in the durable store and then in RAM.
         async with account.account_lock() as locked:
             order = locked.order("c-1")
             assert order is not None
-            account._state.orders["c-1"] = transition(
+            advanced = transition(
                 order, status, at=T1, filled_qty=D(fill_qty), avg_fill_price=D("100")
+            )
+            notional = D(fill_qty) * D("100")
+            state = account._state
+            await account._store.commit(
+                AccountStateChange(
+                    account_scope_id=account.account_scope_id,
+                    expected_revision=state.revision,
+                    new_revision=state.revision + 1,
+                    order_writes=(advanced,),
+                    notional_writes=(
+                        PersistedOrderNotional(client_order_id="c-1", filled_notional=notional),
+                    ),
+                )
+            )
+            account._state = dataclasses.replace(
+                state,
+                orders={**state.orders, "c-1": advanced},
+                notionals={**state.notionals, "c-1": notional},
+                revision=state.revision + 1,
             )
 
     order = await submitter(account, FakeClient(during=fill_without_id)).submit(
@@ -676,7 +707,7 @@ async def test_ack_after_a_fill_does_not_roll_the_order_back(
 def fill_during(account: InMemoryAccountState, qty: str) -> Callable[[OrderRequest], Any]:
     async def during(request: OrderRequest) -> None:
         async with account.account_lock() as locked:
-            locked.apply_fill(exchange_fill("e-1", qty), at=T1)
+            await locked.apply_fill(exchange_fill("e-1", qty), at=T1)
 
     return during
 
@@ -745,13 +776,13 @@ async def test_record_ack_is_rejected_for_orders_that_were_never_accepted() -> N
         before = (await current(account), await account.revision())
         async with account.account_lock() as locked:
             with pytest.raises(OrderAckMismatchError, match=status.value):
-                locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+                await locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
         assert (await current(account), await account.revision()) == before
 
     account = await reserved_account()  # NEW: never sent
     async with account.account_lock() as locked:
         with pytest.raises(OrderAckMismatchError, match="new"):
-            locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+            await locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
 
 
 @pytest.mark.parametrize("status", [S.UNKNOWN, S.OPEN, S.CANCELING, S.CANCELED, S.EXPIRED])
@@ -761,8 +792,8 @@ async def test_record_ack_enriches_any_sent_state(status: OrderStatus) -> None:
     base = await account.revision()
 
     async with account.account_lock() as locked:
-        order = locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
-        again = locked.record_ack("c-1", exchange_order_id="ex-1", at=T3)
+        order = await locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+        again = await locked.record_ack("c-1", exchange_order_id="ex-1", at=T3)
 
     assert (order.status, order.exchange_order_id) == (status, "ex-1")
     assert again is order  # same id again: no change
@@ -776,7 +807,7 @@ async def test_record_outcome_on_a_new_order_is_an_error() -> None:
 
     async with account.account_lock() as locked:
         with pytest.raises(AccountStateError, match="never marked SUBMITTING"):
-            locked.record_submission_outcome("c-1", SubmissionOutcome.AMBIGUOUS, at=T2)
+            await locked.record_submission_outcome("c-1", SubmissionOutcome.AMBIGUOUS, at=T2)
 
     assert (await current(account), await account.revision()) == before
 

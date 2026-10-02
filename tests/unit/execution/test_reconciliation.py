@@ -42,6 +42,7 @@ from app.execution.reconciliation import (
     exchange_state_from_update,
 )
 from app.execution.submitter import OrderSubmitter
+from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.models import ExposureChange, RiskDecision, TradingState
 from app.risk.snapshots import build_risk_snapshot
 
@@ -54,6 +55,13 @@ T3 = T0 + timedelta(seconds=3)
 EXPOSURE = ExposureChange(
     reducing_qty=D("0"), increasing_qty=D("1"), worst_long_qty=D("1"), worst_short_qty=D("0")
 )
+
+
+def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
+    """An account state on a fresh in-memory reference store."""
+    return InMemoryAccountState(
+        account_scope_id=account_scope_id, store=InMemoryAccountStateStore()
+    )
 
 
 class FixedClock:
@@ -86,11 +94,11 @@ async def account_with(status: OrderStatus, *, filled: str = "0") -> InMemoryAcc
     Fills go through ``apply_fill`` (order and position stay consistent); other
     statuses are installed white-box through domain transitions, since order
     updates for them have no public producer in these tests."""
-    account = InMemoryAccountState()
+    account = new_account()
     source = intent()
     async with account.account_lock() as locked:
-        locked.set_position_qty("BTCUSDT", D("0"))
-        locked.register_approved(
+        await locked.set_position_qty("BTCUSDT", D("0"))
+        await locked.register_approved(
             intent=source,
             decision=RiskDecision(
                 intent_id="i-1",
@@ -106,9 +114,9 @@ async def account_with(status: OrderStatus, *, filled: str = "0") -> InMemoryAcc
         )
         if status is S.NEW:
             return account
-        locked.mark_submitting("c-1", at=T0)
+        await locked.mark_submitting("c-1", at=T0)
         if D(filled) > 0:
-            locked.apply_fill(fill("e-1", filled), at=T1)
+            await locked.apply_fill(fill("e-1", filled), at=T1)
         order = locked.order("c-1")
         assert order is not None
         paths: dict[OrderStatus, list[OrderStatus]] = {
@@ -186,7 +194,7 @@ async def current(account: InMemoryAccountState) -> Order:
 
 async def apply(account: InMemoryAccountState, item: ExchangeOrderState) -> Order:
     async with account.account_lock() as locked:
-        return locked.apply_exchange_state(item, at=T3)
+        return await locked.apply_exchange_state(item, at=T3)
 
 
 def whole_state(account: InMemoryAccountState) -> tuple[Any, ...]:
@@ -475,7 +483,7 @@ async def test_unknown_to_filled_needs_the_fills_first() -> None:
     assert whole_state(account) == before
 
     async with account.account_lock() as locked:
-        locked.apply_fill(fill("e-1", "10"), at=T2)  # the missing fill: UNKNOWN -> FILLED
+        await locked.apply_fill(fill("e-1", "10"), at=T2)  # the missing fill: UNKNOWN -> FILLED
     base = await account.revision()
     order = await apply(account, report(S.FILLED, "10"))
 
@@ -548,7 +556,7 @@ async def test_invalid_report_argument() -> None:
 
     async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="ExchangeOrderState"):
-            locked.apply_exchange_state(update(S.OPEN), at=T3)  # type: ignore[arg-type]
+            await locked.apply_exchange_state(update(S.OPEN), at=T3)  # type: ignore[arg-type]
 
 
 # --- reconciler -----------------------------------------------------------------------------
@@ -619,7 +627,7 @@ async def test_reconcile_applies_the_exchange_state(reported: OrderStatus, activ
 async def test_reconcile_passes_a_known_exchange_id() -> None:
     account = await account_with(S.UNKNOWN)
     async with account.account_lock() as locked:
-        locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+        await locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
     client = ReadClient(answer=update(S.OPEN))
 
     await reconciler(account, client).reconcile(client_order_id="c-1")
@@ -683,17 +691,17 @@ async def test_not_found_keeps_the_order_unknown_and_active() -> None:
 
 async def concurrent_fill(account: InMemoryAccountState, qty: str) -> None:
     async with account.account_lock() as locked:
-        locked.apply_fill(fill("e-1", qty), at=T2)
+        await locked.apply_fill(fill("e-1", qty), at=T2)
 
 
 async def concurrent_report(account: InMemoryAccountState, status: OrderStatus) -> None:
     async with account.account_lock() as locked:
-        locked.apply_exchange_state(report(status, exchange_order_id=None), at=T2)
+        await locked.apply_exchange_state(report(status, exchange_order_id=None), at=T2)
 
 
 async def concurrent_ack(account: InMemoryAccountState) -> None:
     async with account.account_lock() as locked:
-        locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
+        await locked.record_ack("c-1", exchange_order_id="ex-1", at=T2)
 
 
 @pytest.mark.parametrize(
@@ -897,7 +905,7 @@ async def test_fill_during_the_read_is_never_rolled_back() -> None:
 
     async def fill_meanwhile(ref: OrderRef) -> None:
         async with account.account_lock() as locked:
-            locked.apply_fill(fill("e-1", "4"), at=T2)  # UNKNOWN -> PARTIALLY_FILLED
+            await locked.apply_fill(fill("e-1", "4"), at=T2)  # UNKNOWN -> PARTIALLY_FILLED
 
     client = ReadClient(answer=update(S.OPEN), during=fill_meanwhile)  # stale answer
 
@@ -915,7 +923,7 @@ async def test_fill_during_the_read_with_a_matching_answer_is_confirmed() -> Non
 
     async def fill_meanwhile(ref: OrderRef) -> None:
         async with account.account_lock() as locked:
-            locked.apply_fill(fill("e-1", "4"), at=T2)
+            await locked.apply_fill(fill("e-1", "4"), at=T2)
 
     client = ReadClient(answer=update(S.PARTIALLY_FILLED, "4"), during=fill_meanwhile)
 
@@ -1018,7 +1026,12 @@ def test_reconciler_has_no_retry_or_background_machinery() -> None:
     awaited = [ast.unparse(n.value) for n in ast.walk(tree) if isinstance(n, ast.Await)]
     network = [call for call in awaited if call.startswith("self._client.")]
     assert network == ["self._client.get_order(ref)"]  # the only exchange call
-    assert set(awaited) - set(network) == {"self._classify_not_found(client_order_id, ref)"}
+    local = set(awaited) - set(network)
+    assert local == {
+        "self._classify_not_found(client_order_id, ref)",
+        "locked.apply_exchange_state(report, "
+        "at=change_time(self._clock, floor=current.updated_at))",
+    }
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

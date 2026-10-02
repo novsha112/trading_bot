@@ -21,6 +21,14 @@ Phase C, under the account lock again: the outcome is recorded.
     flight) is stronger than the transport outcome and is never rolled back (see
     ``LockedAccountState.record_submission_outcome``).
 
+Persistence: every recorded step (SUBMITTING, ack, outcome) is durable before
+it is visible. A store error before the network leaves the order NEW and sends
+nothing. A store error after the network propagates (the transport exception,
+if any, stays as its ``__context__``); the published order keeps its previous
+state, the request is never re-sent and the exchange is never "rolled back".
+After ``StoreUncertainError`` the account state must not be mutated further
+until reloaded (no runtime poison flag yet).
+
 Time: the submission time is one clock read in phase A. The outcome time is read
 in phase C, but a clock failure or an invalid / earlier value there falls back
 to the order's own ``updated_at``, so a known outcome is always recorded. TradingState
@@ -87,7 +95,9 @@ class OrderSubmitter:
                     f"order {client_order_id} is {order.status.value}: not sent again"
                 )
             request = order_request_from_order(order)
-            locked.mark_submitting(client_order_id, at=self._clock.now())
+            # Write-ahead: SUBMITTING is durable before any request may be sent.
+            # Any store error propagates here and nothing is sent.
+            await locked.mark_submitting(client_order_id, at=self._clock.now())
 
         try:
             ack = await self._client.place_order(request)
@@ -106,7 +116,7 @@ class OrderSubmitter:
 
     async def _record(self, client_order_id: str, outcome: SubmissionOutcome) -> Order:
         async with self._account.account_lock() as locked:
-            return locked.record_submission_outcome(
+            return await locked.record_submission_outcome(
                 client_order_id, outcome, at=self._outcome_time(locked, client_order_id)
             )
 
@@ -120,12 +130,12 @@ class OrderSubmitter:
                     raise OrderAckMismatchError(
                         f"ack for {ack.client_order_id} does not belong to order {client_order_id}"
                     )
-                return locked.record_ack(
+                return await locked.record_ack(
                     client_order_id, exchange_order_id=ack.exchange_order_id, at=at
                 )
             except OrderAckMismatchError:
                 # The request was sent and the answer is unusable: ambiguous.
-                locked.record_submission_outcome(
+                await locked.record_submission_outcome(
                     client_order_id, SubmissionOutcome.AMBIGUOUS, at=at
                 )
                 raise

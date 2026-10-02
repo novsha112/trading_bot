@@ -10,7 +10,8 @@
 
       lock:   the order must be UNKNOWN (else ``OrderNotUnknownError``, no read)
       unlock: one ``get_order(OrderRef(symbol, client_order_id, exchange_order_id))``
-      lock:   apply the report to the CURRENT local order
+      lock:   apply the report to the CURRENT local order (durable commit, then
+              publication; the store commit is the only await under the lock)
 
   Exactly one read per call: no retry, backoff, grace period or loop. A read
   error propagates and changes nothing. ``None`` (the exchange confirms no such
@@ -148,6 +149,6 @@ class UnknownOrderReconciler:
             current = locked.order(client_order_id)
             if current is None:  # pragma: no cover - orders are never removed
                 raise AccountStateError(f"no local order {client_order_id}")
-            return locked.apply_exchange_state(
+            return await locked.apply_exchange_state(
                 report, at=change_time(self._clock, floor=current.updated_at)
             )

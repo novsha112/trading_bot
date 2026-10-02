@@ -21,6 +21,7 @@ from app.domain.intents import PlaceOrderIntent
 from app.domain.orders import Order
 from app.execution.account_state import InMemoryAccountState, PlacementConflictError
 from app.execution.models import PlacementRecord
+from app.persistence.memory import InMemoryAccountStateStore
 from app.risk.exposure import ExposureCalculationError
 from app.risk.manager import evaluate
 from app.risk.models import (
@@ -45,6 +46,13 @@ T1 = T0 + timedelta(seconds=1)
 SCOPE = "acct-1"
 RUNNING = TradingState.RUNNING
 FLAT = D("0")
+
+
+def new_account(account_scope_id: str = "acct-1") -> InMemoryAccountState:
+    """An account state on a fresh in-memory reference store."""
+    return InMemoryAccountState(
+        account_scope_id=account_scope_id, store=InMemoryAccountStateStore()
+    )
 
 
 class SequenceIds:
@@ -144,8 +152,7 @@ def coordinator(
     ids: ClientOrderIdGenerator | None = None,
 ) -> PlacementCoordinator:
     return PlacementCoordinator(
-        account_scope_id=SCOPE,
-        account_state=InMemoryAccountState() if account is None else account,
+        account_state=new_account(SCOPE) if account is None else account,
         policy=policy() if risk_policy is None else risk_policy,
         clock=CountingClock() if clock is None else clock,
         client_order_id_generator=SequenceIds() if ids is None else ids,
@@ -158,17 +165,17 @@ SEEDED = 2
 
 async def flat_account(**positions: Decimal | None) -> InMemoryAccountState:
     """Account state with known positions (flat unless overridden; None = unknown)."""
-    account = InMemoryAccountState()
+    account = new_account()
     seeds: dict[str, Decimal | None] = {"BTCUSDT": FLAT, "ETHUSDT": FLAT, **positions}
     async with account.account_lock() as locked:
         for symbol, qty in seeds.items():
-            locked.set_position_qty(symbol, qty)
+            await locked.set_position_qty(symbol, qty)
     return account
 
 
 async def set_position(account: InMemoryAccountState, symbol: str, qty: Decimal | None) -> None:
     async with account.account_lock() as locked:
-        locked.set_position_qty(symbol, qty)
+        await locked.set_position_qty(symbol, qty)
 
 
 def exchange_fill(
@@ -225,12 +232,17 @@ def evaluate_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 # --- construction ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["", " acct-1", "acct-1 ", 5, None, "acct:1", ":", "a:"])
-def test_account_scope_id_is_validated_without_normalization(value: object) -> None:
+@pytest.mark.parametrize("value", ["", " acct-1", "acct-1 ", 5, None])
+def test_account_scope_id_is_validated_by_the_account_state(value: object) -> None:
     with pytest.raises(DomainValidationError, match="account_scope_id"):
+        new_account(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["acct:1", ":", "a:"])
+def test_snapshot_delimiter_in_the_account_scope_is_rejected(value: str) -> None:
+    with pytest.raises(DomainValidationError, match="must not contain"):
         PlacementCoordinator(
-            account_scope_id=value,  # type: ignore[arg-type]
-            account_state=InMemoryAccountState(),
+            account_state=new_account(value),
             policy=policy(),
             clock=CountingClock(),
             client_order_id_generator=SequenceIds(),
@@ -248,8 +260,7 @@ def test_account_scope_id_is_validated_without_normalization(value: object) -> N
 )
 def test_dependencies_are_validated(field: str, value: object, match: str) -> None:
     arguments: dict[str, Any] = {
-        "account_scope_id": SCOPE,
-        "account_state": InMemoryAccountState(),
+        "account_state": new_account(),
         "policy": policy(),
         "clock": CountingClock(),
         "client_order_id_generator": SequenceIds(),
@@ -262,8 +273,7 @@ def test_dependencies_are_validated(field: str, value: object, match: str) -> No
 @pytest.mark.parametrize("value", ["acct-1", "desk/a", "ACCT_7.main"])
 def test_valid_account_scope_ids(value: str) -> None:
     coord = PlacementCoordinator(
-        account_scope_id=value,
-        account_state=InMemoryAccountState(),
+        account_state=new_account(value),
         policy=policy(),
         clock=CountingClock(),
         client_order_id_generator=SequenceIds(),
@@ -274,9 +284,11 @@ def test_valid_account_scope_ids(value: str) -> None:
 
 @pytest.mark.asyncio
 async def test_scope_with_a_slash_keeps_the_snapshot_format() -> None:
+    account = new_account("desk/a")
+    await set_position(account, "BTCUSDT", FLAT)
+    await set_position(account, "ETHUSDT", FLAT)
     coord = PlacementCoordinator(
-        account_scope_id="desk/a",
-        account_state=await flat_account(),
+        account_state=account,
         policy=policy(),
         clock=CountingClock(),
         client_order_id_generator=SequenceIds(),
@@ -287,8 +299,11 @@ async def test_scope_with_a_slash_keeps_the_snapshot_format() -> None:
     assert record.decision.snapshot_id == f"desk/a:{SEEDED}"
 
 
-def test_account_scope_id_is_exposed() -> None:
-    assert coordinator().account_scope_id == SCOPE
+def test_account_scope_id_comes_from_the_account_state() -> None:
+    account = new_account("desk/b")
+
+    assert coordinator(account=account).account_scope_id == "desk/b"
+    assert account.account_scope_id == "desk/b"
 
 
 def test_sequence_generator_satisfies_the_protocol() -> None:
@@ -411,7 +426,7 @@ async def test_place_has_no_position_argument() -> None:
 @pytest.mark.asyncio
 async def test_missing_position_is_unknown_not_flat() -> None:
     # Nothing seeded for BTCUSDT: the account never read it as zero.
-    account = InMemoryAccountState()
+    account = new_account()
     ids, clock = SequenceIds(), CountingClock()
     coord = coordinator(account=account, ids=ids, clock=clock)
 
@@ -544,13 +559,13 @@ async def account_with_sent_buy_6() -> tuple[InMemoryAccountState, PlacementCoor
     first = await place(coord, intent("i-0", qty=D("6")))
     assert first.client_order_id == "c-1"
     async with account.account_lock() as locked:
-        locked.mark_submitting("c-1", at=T1)
+        await locked.mark_submitting("c-1", at=T1)
     return account, coord
 
 
 async def apply_fill_4(account: InMemoryAccountState) -> None:
     async with account.account_lock() as locked:
-        locked.apply_fill(exchange_fill("e-1", "c-1", qty="4"), at=T1)
+        await locked.apply_fill(exchange_fill("e-1", "c-1", qty="4"), at=T1)
 
 
 @pytest.mark.asyncio
@@ -647,8 +662,8 @@ async def test_reduce_only_fill_and_placement_share_one_state() -> None:
     close = await place(coord, intent("i-close", side=Side.SELL, qty=D("3"), reduce_only=True))
     assert close.approved is True
     async with account.account_lock() as locked:
-        locked.mark_submitting("c-1", at=T1)
-        locked.apply_fill(exchange_fill("e-1", "c-1", qty="3", side=Side.SELL), at=T1)
+        await locked.mark_submitting("c-1", at=T1)
+        await locked.apply_fill(exchange_fill("e-1", "c-1", qty="3", side=Side.SELL), at=T1)
 
     record = await place(coord, intent("i-again", side=Side.SELL, qty=D("1"), reduce_only=True))
 
@@ -724,7 +739,7 @@ async def seed_unrepresentable_order(account: InMemoryAccountState) -> None:
     """A legitimate NEW reservation whose remainder Risk cannot compute exactly."""
     seed = intent("seed", qty=HUGE_QTY)
     async with account.account_lock() as locked:
-        locked.register_approved(
+        await locked.register_approved(
             intent=seed,
             decision=RiskDecision(
                 intent_id="seed",
@@ -930,8 +945,8 @@ async def awkward_scenario() -> tuple[list[PlacementRecord], tuple[Any, ...], An
     ]
     # c-1 is sent and partly executed: the position grows, its remainder shrinks.
     async with account.account_lock() as locked:
-        locked.mark_submitting("c-1", at=T1)
-        locked.apply_fill(
+        await locked.mark_submitting("c-1", at=T1)
+        await locked.apply_fill(
             exchange_fill("e-1", "c-1", qty="1.111111111111111111111111111", price="100.3"),
             at=T1,
         )

@@ -7,21 +7,36 @@ signed net positions per symbol, applied fills by ``exec_id`` and ONE monotonic
 lock, so orders and positions can only be read and changed together::
 
     async with account.account_lock() as locked:
-        revision / orders / position   # one consistent state
+        revision / orders / position   # one consistent state (sync reads)
         build snapshot, evaluate       # pure, outside this module
-        locked.register_approved(...) / locked.register_rejected(...)
-        locked.mark_submitting(...) / locked.record_ack(...)
-        locked.record_submission_outcome(...) / locked.apply_fill(...)
-        locked.apply_exchange_state(...)
-        locked.set_position_qty(...)
+        await locked.register_approved(...) / await locked.register_rejected(...)
+        await locked.mark_submitting(...) / await locked.record_ack(...)
+        await locked.record_submission_outcome(...) / await locked.apply_fill(...)
+        await locked.apply_exchange_state(...) / await locked.set_position_qty(...)
+
+Persistence (docs/ARCHITECTURE.md 11.0): every mutation is ``prepare -> durable
+commit -> publish``. Under the account lock it reads the published snapshot,
+prepares a complete new snapshot (copy-on-write; nothing is modified in place)
+and the minimal ``AccountStateChange``, awaits ``AccountStateStore.commit`` and
+only after it returned publishes the new snapshot. Until then no reader sees the
+change: readers need the lock, which the mutation holds through the commit.
+The durable commit is the ONLY I/O awaited under the account lock; network
+calls are never awaited under it. A store error propagates and leaves the
+published state unchanged. After ``StoreUncertainError`` the durable state may
+be ahead of RAM (e.g. SUBMITTING durable, NEW in RAM): the caller must stop
+mutating this account and reload it; there is no runtime poison flag yet and no
+startup hydration (an account state starts empty). A no-op (replay, identical
+fill, a known exchange id, a confirming report, an ambiguous outcome superseded
+by fills, the current position) does not commit. Store validation errors are
+invariant bugs and propagate as such.
 
 Lock design: one non-reentrant ``asyncio.Lock``. Mutations exist only on the
-``LockedAccountState`` handle yielded by ``account_lock()``; its methods are
-synchronous and never take the lock, so mutating inside the held lock cannot
-deadlock. The async reads take the lock; calling them (or ``account_lock()``)
-again from the task that holds it raises ``AccountLockError`` instead of waiting
-forever. A handle is unusable after the lock is released. Tasks spawned and
-awaited inside the lock are not detected.
+``LockedAccountState`` handle yielded by ``account_lock()``; they never take the
+lock, so mutating inside the held lock cannot deadlock. The async reads take the
+lock; calling them (or ``account_lock()``) again from the task that holds it
+raises ``AccountLockError`` instead of waiting forever. A handle is unusable
+after the lock is released. Tasks spawned and awaited inside the lock are not
+detected.
 
 Intent idempotency: one record per ``intent_id``. Registering an intent equal
 (field by field) to the recorded one returns the recorded ``PlacementRecord``
@@ -76,11 +91,12 @@ generated. No exchange, network or storage.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, DecimalException
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 from app.domain.enums import OrderStatus
 from app.domain.errors import DomainValidationError, InvalidOrderTransition
@@ -91,9 +107,16 @@ from app.domain.order_state import record_exchange_order_id, transition
 from app.domain.orders import Order
 from app.domain.validation import require_text, require_utc
 from app.execution.models import ExchangeOrderState, PlacementRecord, SubmissionOutcome
+from app.execution.persistence import (
+    AccountStateChange,
+    AccountStateStore,
+    PersistedOrderNotional,
+    PersistedPosition,
+)
 from app.portfolio.positions import PositionStateError, position_after_fill
 from app.risk.models import ACTIVE_ORDER_STATUSES, RiskDecision
 
+_V = TypeVar("_V")
 _INITIAL_VERSION: Final = 0
 _NO_FILL: Final = Decimal(0)
 # Statuses an outcome of the placement request may still decide: only SUBMITTING.
@@ -173,29 +196,39 @@ def _require_revision(value: object) -> int:
     return value
 
 
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class _State:
-    """The mutable account state, owned by ``InMemoryAccountState``."""
+    """One published snapshot of the account state. Never modified after it is
+    published: every mutation prepares a new snapshot (copy-on-write of the
+    collections; the domain objects themselves are immutable)."""
 
-    __slots__ = ("fills", "notionals", "orders", "placements", "positions", "revision")
+    orders: dict[str, Order] = dataclasses.field(default_factory=dict)
+    notionals: dict[str, Decimal] = dataclasses.field(default_factory=dict)
+    """Exact executed notional per order: the source of its average price."""
+    placements: dict[str, PlacementRecord] = dataclasses.field(default_factory=dict)
+    positions: dict[str, Decimal] = dataclasses.field(default_factory=dict)
+    """Known signed positions only; a missing symbol is unknown."""
+    fills: dict[str, Fill] = dataclasses.field(default_factory=dict)
+    revision: int = 0
 
-    def __init__(self) -> None:
-        self.orders: dict[str, Order] = {}
-        self.notionals: dict[str, Decimal] = {}
-        """Exact executed notional per order: the source of its average price."""
-        self.placements: dict[str, PlacementRecord] = {}
-        self.positions: dict[str, Decimal] = {}
-        """Known signed positions only; a missing symbol is unknown."""
-        self.fills: dict[str, Fill] = {}
-        self.revision = 0
+
+def _with(items: dict[str, _V], key: str, value: _V) -> dict[str, _V]:
+    """A copy of ``items`` with ``key`` set (the original is not modified)."""
+    copied = dict(items)
+    copied[key] = value
+    return copied
 
 
 class LockedAccountState:
-    """Access to the account state while its lock is held (synchronous)."""
+    """Access to the account state while its lock is held. Reads are synchronous;
+    every mutation is ``async``: it prepares the next snapshot, awaits the durable
+    commit (the only I/O awaited under the account lock) and publishes the
+    snapshot only after the commit succeeded."""
 
-    __slots__ = ("_open", "_state")
+    __slots__ = ("_open", "_owner")
 
-    def __init__(self, state: _State) -> None:
-        self._state = state
+    def __init__(self, owner: InMemoryAccountState) -> None:
+        self._owner = owner
         self._open = True
 
     def _close(self) -> None:
@@ -204,7 +237,28 @@ class LockedAccountState:
     def _live(self) -> _State:
         if not self._open:
             raise AccountLockError("handle used after the account lock was released")
-        return self._state
+        return self._owner._state
+
+    def _change(self, state: _State, *, new_revision: int, **writes: Any) -> AccountStateChange:
+        return AccountStateChange(
+            account_scope_id=self._owner.account_scope_id,
+            expected_revision=state.revision,
+            new_revision=new_revision,
+            **writes,
+        )
+
+    async def _commit_and_publish(
+        self, current: _State, prepared: _State, change: AccountStateChange
+    ) -> None:
+        """Durable commit, then publication. A store error propagates and the
+        published state stays ``current``; after ``StoreUncertainError`` the
+        durable state may be ahead of RAM: the caller must stop mutating and
+        reload (no runtime poison flag yet)."""
+        self._live()
+        await self._owner._store.commit(change)
+        if self._owner._state is not current:  # pragma: no cover - lock invariant
+            raise AccountStateError("account state changed during a commit")
+        self._owner._state = prepared
 
     @property
     def revision(self) -> int:
@@ -254,7 +308,7 @@ class LockedAccountState:
             raise DomainValidationError("intent must be a PlaceOrderIntent")
         return self._replay(state, intent)
 
-    def register_approved(
+    async def register_approved(
         self,
         *,
         intent: PlaceOrderIntent,
@@ -305,14 +359,26 @@ class LockedAccountState:
             version=_INITIAL_VERSION,
         )
         record = PlacementRecord(intent=intent, decision=decision, client_order_id=client_order_id)
-        # Everything above may raise; nothing below can, so the change is atomic.
-        state.orders[client_order_id] = order
-        state.notionals[client_order_id] = _NO_FILL
-        state.placements[intent.intent_id] = record
-        state.revision += 1
+        prepared = dataclasses.replace(
+            state,
+            orders=_with(state.orders, client_order_id, order),
+            notionals=_with(state.notionals, client_order_id, _NO_FILL),
+            placements=_with(state.placements, intent.intent_id, record),
+            revision=state.revision + 1,
+        )
+        change = self._change(
+            state,
+            new_revision=prepared.revision,
+            placement_writes=(record,),
+            order_writes=(order,),
+            notional_writes=(
+                PersistedOrderNotional(client_order_id=client_order_id, filled_notional=_NO_FILL),
+            ),
+        )
+        await self._commit_and_publish(state, prepared, change)
         return record
 
-    def register_rejected(
+    async def register_rejected(
         self, *, intent: PlaceOrderIntent, decision: RiskDecision, expected_revision: int
     ) -> PlacementRecord:
         """Record a rejected intent: no Order, no revision change."""
@@ -323,10 +389,14 @@ class LockedAccountState:
             return replay
         self._require_current(state, expected_revision)
         record = PlacementRecord(intent=intent, decision=decision, client_order_id=None)
-        state.placements[intent.intent_id] = record
+        prepared = dataclasses.replace(
+            state, placements=_with(state.placements, intent.intent_id, record)
+        )
+        change = self._change(state, new_revision=state.revision, placement_writes=(record,))
+        await self._commit_and_publish(state, prepared, change)
         return record
 
-    def set_position_qty(self, symbol: str, qty: Decimal | None) -> None:
+    async def set_position_qty(self, symbol: str, qty: Decimal | None) -> None:
         """Seed or clear the known position of ``symbol`` (None = unknown).
 
         +1 revision when the value changes; setting the current value is a no-op.
@@ -340,23 +410,41 @@ class LockedAccountState:
             current is not None and qty is not None and current == qty
         ):
             return
+        positions = dict(state.positions)
         if qty is None:
-            del state.positions[symbol]
+            del positions[symbol]
         else:
-            state.positions[symbol] = qty
-        state.revision += 1
+            positions[symbol] = qty
+        prepared = dataclasses.replace(state, positions=positions, revision=state.revision + 1)
+        change = self._change(
+            state,
+            new_revision=prepared.revision,
+            position_writes=(PersistedPosition(symbol=symbol, known=qty is not None, qty=qty),),
+        )
+        await self._commit_and_publish(state, prepared, change)
 
-    def mark_submitting(self, client_order_id: str, *, at: datetime) -> Order:
+    async def _publish_order(self, state: _State, order: Order) -> Order:
+        """Commit and publish one changed order (+1 revision)."""
+        prepared = dataclasses.replace(
+            state,
+            orders=_with(state.orders, order.client_order_id, order),
+            revision=state.revision + 1,
+        )
+        change = self._change(state, new_revision=prepared.revision, order_writes=(order,))
+        await self._commit_and_publish(state, prepared, change)
+        return order
+
+    async def mark_submitting(self, client_order_id: str, *, at: datetime) -> Order:
         """Write-ahead ``NEW -> SUBMITTING`` before a placement request may be sent
         (docs/ARCHITECTURE.md 7.2); +1 revision. Nothing is sent here."""
         state = self._live()
         order = self._existing(state, client_order_id)
         updated = transition(order, OrderStatus.SUBMITTING, at=at)
-        state.orders[client_order_id] = updated
-        state.revision += 1
-        return updated
+        return await self._publish_order(state, updated)
 
-    def record_ack(self, client_order_id: str, *, exchange_order_id: str, at: datetime) -> Order:
+    async def record_ack(
+        self, client_order_id: str, *, exchange_order_id: str, at: datetime
+    ) -> Order:
         """Record an acknowledgement's ``exchange_order_id``: metadata enrichment,
         never a status change (an ack does not prove OPEN).
 
@@ -380,12 +468,11 @@ class LockedAccountState:
                 f"{order.exchange_order_id} of order {order.client_order_id}"
             )
         updated = record_exchange_order_id(order, exchange_order_id, at=at)
-        if updated is not order:
-            state.orders[order.client_order_id] = updated
-            state.revision += 1
-        return updated
+        if updated is order:
+            return order  # the id is already recorded: no commit
+        return await self._publish_order(state, updated)
 
-    def record_submission_outcome(
+    async def record_submission_outcome(
         self, client_order_id: str, outcome: SubmissionOutcome, *, at: datetime
     ) -> Order:
         """Apply the transport outcome of the placement request.
@@ -403,9 +490,7 @@ class LockedAccountState:
             raise DomainValidationError("outcome must be a SubmissionOutcome")
         if order.status is OrderStatus.SUBMITTING:
             updated = transition(order, _OUTCOME_TARGET[outcome], at=at)
-            state.orders[order.client_order_id] = updated
-            state.revision += 1
-            return updated
+            return await self._publish_order(state, updated)
         if order.status is OrderStatus.NEW:
             raise AccountStateError(f"order {order.client_order_id} was never marked SUBMITTING")
         if outcome is SubmissionOutcome.AMBIGUOUS:
@@ -415,7 +500,7 @@ class LockedAccountState:
             f"status {order.status.value} (filled {order.filled_qty}); state kept"
         )
 
-    def apply_exchange_state(self, report: ExchangeOrderState, *, at: datetime) -> Order:
+    async def apply_exchange_state(self, report: ExchangeOrderState, *, at: datetime) -> Order:
         """Apply a confirmed exchange report to the local order, or change nothing.
 
         Checked before any change: the order exists and was sent (not NEW or
@@ -482,10 +567,9 @@ class LockedAccountState:
                     f"order {order.client_order_id} cannot move from {order.status.value} "
                     f"to reported {report.status.value}: {error}"
                 ) from error
-        if updated is not order:
-            state.orders[order.client_order_id] = updated
-            state.revision += 1
-        return updated
+        if updated is order:
+            return order  # a confirming report: no commit
+        return await self._publish_order(state, updated)
 
     @staticmethod
     def _existing(state: _State, client_order_id: str) -> Order:
@@ -494,7 +578,7 @@ class LockedAccountState:
             raise AccountStateError(f"no local order {client_order_id}")
         return order
 
-    def apply_fill(self, fill: Fill, *, at: datetime) -> Order:
+    async def apply_fill(self, fill: Fill, *, at: datetime) -> Order:
         """Apply one confirmed execution to its order and the position, atomically.
 
         ``at`` is the local time of the change (the caller's clock); the fill's
@@ -555,13 +639,37 @@ class LockedAccountState:
             raise FillApplicationError(
                 f"fill {fill.exec_id} of order {order.client_order_id}: {error}"
             ) from error
-        # Everything above may raise; nothing below can, so the change is atomic.
-        state.orders[order.client_order_id] = updated
-        state.notionals[order.client_order_id] = totals.filled_notional
-        if position is not None:
-            state.positions[order.symbol] = position
-        state.fills[fill.exec_id] = fill
-        state.revision += 1
+        # One durable change: fill, order, notional, position and revision together.
+        prepared = dataclasses.replace(
+            state,
+            orders=_with(state.orders, order.client_order_id, updated),
+            notionals=_with(state.notionals, order.client_order_id, totals.filled_notional),
+            positions=(
+                state.positions
+                if position is None
+                else _with(state.positions, order.symbol, position)
+            ),
+            fills=_with(state.fills, fill.exec_id, fill),
+            revision=state.revision + 1,
+        )
+        change = self._change(
+            state,
+            new_revision=prepared.revision,
+            fill_writes=(fill,),
+            order_writes=(updated,),
+            notional_writes=(
+                PersistedOrderNotional(
+                    client_order_id=order.client_order_id,
+                    filled_notional=totals.filled_notional,
+                ),
+            ),
+            position_writes=(
+                ()
+                if position is None
+                else (PersistedPosition(symbol=order.symbol, known=True, qty=position),)
+            ),
+        )
+        await self._commit_and_publish(state, prepared, change)
         return updated
 
     @staticmethod
@@ -634,12 +742,23 @@ class InMemoryAccountState:
     """Local risk-relevant state of one account (orders, placements, positions,
     fills, revision), guarded by its single account lock."""
 
-    __slots__ = ("_holder", "_lock", "_state")
+    __slots__ = ("_account_scope_id", "_holder", "_lock", "_state", "_store")
 
-    def __init__(self) -> None:
+    def __init__(self, *, account_scope_id: str, store: AccountStateStore) -> None:
+        self._account_scope_id = require_text(account_scope_id, "account_scope_id")
+        if not callable(getattr(store, "commit", None)) or not callable(
+            getattr(store, "load", None)
+        ):
+            raise DomainValidationError("store must provide load() and commit()")
+        self._store = store
         self._lock = asyncio.Lock()
         self._holder: asyncio.Task[Any] | None = None
         self._state = _State()
+
+    @property
+    def account_scope_id(self) -> str:
+        """The account scope of every durable change (the single source of truth)."""
+        return self._account_scope_id
 
     @asynccontextmanager
     async def account_lock(self) -> AsyncIterator[LockedAccountState]:
@@ -651,7 +770,7 @@ class InMemoryAccountState:
             )
         async with self._lock:
             self._holder = task
-            handle = LockedAccountState(self._state)
+            handle = LockedAccountState(self)
             try:
                 yield handle
             finally:
