@@ -51,20 +51,18 @@ from decimal import (
     Decimal,
     DecimalException,
     DivisionByZero,
-    Inexact,
     InvalidOperation,
     Overflow,
 )
 from fractions import Fraction
 from typing import Final
 
-from app.domain.enums import Side
+from app.domain.fill_math import next_position_qty, signed_quantity
 from app.domain.fills import Fill
 from app.domain.positions import Position
 
 # Same published precision as the simulator's average fill price.
 POSITION_PRICE_PRECISION: Final = 40
-_EXACT_PRECISION: Final = 80
 _ZERO_DECIMAL: Final = Decimal(0)
 _ZERO: Final = Fraction(0)
 
@@ -113,12 +111,6 @@ class PreparedPositions:
     applied: Mapping[str, Fill]
 
 
-def _exact() -> Context:
-    return Context(
-        prec=_EXACT_PRECISION, traps=[InvalidOperation, DivisionByZero, Overflow, Inexact]
-    )
-
-
 def _publish(value: Fraction) -> Decimal:
     context = Context(
         prec=POSITION_PRICE_PRECISION,
@@ -140,9 +132,9 @@ def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
     realized = state.realized if state is not None else _ZERO
     price = Fraction(fill.price)
     fill_qty = Fraction(fill.qty)
-    # copy_negate / copy_abs are exact and context-free (plain -x / abs(x) would
-    # round to the process-global decimal context).
-    signed = fill.qty if fill.side is Side.BUY else fill.qty.copy_negate()
+    # Signed quantity and the new net position: the shared exact rule
+    # (app.domain.fill_math); copy_abs below is exact and context-free too.
+    signed = signed_quantity(fill.side, fill.qty)
 
     if qty == 0 or (qty > 0) == (signed > 0):
         cost += price * fill_qty  # open or increase
@@ -157,7 +149,7 @@ def _apply_fill(state: _PositionState | None, fill: Fill) -> _PositionState:
         if opened > 0:
             cost = price * opened  # reversal: fresh basis on the new side
     try:
-        new_qty = _exact().add(qty, signed)
+        new_qty = next_position_qty(qty, side=fill.side, qty=fill.qty)
     except DecimalException:
         raise PositionAccountingError(
             f"{fill.symbol} position quantity cannot be computed exactly"

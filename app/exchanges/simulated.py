@@ -34,9 +34,10 @@ Current scope:
   determines price and liquidity. Fee data and liquidity role come only from an
   explicit fee policy (below); POST_ONLY alone is never claimed to be maker.
 * Average fill price = exact cumulative notional / cumulative qty, divided with an
-  explicit context (``AVERAGE_PRICE_PRECISION`` significant digits,
+  explicit context (``fill_math.AVERAGE_PRICE_PRECISION`` significant digits,
   ROUND_HALF_EVEN), independent of the global decimal context; the first fill's
-  average is its execution price. Quantities and notionals are exact (fail closed
+  average is its execution price (shared rule: ``app.domain.fill_math``).
+  Quantities and notionals are exact (fail closed
   if they need more than ``_EXACT_PRECISION`` digits).
 * Positions: every committed fill is applied to a one-way net position ledger
   (``simulated_positions.SimulatedPositionLedger``), read through the
@@ -112,7 +113,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import (
-    ROUND_HALF_EVEN,
     Context,
     Decimal,
     DecimalException,
@@ -126,6 +126,7 @@ from typing import Final
 from app.domain.clock import Clock
 from app.domain.enums import OrderStatus, OrderType, RoundingDirection, Side, TimeInForce
 from app.domain.errors import DomainValidationError
+from app.domain.fill_math import accumulate_execution
 from app.domain.fills import Fill
 from app.domain.instrument import InstrumentSpec
 from app.domain.orders import OrderUpdate
@@ -162,22 +163,11 @@ _ZERO: Final = Decimal(0)
 # Quantities and notionals are computed exactly; a value needing more digits than
 # this fails closed instead of being rounded.
 _EXACT_PRECISION: Final = 80
-# Average fill price: significant digits, ROUND_HALF_EVEN (only a repeating
-# quotient is ever rounded; the notional it is computed from stays exact).
-AVERAGE_PRICE_PRECISION: Final = 40
 
 
 def _exact_context() -> Context:
     return Context(
         prec=_EXACT_PRECISION, traps=[InvalidOperation, DivisionByZero, Overflow, Inexact]
-    )
-
-
-def _average_context() -> Context:
-    return Context(
-        prec=AVERAGE_PRICE_PRECISION,
-        rounding=ROUND_HALF_EVEN,
-        traps=[InvalidOperation, DivisionByZero, Overflow],
     )
 
 
@@ -298,19 +288,22 @@ def _apply_fill(
     record: _SimulatedOrder, *, execution_price: Decimal, qty: Decimal, at: datetime
 ) -> _SimulatedOrder:
     """The record after one execution of ``qty`` (0 < qty <= remaining)."""
-    exact = _exact_context()
-    filled = exact.add(record.filled_qty, qty)
-    notional = exact.add(record.filled_notional, exact.multiply(execution_price, qty))
-    if record.filled_qty == 0:
-        average = execution_price
-    else:
-        average = _average_context().divide(notional, filled)
+    totals = accumulate_execution(
+        filled_qty=record.filled_qty,
+        filled_notional=record.filled_notional,
+        price=execution_price,
+        qty=qty,
+    )
     return replace(
         record,
-        status=OrderStatus.FILLED if filled == record.request.qty else OrderStatus.PARTIALLY_FILLED,
-        filled_qty=filled,
-        avg_fill_price=average,
-        filled_notional=notional,
+        status=(
+            OrderStatus.FILLED
+            if totals.filled_qty == record.request.qty
+            else OrderStatus.PARTIALLY_FILLED
+        ),
+        filled_qty=totals.filled_qty,
+        avg_fill_price=totals.avg_fill_price,
+        filled_notional=totals.filled_notional,
         updated_at=at,
     )
 

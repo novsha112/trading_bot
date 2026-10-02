@@ -11,10 +11,11 @@ from typing import Any
 
 import pytest
 
+from app.domain import fill_math
 from app.domain.enums import PositionSide, Side
 from app.domain.fills import Fill
 from app.domain.positions import Position
-from app.exchanges import simulated, simulated_positions
+from app.exchanges import simulated_positions
 from app.exchanges.simulated_positions import (
     MarkQuote,
     PositionAccountingError,
@@ -289,7 +290,7 @@ def test_results_ignore_the_global_decimal_context() -> None:
 
 
 def test_precision_matches_the_simulator_average_policy() -> None:
-    assert simulated_positions.POSITION_PRICE_PRECISION == simulated.AVERAGE_PRICE_PRECISION
+    assert simulated_positions.POSITION_PRICE_PRECISION == fill_math.AVERAGE_PRICE_PRECISION
 
 
 # --- exec-id idempotency ----------------------------------------------------------

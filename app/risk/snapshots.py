@@ -1,10 +1,10 @@
 """Pure mapping of local domain orders into a Risk V1 snapshot.
 
 The boundary between the local order state and the evaluator: the caller (the
-future placement coordinator) has already read its registry under the account
-lock, chosen the ``snapshot_id`` and decided the effective ``TradingState`` and
-the position. Nothing here reads an exchange or a registry, takes a lock, uses a
-clock or derives a position from fills.
+placement coordinator) has already read orders and the position from the
+account state under its lock, chosen the ``snapshot_id`` and the effective
+``TradingState``. Nothing here reads an exchange or the account state, takes a
+lock, uses a clock or derives a position from fills.
 
 * ``orders``: the LOCAL UNIFIED active orders of ``symbol`` only (in flight,
   acknowledged and foreign ones alike); ``None`` = unknown, a tuple = a known view

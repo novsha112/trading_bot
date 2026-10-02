@@ -30,9 +30,10 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "market_data": frozenset({"domain", "exchanges"}),
     "strategies": frozenset({"domain"}),
     "risk": frozenset({"domain", "portfolio"}),
-    # Execution may store Risk results (RiskDecision) and read the active-status set;
-    # Risk never imports execution.
-    "execution": frozenset({"domain", "exchanges", "risk"}),
+    # Execution may store Risk results (RiskDecision) and read the active-status set,
+    # and owns the account state that applies portfolio position rules; Risk and
+    # portfolio never import execution.
+    "execution": frozenset({"domain", "exchanges", "risk", "portfolio"}),
     "portfolio": frozenset({"domain"}),
     "persistence": frozenset({"domain"}),
     # Orchestration / infrastructure packages: restrictions will be refined as
@@ -63,6 +64,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "execution": frozenset(),
     # Orchestration: no frameworks, SDKs or I/O libraries.
     "services": frozenset(),
+    # Pure position rules on domain types.
+    "portfolio": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -99,7 +102,9 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     "exchanges.simulated_accounting": frozenset({"app.domain"}),
     # Reservation registry: local state only, no exchange contracts or network.
     "execution.models": frozenset({"app.domain", "app.risk.models"}),
-    "execution.registry": frozenset({"app.domain", "app.risk.models", "app.execution.models"}),
+    "execution.account_state": frozenset(
+        {"app.domain", "app.risk.models", "app.execution.models", "app.portfolio.positions"}
+    ),
 }
 
 # Implementation subpackages that the rest of their own top-level package must not
@@ -889,8 +894,12 @@ def test_risk_allowed_imports(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("relative", "source", "expected"),
     [
-        ("execution/registry.py", "from app.exchanges.models import OrderRequest\n", "allowlist"),
-        ("execution/registry.py", "from app.risk.manager import evaluate\n", "allowlist"),
+        (
+            "execution/account_state.py",
+            "from app.exchanges.models import OrderRequest\n",
+            "allowlist",
+        ),
+        ("execution/account_state.py", "from app.risk.manager import evaluate\n", "allowlist"),
         ("execution/models.py", "from app.exchanges.errors import ExchangeError\n", "allowlist"),
         ("execution/engine.py", "from app.services import X\n", "app.execution -> app.services"),
         (
@@ -919,7 +928,7 @@ def test_execution_allowed_imports(tmp_path: Path) -> None:
     root = tmp_path / "app"
     _write(
         root,
-        "execution/registry.py",
+        "execution/account_state.py",
         "import asyncio\nfrom app.domain.orders import Order\n"
         "from app.execution.models import PlacementRecord\n"
         "from app.risk.models import RiskDecision\n",
@@ -946,7 +955,7 @@ def test_execution_allowed_imports(tmp_path: Path) -> None:
         ),
         ("services/placement.py", "import httpx\n", "'httpx' (third-party"),
         (
-            "execution/registry.py",
+            "execution/account_state.py",
             "from app.services.placement import X\n",
             "app.execution -> app.services",
         ),
@@ -968,8 +977,48 @@ def test_services_allowed_imports(tmp_path: Path) -> None:
         root,
         "services/placement.py",
         "from typing import Protocol\nfrom app.domain.clock import Clock\n"
-        "from app.execution.registry import InMemoryOrderRegistry\n"
+        "from app.execution.account_state import InMemoryAccountState\n"
         "from app.risk.manager import evaluate\n",
+    )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        (
+            "portfolio/positions.py",
+            "from app.execution.account_state import X\n",
+            "app.portfolio -> app.execution",
+        ),
+        ("portfolio/positions.py", "from app.risk.models import X\n", "app.portfolio -> app.risk"),
+        (
+            "portfolio/positions.py",
+            "from app.exchanges.simulated_positions import X\n",
+            "app.portfolio -> app.exchanges",
+        ),
+        ("portfolio/positions.py", "import httpx\n", "'httpx' (third-party"),
+        ("execution/account_state.py", "from app.portfolio.book import X\n", "allowlist"),
+        ("execution/account_state.py", "from app.services.placement import X\n", "allowlist"),
+    ],
+)
+def test_portfolio_violations(tmp_path: Path, relative: str, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_portfolio_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(root, "portfolio/positions.py", "from app.domain.fill_math import next_position_qty\n")
+    _write(
+        root,
+        "execution/account_state.py",
+        "from app.portfolio.positions import position_after_fill\n",
     )
 
     assert find_violations(root) == []

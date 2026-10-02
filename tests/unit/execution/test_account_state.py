@@ -1,4 +1,4 @@
-"""In-memory order reservation registry: idempotency, revision and the account lock."""
+"""In-memory order reservation account: idempotency, revision and the account lock."""
 
 from __future__ import annotations
 
@@ -16,16 +16,16 @@ from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
 from app.domain.orders import Order
+from app.execution import account_state as account_state_module
 from app.execution import models as models_module
-from app.execution import registry as registry_module
-from app.execution.models import PlacementRecord
-from app.execution.registry import (
-    InMemoryOrderRegistry,
-    LockedOrderRegistry,
+from app.execution.account_state import (
+    AccountLockError,
+    InMemoryAccountState,
+    LockedAccountState,
     PlacementConflictError,
-    RegistryLockError,
     StaleRevisionError,
 )
+from app.execution.models import PlacementRecord
 from app.risk.models import ExposureChange, RiskDecision, RiskReason
 
 D = Decimal
@@ -76,7 +76,7 @@ def rejected(source: PlaceOrderIntent, snapshot_id: str = "acct:0") -> RiskDecis
 
 
 def reserve(
-    locked: LockedOrderRegistry,
+    locked: LockedAccountState,
     source: PlaceOrderIntent,
     client_order_id: str,
     *,
@@ -92,7 +92,7 @@ def reserve(
     )
 
 
-def reject(locked: LockedOrderRegistry, source: PlaceOrderIntent) -> PlacementRecord:
+def reject(locked: LockedAccountState, source: PlaceOrderIntent) -> PlacementRecord:
     return locked.register_rejected(
         intent=source, decision=rejected(source), expected_revision=locked.revision
     )
@@ -103,13 +103,13 @@ def reject(locked: LockedOrderRegistry, source: PlaceOrderIntent) -> PlacementRe
 
 @pytest.mark.asyncio
 async def test_initial_state_is_empty() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    assert await registry.revision() == 0
-    assert await registry.active_orders("BTCUSDT") == ()
-    assert await registry.account_active_order_count() == 0
-    assert await registry.placement("i-1") is None
-    assert await registry.order("c-1") is None
+    assert await account.revision() == 0
+    assert await account.active_orders("BTCUSDT") == ()
+    assert await account.account_active_order_count() == 0
+    assert await account.placement("i-1") is None
+    assert await account.order("c-1") is None
 
 
 # --- approved reservation -------------------------------------------------------------------
@@ -117,10 +117,10 @@ async def test_initial_state_is_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_approved_reservation_creates_new_order_and_bumps_revision() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         record = reserve(locked, source, "c-1")
         assert locked.revision == 1
 
@@ -148,16 +148,16 @@ async def test_approved_reservation_creates_new_order_and_bumps_revision() -> No
     )
     assert record.approved is True
     assert record.intent_id == "i-1"
-    assert await registry.order("c-1") == expected_order
-    assert await registry.placement("i-1") == record
-    assert await registry.active_orders("BTCUSDT") == (expected_order,)
-    assert await registry.account_active_order_count() == 1
-    assert await registry.revision() == 1
+    assert await account.order("c-1") == expected_order
+    assert await account.placement("i-1") == record
+    assert await account.active_orders("BTCUSDT") == (expected_order,)
+    assert await account.account_active_order_count() == 1
+    assert await account.revision() == 1
 
 
 @pytest.mark.asyncio
 async def test_market_and_reduce_only_terms_are_copied() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent(
         order_type=OrderType.MARKET,
         price=None,
@@ -167,10 +167,10 @@ async def test_market_and_reduce_only_terms_are_copied() -> None:
         tag=None,
     )
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, source, "c-1")
 
-    order = await registry.order("c-1")
+    order = await account.order("c-1")
     assert order is not None
     assert (order.order_type, order.price, order.time_in_force, order.side, order.reduce_only) == (
         OrderType.MARKET,
@@ -183,21 +183,21 @@ async def test_market_and_reduce_only_terms_are_copied() -> None:
 
 @pytest.mark.asyncio
 async def test_reservation_time_may_equal_intent_time() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent(), "c-1", at=T0)
 
-    order = await registry.order("c-1")
+    order = await account.order("c-1")
     assert order is not None
     assert order.created_at == T0
 
 
 @pytest.mark.asyncio
 async def test_reservation_before_intent_time_is_rejected() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="before"):
             reserve(locked, intent(), "c-1", at=T0 - timedelta(microseconds=1))
         assert locked.revision == 0
@@ -208,31 +208,31 @@ async def test_reservation_before_intent_time_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_rejected_placement_is_recorded_without_order_or_revision() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         record = reject(locked, source)
 
     assert record == PlacementRecord(intent=source, decision=rejected(source), client_order_id=None)
     assert record.approved is False
-    assert await registry.placement("i-1") == record
-    assert await registry.revision() == 0
-    assert await registry.active_orders("BTCUSDT") == ()
-    assert await registry.account_active_order_count() == 0
+    assert await account.placement("i-1") == record
+    assert await account.revision() == 0
+    assert await account.active_orders("BTCUSDT") == ()
+    assert await account.account_active_order_count() == 0
 
 
 @pytest.mark.asyncio
 async def test_rejected_placement_does_not_change_existing_exposure() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent("i-1"), "c-1")
         reject(locked, intent("i-2"))
 
-    assert await registry.revision() == 1
-    assert len(await registry.active_orders("BTCUSDT")) == 1
-    assert await registry.account_active_order_count() == 1
+    assert await account.revision() == 1
+    assert len(await account.active_orders("BTCUSDT")) == 1
+    assert await account.account_active_order_count() == 1
 
 
 # --- intent idempotency ---------------------------------------------------------------------
@@ -240,58 +240,58 @@ async def test_rejected_placement_does_not_change_existing_exposure() -> None:
 
 @pytest.mark.asyncio
 async def test_approved_replay_returns_the_same_record() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         first = reserve(locked, source, "c-1")
         # A replay with a new client id and a stale revision is still a replay.
         second = reserve(locked, intent(), "c-2", expected_revision=0)
         assert locked.revision == 1
 
     assert second is first
-    assert await registry.order("c-2") is None
-    assert await registry.account_active_order_count() == 1
+    assert await account.order("c-2") is None
+    assert await account.account_active_order_count() == 1
 
 
 @pytest.mark.asyncio
 async def test_rejected_replay_returns_the_same_record() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         first = reject(locked, intent())
         second = reject(locked, intent())
 
     assert second is first
-    assert await registry.revision() == 0
+    assert await account.revision() == 0
 
 
 @pytest.mark.asyncio
 async def test_intent_is_single_use_across_outcomes() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         first = reject(locked, source)
         # A later approval of the same intent does not replace the recorded result.
         second = reserve(locked, source, "c-1")
 
     assert second is first
-    assert await registry.order("c-1") is None
-    assert await registry.revision() == 0
+    assert await account.order("c-1") is None
+    assert await account.revision() == 0
 
 
 @pytest.mark.asyncio
 async def test_replay_after_lock_release_returns_the_same_record() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         first = reserve(locked, intent(), "c-1")
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         second = reserve(locked, intent(), "c-9")
 
     assert second is first
-    assert await registry.revision() == 1
+    assert await account.revision() == 1
 
 
 @pytest.mark.parametrize(
@@ -314,9 +314,9 @@ async def test_replay_after_lock_release_returns_the_same_record() -> None:
 async def test_same_intent_id_with_different_data_is_a_conflict(
     overrides: dict[str, Any],
 ) -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent(), "c-1")
         with pytest.raises(PlacementConflictError, match="i-1"):
             reserve(locked, intent(**overrides), "c-2", at=T1 + timedelta(seconds=1))
@@ -324,15 +324,15 @@ async def test_same_intent_id_with_different_data_is_a_conflict(
             reject(locked, intent(**overrides))
         assert locked.revision == 1
 
-    assert await registry.order("c-2") is None
+    assert await account.order("c-2") is None
 
 
 @pytest.mark.asyncio
 async def test_numerically_equal_decimals_are_the_same_intent() -> None:
     # Identity is field equality: Decimal compares by value, not representation.
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         first = reserve(locked, intent(price=D("100.5")), "c-1")
         second = reserve(locked, intent(price=D("100.50")), "c-2")
 
@@ -341,9 +341,9 @@ async def test_numerically_equal_decimals_are_the_same_intent() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         assert locked.replay_of(intent()) is None
         record = reject(locked, intent())
         assert locked.replay_of(intent()) is record
@@ -353,7 +353,7 @@ async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
             locked.replay_of("i-1")  # type: ignore[arg-type]
         assert locked.revision == 0
 
-    with pytest.raises(RegistryLockError, match="released"):
+    with pytest.raises(AccountLockError, match="released"):
         locked.replay_of(intent())
 
 
@@ -362,33 +362,33 @@ async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
 
 @pytest.mark.asyncio
 async def test_client_order_id_of_another_intent_is_a_conflict() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent("i-1"), "c-1")
         with pytest.raises(PlacementConflictError, match="c-1"):
             reserve(locked, intent("i-2"), "c-1")
         assert locked.revision == 1
 
-    assert await registry.placement("i-2") is None
-    assert await registry.account_active_order_count() == 1
+    assert await account.placement("i-2") is None
+    assert await account.account_active_order_count() == 1
 
 
 @pytest.mark.parametrize("client_order_id", ["", " c-1", "c-1 ", 7, None])
 @pytest.mark.asyncio
 async def test_invalid_client_order_id_is_rejected(client_order_id: object) -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="client_order_id"):
             reserve(locked, intent(), client_order_id)  # type: ignore[arg-type]
         assert locked.revision == 0
 
-    assert await registry.placement("i-1") is None
+    assert await account.placement("i-1") is None
 
 
 def test_registry_does_not_generate_identifiers() -> None:
-    source = Path(registry_module.__file__).read_text(encoding="utf-8")
+    source = Path(account_state_module.__file__).read_text(encoding="utf-8")
 
     for banned in ("uuid", "random", "secrets", "hash(", "time.", "datetime.now"):
         assert banned not in source, banned
@@ -399,9 +399,9 @@ def test_registry_does_not_generate_identifiers() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_must_belong_to_the_intent() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="intent_id"):
             locked.register_approved(
                 intent=intent("i-1"),
@@ -418,10 +418,10 @@ async def test_decision_must_belong_to_the_intent() -> None:
 
 @pytest.mark.asyncio
 async def test_decision_outcome_must_match_the_operation() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match="approved"):
             locked.register_approved(
                 intent=source,
@@ -434,7 +434,7 @@ async def test_decision_outcome_must_match_the_operation() -> None:
             locked.register_rejected(intent=source, decision=approved(source), expected_revision=0)
         assert locked.revision == 0
 
-    assert await registry.placement("i-1") is None
+    assert await account.placement("i-1") is None
 
 
 @pytest.mark.parametrize(
@@ -451,7 +451,7 @@ async def test_decision_outcome_must_match_the_operation() -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_arguments_are_rejected(field: str, value: object, match: str) -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     source = intent()
     arguments: dict[str, Any] = {
         "intent": source,
@@ -461,7 +461,7 @@ async def test_invalid_arguments_are_rejected(field: str, value: object, match: 
         "at": T1,
     }
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         with pytest.raises(DomainValidationError, match=match):
             locked.register_approved(**{**arguments, field: value})
         assert locked.revision == 0
@@ -472,9 +472,9 @@ async def test_invalid_arguments_are_rejected(field: str, value: object, match: 
 
 @pytest.mark.asyncio
 async def test_stale_revision_is_rejected_without_changes() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent("i-1"), "c-1")
         with pytest.raises(StaleRevisionError, match="0"):
             reserve(locked, intent("i-2"), "c-2", expected_revision=0)
@@ -484,16 +484,16 @@ async def test_stale_revision_is_rejected_without_changes() -> None:
             )
         assert locked.revision == 1
 
-    assert await registry.placement("i-2") is None
-    assert await registry.placement("i-3") is None
+    assert await account.placement("i-2") is None
+    assert await account.placement("i-3") is None
 
 
 @pytest.mark.asyncio
 async def test_revision_counts_only_reservations() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     revisions: list[int] = []
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         revisions.append(locked.revision)
         reserve(locked, intent("i-1"), "c-1")
         revisions.append(locked.revision)
@@ -512,9 +512,9 @@ async def test_revision_counts_only_reservations() -> None:
 
 @pytest.mark.asyncio
 async def test_symbol_views_and_account_count_across_symbols() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent("i-1"), "c-1")
         reserve(locked, intent("i-2", symbol="ETHUSDT"), "c-2")
         reserve(locked, intent("i-3", side=Side.SELL), "c-3")
@@ -533,9 +533,9 @@ async def test_symbol_views_and_account_count_across_symbols() -> None:
 
 @pytest.mark.asyncio
 async def test_views_are_immutable_and_defensive() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         record = reserve(locked, intent(), "c-1")
         view = locked.active_orders("BTCUSDT")
 
@@ -545,22 +545,22 @@ async def test_views_are_immutable_and_defensive() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         record.client_order_id = "c-2"  # type: ignore[misc]
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         reserve(locked, intent("i-2"), "c-2")
 
     assert len(view) == 1  # an earlier view does not change
-    assert len(await registry.active_orders("BTCUSDT")) == 2
-    public = [getattr(registry, name) for name in dir(registry) if not name.startswith("_")]
+    assert len(await account.active_orders("BTCUSDT")) == 2
+    public = [getattr(account, name) for name in dir(account) if not name.startswith("_")]
     assert not any(isinstance(value, dict | list | set) for value in public)
 
 
 @pytest.mark.parametrize("symbol", ["", " BTCUSDT", 7])
 @pytest.mark.asyncio
 async def test_invalid_symbol_view_is_rejected(symbol: object) -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     with pytest.raises(DomainValidationError, match="symbol"):
-        await registry.active_orders(symbol)  # type: ignore[arg-type]
+        await account.active_orders(symbol)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -569,10 +569,10 @@ async def test_invalid_symbol_view_is_rejected(symbol: object) -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_lookup_ids_are_rejected(method: str, value: object) -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     with pytest.raises(DomainValidationError):
-        await getattr(registry, method)(value)
+        await getattr(account, method)(value)
 
 
 # --- lock -----------------------------------------------------------------------------------
@@ -580,14 +580,14 @@ async def test_invalid_lookup_ids_are_rejected(method: str, value: object) -> No
 
 @pytest.mark.asyncio
 async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     a_inside = asyncio.Event()
     b_waiting = asyncio.Event()
     b_inside = asyncio.Event()
     seen: dict[str, Any] = {}
 
     async def task_a() -> None:
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             a_inside.set()
             await b_waiting.wait()
             await asyncio.sleep(0)  # B is now blocked on the lock
@@ -598,7 +598,7 @@ async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
     async def task_b() -> None:
         await a_inside.wait()
         b_waiting.set()
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             b_inside.set()
             seen["b_revision"] = locked.revision
             seen["b_view"] = locked.active_orders("BTCUSDT")
@@ -614,11 +614,11 @@ async def test_waiting_task_sees_the_reservation_of_the_lock_holder() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_reservations_do_not_lose_updates() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
     attempts = 20
 
     async def attempt(index: int) -> int:
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             revision = locked.revision
             await asyncio.sleep(0)  # yield inside the lock (e.g. a future persistence write)
             reserve(locked, intent(f"i-{index}"), f"c-{index}", expected_revision=revision)
@@ -627,32 +627,32 @@ async def test_concurrent_reservations_do_not_lose_updates() -> None:
     seen = await asyncio.wait_for(asyncio.gather(*(attempt(i) for i in range(attempts))), timeout=5)
 
     assert sorted(seen) == list(range(attempts))
-    assert await registry.revision() == attempts
-    assert await registry.account_active_order_count() == attempts
+    assert await account.revision() == attempts
+    assert await account.account_active_order_count() == attempts
 
 
 @pytest.mark.asyncio
 async def test_concurrent_replays_of_one_intent_create_one_order() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     async def attempt(index: int) -> PlacementRecord:
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             await asyncio.sleep(0)
             return reserve(locked, intent("i-1"), f"c-{index}")
 
     records = await asyncio.wait_for(asyncio.gather(*(attempt(i) for i in range(10))), timeout=5)
 
     assert all(record is records[0] for record in records)
-    assert await registry.revision() == 1
-    assert await registry.account_active_order_count() == 1
+    assert await account.revision() == 1
+    assert await account.account_active_order_count() == 1
 
 
 @pytest.mark.asyncio
 async def test_registration_inside_the_held_lock_does_not_deadlock() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     async def flow() -> PlacementRecord:
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             _ = locked.revision, locked.active_orders("BTCUSDT")
             return reserve(locked, intent(), "c-1")
 
@@ -663,52 +663,52 @@ async def test_registration_inside_the_held_lock_does_not_deadlock() -> None:
 
 @pytest.mark.asyncio
 async def test_reentering_the_lock_fails_fast_instead_of_deadlocking() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     async def flow() -> None:
-        async with registry.placement_lock():
-            with pytest.raises(RegistryLockError, match="reentrant"):
-                await registry.revision()
-            with pytest.raises(RegistryLockError, match="reentrant"):
-                async with registry.placement_lock():
+        async with account.account_lock():
+            with pytest.raises(AccountLockError, match="reentrant"):
+                await account.revision()
+            with pytest.raises(AccountLockError, match="reentrant"):
+                async with account.account_lock():
                     pass  # pragma: no cover - never entered
 
     await asyncio.wait_for(flow(), timeout=1)
-    assert await registry.revision() == 0  # the lock was released
+    assert await account.revision() == 0  # the lock was released
 
 
 @pytest.mark.asyncio
 async def test_handle_cannot_be_used_after_release() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
-    async with registry.placement_lock() as locked:
+    async with account.account_lock() as locked:
         pass
 
-    with pytest.raises(RegistryLockError, match="released"):
+    with pytest.raises(AccountLockError, match="released"):
         _ = locked.revision
-    with pytest.raises(RegistryLockError, match="released"):
+    with pytest.raises(AccountLockError, match="released"):
         reserve(locked, intent(), "c-1", expected_revision=0)
-    with pytest.raises(RegistryLockError, match="released"):
+    with pytest.raises(AccountLockError, match="released"):
         locked.active_orders("BTCUSDT")
-    assert await registry.placement("i-1") is None
+    assert await account.placement("i-1") is None
 
 
 @pytest.mark.asyncio
 async def test_lock_is_released_after_an_exception() -> None:
-    registry = InMemoryOrderRegistry()
+    account = InMemoryAccountState()
 
     with pytest.raises(StaleRevisionError):
-        async with registry.placement_lock() as locked:
+        async with account.account_lock() as locked:
             reserve(locked, intent(), "c-1", expected_revision=5)
 
-    assert await asyncio.wait_for(registry.revision(), timeout=1) == 0
+    assert await asyncio.wait_for(account.revision(), timeout=1) == 0
 
 
 def test_mutation_is_only_available_on_the_locked_handle() -> None:
-    public = {name for name in dir(InMemoryOrderRegistry) if not name.startswith("_")}
+    public = {name for name in dir(InMemoryAccountState) if not name.startswith("_")}
 
     assert not any(name.startswith("register") for name in public)
-    assert {"register_approved", "register_rejected"} <= set(dir(LockedOrderRegistry))
+    assert {"register_approved", "register_rejected"} <= set(dir(LockedAccountState))
 
 
 # --- PlacementRecord ------------------------------------------------------------------------
@@ -748,7 +748,7 @@ def test_placement_record_validation(kwargs: dict[str, Any], match: str) -> None
 # --- dependencies ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("module", [models_module, registry_module])
+@pytest.mark.parametrize("module", [models_module, account_state_module])
 def test_no_network_exchange_or_persistence_dependencies(module: object) -> None:
     source = Path(module.__file__).read_text(encoding="utf-8")  # type: ignore[attr-defined]
     imports: set[str] = set()
@@ -760,7 +760,7 @@ def test_no_network_exchange_or_persistence_dependencies(module: object) -> None
 
     for name in imports:
         assert not name.startswith("app.") or name.startswith(
-            ("app.domain", "app.risk.models", "app.execution")
+            ("app.domain", "app.risk.models", "app.execution", "app.portfolio")
         ), name
     banned = {"httpx", "pybit", "ccxt", "sqlite3", "sqlalchemy", "socket", "logging"}
     assert not {name.split(".")[0] for name in imports} & banned
