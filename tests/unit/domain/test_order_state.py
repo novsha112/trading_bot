@@ -215,6 +215,39 @@ def test_d_unknown_resolution() -> None:
     assert step(make_order(S.UNKNOWN, "0.3"), S.CANCELED).status is S.CANCELED
 
 
+@pytest.mark.parametrize(
+    ("source", "fill"),
+    [
+        (S.SUBMITTING, "1.0"),
+        (S.OPEN, "1.0"),
+        (S.PARTIALLY_FILLED, "1.0"),
+        (S.CANCELING, "1.0"),
+    ],
+)
+def test_d_transition_to_unknown_with_full_fill_is_rejected(source: OrderStatus, fill: str) -> None:
+    # A known full execution is FILLED; UNKNOWN keeps a remainder > 0 (Order invariant,
+    # re-checked by transition() through dataclasses.replace).
+    with pytest.raises(DomainValidationError, match="status unknown: must be < qty"):
+        step(make_order(source, SOURCE_FILL[source]), S.UNKNOWN, fill)
+
+
+@pytest.mark.parametrize("source", [S.SUBMITTING, S.OPEN, S.PARTIALLY_FILLED, S.CANCELING])
+def test_d_transition_to_unknown_keeps_a_partial_fill(source: OrderStatus) -> None:
+    o = step(make_order(source, SOURCE_FILL[source]), S.UNKNOWN, "0.999")
+
+    assert (o.status, o.qty - o.filled_qty) == (S.UNKNOWN, D("0.001"))
+
+
+def test_d_unknown_has_no_self_transition() -> None:
+    assert S.UNKNOWN not in ALLOWED_TRANSITIONS[S.UNKNOWN]
+
+
+def test_d_full_execution_from_unknown_resolves_to_filled() -> None:
+    o = step(make_order(S.UNKNOWN, "0.3"), S.FILLED, "1.0")
+
+    assert (o.status, o.filled_qty) == (S.FILLED, o.qty)
+
+
 @pytest.mark.parametrize("fill", ["0", "1.0"])
 def test_d_unknown_to_partially_filled_keeps_fill_invariants(fill: str) -> None:
     with pytest.raises(DomainValidationError, match="partially_filled"):

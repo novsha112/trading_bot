@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 
 from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 from app.domain.errors import DomainValidationError
+from app.domain.order_state import TERMINAL_STATUSES
 from app.domain.orders import Order, OrderUpdate
 
 D = Decimal
@@ -164,7 +166,7 @@ VALID_STATUS_FILLS = [
     (S.EXPIRED, "0.6"),
     (S.UNKNOWN, "0"),
     (S.UNKNOWN, "0.3"),
-    (S.UNKNOWN, "1.0"),
+    (S.UNKNOWN, "0.999"),
 ]
 INVALID_STATUS_FILLS = [
     (S.NEW, "0.3"),
@@ -179,6 +181,7 @@ INVALID_STATUS_FILLS = [
     (S.CANCELED, "1.0"),  # fully executed order is FILLED, not CANCELED
     (S.EXPIRED, "1.0"),
     (S.CANCELING, "1.0"),  # fully executed while canceling is FILLED
+    (S.UNKNOWN, "1.0"),  # a known full execution is FILLED, not UNKNOWN
 ]
 
 
@@ -191,6 +194,42 @@ def test_valid_status_fill_combinations(status: OrderStatus, qty: str) -> None:
 def test_invalid_status_fill_combinations(status: OrderStatus, qty: str) -> None:
     with pytest.raises(DomainValidationError, match=rf"^filled_qty .* {status.value}"):
         order(**filled(status, qty))
+
+
+# Every non-terminal (active) status, with the rule that rejects a full fill. The
+# stricter status-specific rules keep their own messages.
+FULL_FILL_RULE_BY_ACTIVE_STATUS = {
+    S.NEW: "must be 0",
+    S.SUBMITTING: "must be 0",
+    S.OPEN: "must be 0",
+    S.PARTIALLY_FILLED: "must be > 0 and < qty",
+    S.CANCELING: "must be < qty",
+    S.UNKNOWN: "must be < qty",
+}
+
+
+def test_active_statuses_are_exactly_the_non_terminal_ones() -> None:
+    assert set(FULL_FILL_RULE_BY_ACTIVE_STATUS) == set(OrderStatus) - TERMINAL_STATUSES
+
+
+@pytest.mark.parametrize(("status", "rule"), FULL_FILL_RULE_BY_ACTIVE_STATUS.items())
+def test_active_status_with_full_fill_is_rejected(status: OrderStatus, rule: str) -> None:
+    with pytest.raises(
+        DomainValidationError,
+        match=rf"^filled_qty \(1\.0\) is not allowed for status {status.value}: {re.escape(rule)}$",
+    ):
+        order(**filled(status, "1.0"))
+
+
+@pytest.mark.parametrize(("status", "qty"), VALID_STATUS_FILLS)
+def test_every_valid_active_order_has_a_positive_remainder(status: OrderStatus, qty: str) -> None:
+    o = order(**filled(status, qty))
+    if status not in TERMINAL_STATUSES:
+        assert o.qty - o.filled_qty > 0
+
+
+def test_unknown_fully_executed_order_is_filled() -> None:
+    assert order(**filled(S.FILLED, "1.0")).status is S.FILLED
 
 
 # --- Order: timestamps / version ---------------------------------------------------------

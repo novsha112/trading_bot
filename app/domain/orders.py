@@ -30,9 +30,11 @@ _ZERO_FILL_STATUSES: Final = frozenset(
     }
 )
 # Not fully executed: once the cumulative fill reaches qty the order is FILLED,
-# including when a cancel request was pending (CANCELING -> FILLED).
+# including when a cancel request was pending (CANCELING -> FILLED) or the outcome
+# was uncertain (UNKNOWN -> FILLED). Together with the zero-fill statuses and
+# PARTIALLY_FILLED this makes every non-terminal order keep a remainder > 0.
 _NOT_FULLY_FILLED_STATUSES: Final = frozenset(
-    {OrderStatus.CANCELING, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+    {OrderStatus.CANCELING, OrderStatus.UNKNOWN, OrderStatus.CANCELED, OrderStatus.EXPIRED}
 )
 
 
@@ -56,7 +58,6 @@ def _require_status_fill(status: OrderStatus, filled_qty: Decimal, qty: Decimal)
         rule = "must be == qty"
     elif status in _NOT_FULLY_FILLED_STATUSES and filled_qty >= qty:
         rule = "must be < qty"
-    # UNKNOWN allows any fill from 0 through qty: its purpose is uncertainty.
     if rule is not None:
         raise DomainValidationError(
             f"filled_qty ({filled_qty}) is not allowed for status {status.value}: {rule}"

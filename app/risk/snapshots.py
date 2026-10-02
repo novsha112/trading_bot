@@ -38,9 +38,10 @@ def open_order_exposure(order: Order) -> OpenOrderExposure:
     """The exposure of one active local order: its whole unexecuted remainder.
 
     Only an exact ``Order`` with an active status (NEW, SUBMITTING, OPEN,
-    PARTIALLY_FILLED, CANCELING, UNKNOWN) is accepted; a terminal order or one with
-    nothing left to execute (an UNKNOWN fully filled) raises
-    ``DomainValidationError``. Exchange metadata is not used.
+    PARTIALLY_FILLED, CANCELING, UNKNOWN) is accepted; a terminal order raises
+    ``DomainValidationError``. The domain guarantees a remainder > 0 for every
+    active order; ``OpenOrderExposure`` re-checks it defensively. Exchange metadata
+    is not used.
     """
     if type(order) is not Order:
         raise DomainValidationError("order must be a domain Order")

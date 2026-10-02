@@ -139,11 +139,41 @@ def test_terminal_status_is_rejected(status: OrderStatus) -> None:
         open_order_exposure(order(status))
 
 
-def test_unknown_order_with_its_whole_qty_filled_is_rejected() -> None:
-    # Valid in the domain (UNKNOWN allows any fill) but nothing may execute any more:
-    # it is not an active exposure and cannot be represented with remaining_qty > 0.
+def test_domain_does_not_allow_an_active_order_without_remainder() -> None:
+    with pytest.raises(DomainValidationError, match="unknown: must be < qty"):
+        order(S.UNKNOWN, filled_qty="1.0")
+
+
+@pytest.mark.parametrize(
+    ("status", "filled_qty", "remaining"),
+    [
+        (S.NEW, "0", "1.0"),
+        (S.SUBMITTING, "0", "1.0"),
+        (S.OPEN, "0", "1.0"),
+        (S.PARTIALLY_FILLED, "0.3", "0.7"),
+        (S.PARTIALLY_FILLED, "0.999", "0.001"),
+        (S.CANCELING, "0", "1.0"),
+        (S.CANCELING, "0.999", "0.001"),
+        (S.UNKNOWN, "0", "1.0"),
+        (S.UNKNOWN, "0.999", "0.001"),
+    ],
+)
+def test_every_valid_active_order_maps_to_a_positive_remainder(
+    status: OrderStatus, filled_qty: str, remaining: str
+) -> None:
+    exposure = open_order_exposure(order(status, filled_qty=filled_qty))
+
+    assert exposure.remaining_qty == D(remaining)
+    assert exposure.remaining_qty > 0
+
+
+def test_defensive_remaining_check_is_kept() -> None:
+    # Bypass the frozen domain invariant on purpose: the mapping must still refuse it.
+    source = order(S.UNKNOWN, filled_qty="0.3")
+    object.__setattr__(source, "filled_qty", source.qty)
+
     with pytest.raises(DomainValidationError, match="remaining_qty"):
-        open_order_exposure(order(S.UNKNOWN, filled_qty="1.0"))
+        open_order_exposure(source)
 
 
 @pytest.mark.parametrize("value", [None, "order", object()])
