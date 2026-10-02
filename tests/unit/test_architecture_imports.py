@@ -53,6 +53,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "exchanges": frozenset(),
     # Concrete adapter: the core contracts plus one HTTP client.
     "exchanges.bybit": frozenset({"httpx"}),
+    # Pure risk evaluation on domain types: no frameworks or I/O.
+    "risk": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -832,6 +834,42 @@ def test_simulator_may_use_cash_accounting(tmp_path: Path) -> None:
         root,
         "exchanges/simulated_accounting.py",
         "from fractions import Fraction\nfrom app.domain.validation import require_text\n",
+    )
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from app.exchanges.simulated_accounting import EquityState\n",
+            "app.risk -> app.exchanges",
+        ),
+        ("from app.exchanges.models import OrderRequest\n", "app.risk -> app.exchanges"),
+        ("from app.config.schema import AppConfig\n", "app.risk -> app.config"),
+        ("from app.strategies.grid.levels import X\n", "app.risk -> app.strategies"),
+        ("from app.persistence import X\n", "app.risk -> app.persistence"),
+        ("import pydantic\n", "'pydantic' (third-party"),
+        ("import httpx\n", "'httpx' (third-party"),
+    ],
+)
+def test_risk_violations(tmp_path: Path, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, "risk/models.py", source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_risk_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "risk/models.py",
+        "from dataclasses import dataclass\nfrom types import MappingProxyType\n"
+        "from app.domain.enums import Side\nfrom app.domain.validation import require_text\n",
     )
 
     assert find_violations(root) == []
