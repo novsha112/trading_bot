@@ -339,6 +339,24 @@ async def test_numerically_equal_decimals_are_the_same_intent() -> None:
     assert second is first
 
 
+@pytest.mark.asyncio
+async def test_replay_of_reports_new_equal_and_conflicting_intents() -> None:
+    registry = InMemoryOrderRegistry()
+
+    async with registry.placement_lock() as locked:
+        assert locked.replay_of(intent()) is None
+        record = reject(locked, intent())
+        assert locked.replay_of(intent()) is record
+        with pytest.raises(PlacementConflictError, match="i-1"):
+            locked.replay_of(intent(qty=D("2")))
+        with pytest.raises(DomainValidationError, match="PlaceOrderIntent"):
+            locked.replay_of("i-1")  # type: ignore[arg-type]
+        assert locked.revision == 0
+
+    with pytest.raises(RegistryLockError, match="released"):
+        locked.replay_of(intent())
+
+
 # --- client_order_id ------------------------------------------------------------------------
 
 

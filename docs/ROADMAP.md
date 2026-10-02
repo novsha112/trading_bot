@@ -175,7 +175,7 @@
 
 **Мета.** Контрольований життєвий цикл ордерів без дублів і втрати стану.
 
-**Стан.** Розпочато лише foundation резервувань (ARCHITECTURE 7.0): in-memory `InMemoryOrderRegistry` з lock акаунта, revision, індексом intent → `PlacementRecord` і резервацією `Order(NEW)` — без submit, resolver, persistence, переходів після NEW і coordinator. Фаза **не** завершена.
+**Стан.** Розпочато лише foundation резервувань (ARCHITECTURE 7.0): in-memory `InMemoryOrderRegistry` з lock акаунта, revision, індексом intent → `PlacementRecord` і резервацією `Order(NEW)` — і `PlacementCoordinator` (`app/services/placement.py`: атомарне `snapshot → evaluate → reserve` під lock акаунта) — без submit, resolver, persistence, переходів після NEW, власників позиції / `TradingState` і інтеграції з paper / backtest. Фаза **не** завершена.
 
 **Що реалізуємо.**
 - `ClientOrderIdGenerator` (префікс бота, унікальність, персистентний лічильник).
@@ -207,7 +207,7 @@
 
 **Мета.** Обов'язковий шар, що може зупинити торгівлю незалежно від стратегії.
 
-**Стан.** Затверджено межу й контракт V1 (ARCHITECTURE 9.0: approve / reject без зміни intent, чисте ядро, snapshot без equity / cash / mark). Реалізація V1 розпочинається на гілці `feature/risk-manager`: моделі, exposure, `evaluate` і чиста побудова snapshot з локальних `Order` готові; інтеграція з execution (coordinator) — ні. Фаза **не** завершена.
+**Стан.** Затверджено межу й контракт V1 (ARCHITECTURE 9.0: approve / reject без зміни intent, чисте ядро, snapshot без equity / cash / mark). Реалізація V1 розпочинається на гілці `feature/risk-manager`: моделі, exposure, `evaluate` і чиста побудова snapshot з локальних `Order` готові; foundation coordinator (резервування `Order(NEW)` під lock акаунта) готовий; інтеграція з submit / execution — ні. Фаза **не** завершена.
 
 **Що реалізуємо.**
 - Pre-trade перевірки (max order qty, max position з урахуванням активних і `UNKNOWN` ордерів, capital allocation, max open orders, max leverage, вільна маржа, max loss per trade). Tick / step / min — окремий instrument preflight, не Risk.

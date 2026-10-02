@@ -1,7 +1,7 @@
 """In-memory order reservation registry: one account, one writer (V1).
 
 The local unified view of the account's orders and the serialization boundary
-for the future placement coordinator (docs/ARCHITECTURE.md 7.0)::
+for the placement coordinator (app/services/placement.py, docs/ARCHITECTURE.md 7.0)::
 
     async with registry.placement_lock() as locked:
         revision / views          # read the state the decision is based on
@@ -128,6 +128,17 @@ class LockedOrderRegistry:
     def order(self, client_order_id: str) -> Order | None:
         state = self._live()
         return state.orders.get(require_text(client_order_id, "client_order_id"))
+
+    def replay_of(self, intent: PlaceOrderIntent) -> PlacementRecord | None:
+        """The recorded result of an equal intent, or None for a new ``intent_id``.
+
+        Raises ``PlacementConflictError`` when the ``intent_id`` is recorded with
+        different data. Lets the caller detect a replay before any evaluation.
+        """
+        state = self._live()
+        if type(intent) is not PlaceOrderIntent:
+            raise DomainValidationError("intent must be a PlaceOrderIntent")
+        return self._replay(state, intent)
 
     def register_approved(
         self,

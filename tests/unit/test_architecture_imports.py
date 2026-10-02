@@ -41,7 +41,9 @@ ALLOWED_APP_IMPORTS: dict[str, frozenset[str] | None] = {
     "paper_trading": None,
     "monitoring": None,
     "notifications": None,
-    "services": None,
+    # Orchestration of the placement boundary: Risk + execution state + domain.
+    # No exchange adapters, simulator or persistence.
+    "services": frozenset({"domain", "risk", "execution"}),
 }
 
 ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
@@ -59,6 +61,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "risk": frozenset(),
     # Local order state and (later) submission through exchange contracts only.
     "execution": frozenset(),
+    # Orchestration: no frameworks, SDKs or I/O libraries.
+    "services": frozenset(),
     # Pure request mapping and shared JSON types: no HTTP client, no third-party code.
     "exchanges.bybit.order_mapping": frozenset(),
     "exchanges.bybit.types": frozenset(),
@@ -268,7 +272,7 @@ def test_forbidden_imports_detected(
         ("strategies/grid/levels.py", "from . import math\nfrom ..base import Strategy\n"),
         ("risk/limits.py", "from app.portfolio import Portfolio\nfrom app.domain import Side\n"),
         ("execution/engine.py", "from app.exchanges.base import ExchangeAdapter\n"),
-        ("services/bootstrap.py", "from app.exchanges import bybit\nfrom app import risk\n"),
+        ("paper_trading/runner.py", "from app.exchanges import bybit\nfrom app import risk\n"),
     ],
 )
 def test_allowed_imports_pass(tmp_path: Path, relative: str, source: str) -> None:
@@ -365,7 +369,7 @@ def test_third_party_rule_applies_only_to_restricted_packages(tmp_path: Path) ->
     root = tmp_path / "app"
     _write(root, "monitoring/logging.py", "import structlog\n")
     _write(root, "config/settings.py", "from pydantic import BaseModel\n")
-    _write(root, "services/bootstrap.py", "import httpx\n")
+    _write(root, "paper_trading/runner.py", "import httpx\n")
 
     assert find_violations(root) == []
 
@@ -922,5 +926,50 @@ def test_execution_allowed_imports(tmp_path: Path) -> None:
     )
     _write(root, "execution/models.py", "from app.risk.models import RiskDecision\n")
     _write(root, "execution/engine.py", "from app.exchanges.models import OrderRequest\n")
+
+    assert find_violations(root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "source", "expected"),
+    [
+        ("services/placement.py", "import app.exchanges.bybit\n", "app.services -> app.exchanges"),
+        (
+            "services/placement.py",
+            "from app.exchanges.simulated import SimulatedExchange\n",
+            "app.services -> app.exchanges",
+        ),
+        (
+            "services/placement.py",
+            "from app.persistence import X\n",
+            "app.services -> app.persistence",
+        ),
+        ("services/placement.py", "import httpx\n", "'httpx' (third-party"),
+        (
+            "execution/registry.py",
+            "from app.services.placement import X\n",
+            "app.execution -> app.services",
+        ),
+        ("risk/manager.py", "from app.services import placement\n", "app.risk -> app.services"),
+    ],
+)
+def test_services_violations(tmp_path: Path, relative: str, source: str, expected: str) -> None:
+    root = tmp_path / "app"
+    _write(root, relative, source)
+
+    violations = find_violations(root)
+
+    assert any(expected in v for v in violations), violations
+
+
+def test_services_allowed_imports(tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    _write(
+        root,
+        "services/placement.py",
+        "from typing import Protocol\nfrom app.domain.clock import Clock\n"
+        "from app.execution.registry import InMemoryOrderRegistry\n"
+        "from app.risk.manager import evaluate\n",
+    )
 
     assert find_violations(root) == []
