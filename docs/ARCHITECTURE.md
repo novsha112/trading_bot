@@ -1002,6 +1002,8 @@ Startup recovery не покладається лише на локально в
 
 Нічого не скасовується й не імпортується автоматично.
 
+**Реалізовано: чиста класифікація snapshot** (`app/execution/recovery_matching.py`; лише домен, recovery DTO і namespace client id). `classify_open_orders(local_orders, exchange_orders, namespace)` — **лише класифікація snapshot, не exchange reconciliation**: нічого не читає з біржі, нічого не змінює. Спершу ідентичність (client id у namespace, відомий exchange id, колізії в обидва боки проти всіх локальних ордерів), потім умови (symbol, side, type, qty, price, time-in-force, reduce_only; точна рівність `Decimal`); статус, виконання, середня ціна й мітки часу — не умови. Кошики взаємовиключні й детерміновані: `managed` (з ознакою `exchange_id_completion_required`), `foreign`, `lost_managed`, `identity_conflicts` (структурована причина `IdentityConflictReason`, для умов — точні поля), `missing_local_active` (лише «відсутній у snapshot»; жодного висновку FAILED / CANCELED). Релевантні локальні статуси: UNKNOWN, OPEN, PARTIALLY_FILLED, CANCELING. Локальний ордер без нашого керованого id (legacy, інший namespace, пошкоджений) — конфлікт, ніколи не зіставлення за умовами. Discovery-сервіс і recovery-рішення — ще ні.
+
 **Foreign orders у V1:** foreign order ≠ доменний `Order`; не отримує фіктивний `PlacementRecord`; не імпортується в стан акаунта; не скасовується; блокує `open_orders_reconciled` — **включно з foreign reduce-only** (він теж змінює позицію). Вихід: оператор усуває ордер на біржі й recovery запускається знову. Імпорт foreign exposure (в Risk snapshot через `OpenOrderExposure`, з persistence і моделлю походження) — **[майбутнє]**, окрема фаза.
 
 **Scope.** Ціль V1 — **увесь керований exchange scope** виділеного акаунта / субакаунта, а не лише символи поточної стратегії: foreign activity на неочікуваному символі не повинна бути невидимою. Для запланованої конфігурації Bybit — linear і керований settlement scope; точні account / subaccount / category / settle задає конфігурація адаптера.
@@ -1120,7 +1122,7 @@ Safety-hardening відправки (`OrderSubmitter`, атомарні бірж
 
 1. exchange recovery DTO / protocol (13.3–13.4; симулятор реалізує їх для тестів) — **виконано**;
 2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
-3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10);
+3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10) — **виконано** (класифікація ордерів snapshot; порівняння notional / avg — разом із п. 4);
 4. відновлення виконань / fills (13.8);
 5. reconciliation позицій + workflow baseline (13.9);
 6. open-order discovery (13.7);

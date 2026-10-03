@@ -328,7 +328,7 @@
 **Стан.** Нормативний контракт exchange recovery — ARCHITECTURE 13 (задокументовано; коду ще немає). Затверджена послідовність (кожен пункт — окремий commit з тестами; safety-hardening відправки вже виконано):
 1. exchange recovery DTO / protocol (`ExchangeStateReader`; симулятор реалізує для тестів) — **виконано** (`app/exchanges/recovery.py`, reusable contract-тести; `TradingClient` не змінено);
 2. стабільний namespace `client_order_id` — **виконано** (`app/execution/client_order_id.py`: формат `tb1_<namespace>_<token>`, parser / класифікація id, генератор з ін'єкцією namespace; durable-джерело namespace — ще ні);
-3. чисте зіставлення / класифікація recovery;
+3. чисте зіставлення / класифікація recovery — **виконано** (`app/execution/recovery_matching.py`: managed / foreign / lost-managed / identity conflicts / missing-local-active, без читання біржі й змін стану);
 4. відновлення виконань / fills;
 5. reconciliation позицій + workflow прийняття baseline;
 6. open-order discovery;

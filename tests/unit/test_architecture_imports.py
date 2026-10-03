@@ -151,6 +151,11 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.timing",
         }
     ),
+    # Pure recovery order matching: domain, the exchange recovery DTOs and the
+    # client order id namespace only (no reader, persistence, services, adapters).
+    "execution.recovery_matching": frozenset(
+        {"app.domain", "app.exchanges.recovery", "app.execution.client_order_id"}
+    ),
     # Client order id namespace: pure, the domain only (no persistence, exchange,
     # services or recovery).
     "execution.client_order_id": frozenset({"app.domain"}),
