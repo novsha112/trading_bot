@@ -69,10 +69,14 @@ Positions, two separate views per symbol:
   the runtime position is unknown, e.g. a fill recovered after ``hydrate``). A
   durable unknown never becomes known through a fill. ``hydrate`` restores the
   durable projection, not the runtime position.
-``set_position_qty`` (a trusted value, or None to clear) sets both. Runtime known
-without a known durable projection is not produced by any current mutation; a
-fill there moves only the runtime value. A known runtime value that differs from
-the known durable projection fails closed (``PositionProjectionMismatchError``).
+``set_position_qty`` (a trusted value, or None to clear) sets both.
+``publish_exchange_positions`` (position reconciliation) sets RUNTIME values only
+from an authoritative exchange snapshot: no commit, no revision change. It makes
+two recovery states legitimate: runtime known with an unknown durable projection
+(an unexplained exchange position; a fill there moves only the runtime value and
+never makes the durable projection known) and runtime known different from a
+known durable projection (a mismatch; a fill there fails closed with
+``PositionProjectionMismatchError`` until it is resolved).
 
 Fills (``apply_fill``): the fill is found by its ``client_order_id``; symbol,
 side and a known ``exchange_order_id`` must match the order. Only SUBMITTING,
@@ -125,10 +129,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, DecimalException
+from types import MappingProxyType
 from typing import Any, Final, TypeVar
 
 from app.domain.clock import Clock
@@ -253,6 +258,19 @@ class AccountStatePoisonedError(AccountStateError):
 class SubmissionOutcomeConflictError(AccountStateError):
     """A definite transport outcome (not sent / rejected) contradicts exchange
     progress already observed for the order; the stronger state was kept."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class PositionEvidence:
+    """Immutable local position evidence read under the account lock."""
+
+    revision: int
+    runtime_positions: Mapping[str, Decimal]
+    """Known runtime positions (an absent symbol is unknown)."""
+    durable_positions: Mapping[str, PersistedPosition]
+    """Committed durable projections (an absent symbol has no durable row)."""
+    fill_symbols: frozenset[str]
+    """Symbols with at least one committed fill."""
 
 
 def _require_revision(value: object) -> int:
@@ -400,6 +418,44 @@ class LockedAccountState:
         never the exchange's current position."""
         state = self._live()
         return state.durable_positions.get(require_text(symbol, "symbol"))
+
+    def position_evidence(self) -> PositionEvidence:
+        """One immutable read of every position-relevant local fact (runtime
+        positions, durable projections, symbols with committed fills, revision)."""
+        state = self._live()
+        return PositionEvidence(
+            revision=state.revision,
+            runtime_positions=MappingProxyType(dict(state.positions)),
+            durable_positions=MappingProxyType(dict(state.durable_positions)),
+            fill_symbols=frozenset(fill.symbol for fill in state.fills.values()),
+        )
+
+    def publish_exchange_positions(
+        self, positions: Mapping[str, Decimal], *, expected_revision: int
+    ) -> None:
+        """Publish exchange-authoritative RUNTIME positions, all at once.
+
+        A runtime cache publication, not a durable mutation: the durable
+        projections, the revision and the store are untouched (nothing is
+        committed; a restart forgets it). Refused for a poisoned account and when
+        the local state moved past ``expected_revision`` (stale evidence). A zero
+        quantity is published as known flat, never as an absent entry."""
+        state = self._mutable()
+        if _require_revision(expected_revision) != state.revision:
+            raise StaleRevisionError(
+                f"positions reconciled at revision {expected_revision}, "
+                f"current revision is {state.revision}"
+            )
+        published = dict(state.positions)
+        for symbol, qty in positions.items():
+            require_text(symbol, "symbol")
+            if type(qty) is not Decimal or not qty.is_finite():
+                raise DomainValidationError(
+                    f"position of {symbol} must be a finite, exact Decimal, got {qty!r}"
+                )
+            published[symbol] = qty
+        # Synchronous (no await): no reader ever sees a partially published map.
+        self._owner._state = dataclasses.replace(state, positions=published)
 
     def placement(self, intent_id: str) -> PlacementRecord | None:
         state = self._live()

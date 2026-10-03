@@ -1038,6 +1038,15 @@ exchange cum_filled_qty > local filled_qty
   - **поточна durable projection після fill recovery == авторитетна біржова qty** (fills — доказ того, як отримано projection; вдруге вони **не** додаються); **або**
   - durable unknown / немає рядка + авторитетна біржова qty == 0 + немає position-level доказів виконань.
 - Ненульова авторитетна позиція при persisted unknown: runtime може стати known, але позиція лишається **unexplained**, gate не закривається, effective PAUSED.
+- **[інваріант: реалізовано] Автоматична reconciliation** (`app/execution/position_reconciliation.py`: `reconcile_positions(account_state=, snapshot=)` → `PositionReconciliationResult`; чиста `classify_positions`). Вхід — уже отриманий `PositionSnapshot`: без reader, без мережі. Scope повного snapshot = символи snapshot ∪ durable projection ∪ runtime ∪ закомічених fills; символ, відсутній у **повному** snapshot, має біржову qty 0. Результат по символу (`PositionReconciliation`: `exchange_qty`, `durable_present` / `durable_known` / `durable_qty`, `has_fill_evidence`, `runtime_qty`, `known`, `explained`, `explanation`):
+  - durable known == біржова → `DURABLE_PROJECTION_MATCH` (explained);
+  - durable known ≠ біржова → `DURABLE_PROJECTION_MISMATCH` (unexplained; durable **не** перезаписується);
+  - durable unknown / немає рядка, біржова 0, немає fills символу → `UNKNOWN_FLAT_WITH_NO_EVIDENCE` (explained);
+  - те саме, але fills символу є → `UNEXPLAINED_FLAT_WITH_LOCAL_EVIDENCE`;
+  - durable unknown / немає рядка, біржова ≠ 0 → `UNEXPLAINED_NONZERO`;
+  - неповний snapshot (`complete=False`) → кожен символ `INCOMPLETE_SNAPSHOT`, нічого не виводиться і не публікується.
+
+  Агрегат: `reconciled = snapshot_complete and all_known and all_explained`; порожній повний scope → reconciled; символи впорядковані детерміновано. Для повного snapshot кожна біржова qty (також 0 — як known flat, не як відсутній запис) публікується як **runtime**-позиція (`publish_exchange_positions`): copy-on-write, одним кроком, без store commit і без зміни revision; durable projection не змінюється; poisoned стан відмовляє; рестарт забуває публікацію. Runtime known + durable unknown легітимні: fills рухають лише runtime. Runtime known ≠ durable known (mismatch) → наступний fill символу fail closed (`PositionProjectionMismatchError`). Читання доказів, класифікація і публікація — під одним lock акаунта без await. **Межа staleness:** результат узгоджує лише наданий snapshot і не доводить, що біржа не змінилась після нього — це final verification координатора (13.11). Safety gates не змінюються; `mark_exchange_reconciled` не викликається.
 - **Baseline acceptance** — запланована явна дія оператора «прийняти поточну біржову позицію як baseline»: **не реалізується зараз**; лише explicit; durable; з причиною / audit event; після неї поточна біржова qty стає persisted known baseline, і наступний рестарт пояснює позицію автоматично. Неявного прийняття немає.
 
 ### 13.10 Кількість, notional і середня ціна **[план V1]**
@@ -1126,7 +1135,7 @@ Safety-hardening відправки (`OrderSubmitter`, атомарні бірж
 2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10) — **виконано** (класифікація ордерів snapshot; порівняння notional / avg — разом із п. 4);
 4. відновлення виконань / fills (13.8) — **виконано** (для одного managed-ордера; generic reader + simulator);
-5. reconciliation позицій + workflow baseline (13.9) — передумова **виконана** (інваріант durable position projection); reconciliation позицій і прийняття baseline — ще ні;
+5. reconciliation позицій + workflow baseline (13.9) — передумова **виконана** (інваріант durable position projection); автоматична reconciliation позицій — **виконано**; явне прийняття baseline — ще ні (пункт не завершено);
 6. open-order discovery (13.7);
 7. `RecoveryCoordinator` + final verification (13.1, 13.11, 13.12);
 8. Bybit read-адаптер + fixtures / testnet-валідація (13.14);

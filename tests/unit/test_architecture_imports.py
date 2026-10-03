@@ -151,6 +151,12 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.timing",
         }
     ),
+    # Position reconciliation of a supplied snapshot: the snapshot DTO and the
+    # account state only (no reader, simulator, adapter, persistence, services,
+    # safety controller).
+    "execution.position_reconciliation": frozenset(
+        {"app.domain", "app.exchanges.recovery", "app.execution.account_state"}
+    ),
     # Missing-fill recovery of one order: the read-only exchange reader and DTOs,
     # the account state's public API, matching and timing (no adapter, simulator,
     # persistence or services).
