@@ -77,6 +77,11 @@ two recovery states legitimate: runtime known with an unknown durable projection
 never makes the durable projection known) and runtime known different from a
 known durable projection (a mismatch; a fill there fails closed with
 ``PositionProjectionMismatchError`` until it is resolved).
+``commit_position_baseline`` (the privileged primitive of an EXPLICIT baseline
+acceptance, ``app.execution.position_baseline``) makes the current runtime
+quantity the known durable projection, together with its append-only
+``PositionBaselineRecord``, in ONE change (+1 revision); the runtime position is
+unchanged. Never called automatically.
 
 Fills (``apply_fill``): the fill is found by its ``client_order_id``; symbol,
 side and a known ``exchange_order_id`` must match the order. Only SUBMITTING,
@@ -148,6 +153,7 @@ from app.domain.validation import require_text, require_utc
 from app.execution.models import (
     ExchangeOrderState,
     PlacementRecord,
+    PositionBaselineRecord,
     SafetyBlockRecord,
     SubmissionBlockStage,
     SubmissionOutcome,
@@ -243,6 +249,24 @@ class PositionProjectionMismatchError(FillApplicationError):
     differ: a fill is never applied to one of them arbitrarily."""
 
 
+class PositionBaselineError(AccountStateError):
+    """A position baseline cannot be accepted; nothing was changed."""
+
+
+class BaselineRuntimeUnknownError(PositionBaselineError):
+    """There is no authoritative runtime (exchange-published) position to accept."""
+
+
+class BaselineQtyMismatchError(PositionBaselineError):
+    """The accepted quantity is not the current runtime position (a stale
+    acceptance: the exchange-published position changed since it was seen)."""
+
+
+class BaselineIdConflictError(PositionBaselineError):
+    """The ``baseline_id`` is already used by a recorded baseline (append-only:
+    a record is never overwritten)."""
+
+
 class MissingFillsError(AccountStateError):
     """The exchange reports more execution than the fills applied locally. Fills
     are never synthesized from an order report: the missing fills must be
@@ -297,6 +321,8 @@ class _State:
     fills: dict[str, Fill] = dataclasses.field(default_factory=dict)
     safety_blocks: dict[str, SafetyBlockRecord] = dataclasses.field(default_factory=dict)
     """Why an order was FAILED by the safety gate (definitely not sent)."""
+    position_baselines: dict[str, PositionBaselineRecord] = dataclasses.field(default_factory=dict)
+    """Append-only audit records of accepted position baselines, by baseline_id."""
     revision: int = 0
 
 
@@ -456,6 +482,73 @@ class LockedAccountState:
             published[symbol] = qty
         # Synchronous (no await): no reader ever sees a partially published map.
         self._owner._state = dataclasses.replace(state, positions=published)
+
+    def position_baselines(self, symbol: str | None = None) -> tuple[PositionBaselineRecord, ...]:
+        """Accepted baseline records (of ``symbol``, or all), ordered by
+        ``(account_revision, baseline_id)``; an immutable tuple."""
+        state = self._live()
+        if symbol is not None:
+            require_text(symbol, "symbol")
+        return tuple(
+            sorted(
+                (
+                    record
+                    for record in state.position_baselines.values()
+                    if symbol is None or record.symbol == symbol
+                ),
+                key=lambda record: (record.account_revision, record.baseline_id),
+            )
+        )
+
+    async def commit_position_baseline(self, record: PositionBaselineRecord) -> None:
+        """PRIVILEGED: durably accept the current runtime position as the known
+        durable projection of ``record.symbol``, with ``record`` as its audit
+        record, in one change (+1 revision). The runtime position is unchanged.
+
+        Only for an explicit acceptance (``app.execution.position_baseline``),
+        never automatic. ``record.qty`` must be exactly the current runtime
+        quantity and ``record.account_revision`` the next revision.
+
+        Raises:
+            AccountStatePoisonedError: the account is poisoned.
+            BaselineIdConflictError: ``record.baseline_id`` is already recorded.
+            StaleRevisionError: ``record.account_revision`` is not revision + 1.
+            BaselineRuntimeUnknownError: no runtime position of the symbol.
+            BaselineQtyMismatchError: ``record.qty`` is not the runtime position.
+        """
+        state = self._mutable()
+        if type(record) is not PositionBaselineRecord:
+            raise DomainValidationError("record must be a PositionBaselineRecord")
+        if record.baseline_id in state.position_baselines:
+            raise BaselineIdConflictError(f"baseline_id {record.baseline_id} is already recorded")
+        if record.account_revision != state.revision + 1:
+            raise StaleRevisionError(
+                f"baseline for revision {record.account_revision}, "
+                f"next revision is {state.revision + 1}"
+            )
+        runtime = state.positions.get(record.symbol)
+        if runtime is None:
+            raise BaselineRuntimeUnknownError(
+                f"no runtime position of {record.symbol} to accept as baseline"
+            )
+        if record.qty != runtime or repr(record.qty) != repr(runtime):
+            raise BaselineQtyMismatchError(
+                f"baseline {record.qty} of {record.symbol} is not the runtime position {runtime}"
+            )
+        row = PersistedPosition(symbol=record.symbol, known=True, qty=runtime)
+        prepared = dataclasses.replace(
+            state,
+            durable_positions=_with(state.durable_positions, record.symbol, row),
+            position_baselines=_with(state.position_baselines, record.baseline_id, record),
+            revision=record.account_revision,
+        )
+        change = self._change(
+            state,
+            new_revision=prepared.revision,
+            position_writes=(row,),
+            position_baseline_writes=(record,),
+        )
+        await self._commit_and_publish(state, prepared, change)
 
     def placement(self, intent_id: str) -> PlacementRecord | None:
         state = self._live()
@@ -1005,6 +1098,7 @@ def _runtime_state(snapshot: PersistedAccountState, change: AccountStateChange |
         durable_positions=dict(snapshot.positions),
         fills=dict(snapshot.fills),
         safety_blocks=dict(snapshot.safety_blocks),
+        position_baselines=dict(snapshot.position_baselines),
         revision=revision,
     )
 
@@ -1130,6 +1224,12 @@ class InMemoryAccountState:
     async def durable_position(self, symbol: str) -> PersistedPosition | None:
         async with self.account_lock() as locked:
             return locked.durable_position(symbol)
+
+    async def position_baselines(
+        self, symbol: str | None = None
+    ) -> tuple[PositionBaselineRecord, ...]:
+        async with self.account_lock() as locked:
+            return locked.position_baselines(symbol)
 
     async def placement(self, intent_id: str) -> PlacementRecord | None:
         async with self.account_lock() as locked:

@@ -21,6 +21,10 @@ library, the domain and execution's own models only.
 * ``AccountStateChange``: one atomic change set, guarded by ``expected_revision``.
 * ``SafetyBlockRecord`` (execution model): the durable reason of an order FAILED
   by the local safety gate (definitely not sent), immutable per order.
+* ``PositionBaselineRecord`` (execution model): the append-only audit record of
+  an explicit position baseline acceptance, immutable per ``baseline_id``. A
+  change writing one must, in the same change, write the known durable position
+  it accepted and advance the revision to the record's ``account_revision``.
 * ``PersistedAccountState``: an immutable snapshot of one account's durable state.
 * Errors of the port: ``PersistenceStoreError`` and its four outcomes, so callers
   handle them without importing an adapter.
@@ -40,7 +44,7 @@ from typing import Protocol, TypeVar
 
 from app.domain.fills import Fill
 from app.domain.orders import Order
-from app.execution.models import PlacementRecord, SafetyBlockRecord
+from app.execution.models import PlacementRecord, PositionBaselineRecord, SafetyBlockRecord
 
 
 class PersistenceStoreError(Exception):
@@ -141,6 +145,8 @@ class AccountStateChange:
     notional_writes: tuple[PersistedOrderNotional, ...] = ()
     safety_block_writes: tuple[SafetyBlockRecord, ...] = ()
     """Immutable reasons of safety-blocked (definitely unsent) FAILED orders."""
+    position_baseline_writes: tuple[PositionBaselineRecord, ...] = ()
+    """Append-only audit records of explicitly accepted position baselines."""
 
     def __post_init__(self) -> None:
         _text(self.account_scope_id, "account_scope_id")
@@ -157,9 +163,13 @@ class AccountStateChange:
         _typed_tuple(self.position_writes, PersistedPosition, "position_writes")
         _typed_tuple(self.notional_writes, PersistedOrderNotional, "notional_writes")
         _typed_tuple(self.safety_block_writes, SafetyBlockRecord, "safety_block_writes")
+        baselines = _typed_tuple(
+            self.position_baseline_writes, PositionBaselineRecord, "position_baseline_writes"
+        )
         if new == expected and (
             self.order_writes
             or self.safety_block_writes
+            or baselines
             or self.fill_writes
             or self.position_writes
             or self.notional_writes
@@ -168,6 +178,20 @@ class AccountStateChange:
             raise StoreValidationError(
                 "a change that keeps the revision may only write rejected placements"
             )
+        positions = {position.symbol: position for position in self.position_writes}
+        for record in baselines:
+            if record.account_revision != new:
+                raise StoreValidationError(
+                    f"position baseline {record.baseline_id}: account_revision "
+                    f"{record.account_revision} is not the new revision {new}"
+                )
+            accepted = PersistedPosition(symbol=record.symbol, known=True, qty=record.qty)
+            written = positions.get(record.symbol)
+            if written != accepted or repr(written) != repr(accepted):
+                raise StoreValidationError(
+                    f"position baseline {record.baseline_id} without its known position "
+                    f"{record.symbol} = {record.qty} in the same change"
+                )
 
 
 def _keyed(item: object, kind: type, key: str, identity: object, name: str) -> None:
@@ -197,6 +221,8 @@ class PersistedAccountState:
     """Exact accumulated fill notional by client_order_id."""
     safety_blocks: Mapping[str, SafetyBlockRecord] = field(default_factory=dict)
     """Why an order was FAILED by the safety gate, by client_order_id."""
+    position_baselines: Mapping[str, PositionBaselineRecord] = field(default_factory=dict)
+    """Audit records of accepted position baselines, by baseline_id."""
 
     def __post_init__(self) -> None:
         _text(self.account_scope_id, "account_scope_id")
@@ -219,8 +245,29 @@ class PersistedAccountState:
                 getattr(block, "client_order_id", None),
                 "safety_blocks",
             )
+        for key, baseline in self.position_baselines.items():
+            _keyed(
+                baseline,
+                PositionBaselineRecord,
+                key,
+                getattr(baseline, "baseline_id", None),
+                "position_baselines",
+            )
+            if baseline.account_revision > self.revision:
+                raise StoreValidationError(
+                    f"position baseline {key} is from revision {baseline.account_revision}, "
+                    f"after the snapshot revision {self.revision}"
+                )
         # Defensive read-only copies: later changes to the given mappings are not seen.
-        for name in ("placements", "orders", "fills", "positions", "notionals", "safety_blocks"):
+        for name in (
+            "placements",
+            "orders",
+            "fills",
+            "positions",
+            "notionals",
+            "safety_blocks",
+            "position_baselines",
+        ):
             object.__setattr__(self, name, _frozen(getattr(self, name)))
 
 

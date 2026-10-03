@@ -330,11 +330,11 @@
 2. стабільний namespace `client_order_id` — **виконано** (`app/execution/client_order_id.py`: формат `tb1_<namespace>_<token>`, parser / класифікація id, генератор з ін'єкцією namespace; durable-джерело namespace — ще ні);
 3. чисте зіставлення / класифікація recovery — **виконано** (`app/execution/recovery_matching.py`: managed / foreign / lost-managed / identity conflicts / missing-local-active, без читання біржі й змін стану);
 4. відновлення виконань / fills — **виконано** (`app/execution/fill_recovery.py`: повна історія, дедуп, блок не-TRADE, preflight до мутації, точні qty / notional через наявний `apply_fill`);
-5. reconciliation позицій + workflow прийняття baseline — **частково** (не завершено):
+5. reconciliation позицій + workflow прийняття baseline — **виконано**:
    - передумова: інваріант durable position projection — **виконано** (known durable позиція покриває всі закомічені fills, також після hydrate);
    - автоматична reconciliation авторитетних позицій — **виконано** (`app/execution/position_reconciliation.py`: класифікація match / mismatch / unknown flat / unexplained, публікація лише runtime-позицій без commit і revision; неповний snapshot нічого не виводить);
-   - явне прийняття baseline — ні (пункт 5 не завершено);
-6. open-order discovery;
+   - явне прийняття baseline — **виконано** (`app/execution/position_baseline.py`: явна per-symbol команда з reason, qty = поточна runtime-позиція, захист revision + qty, атомарно known durable позиція + append-only `PositionBaselineRecord` + revision; gates не змінює);
+6. open-order discovery — наступний, ще не виконано;
 7. `RecoveryCoordinator` + final verification;
 8. Bybit read-адаптер + fixtures / testnet-валідація;
 9. private stream + runtime health;

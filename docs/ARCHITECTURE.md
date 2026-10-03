@@ -743,6 +743,7 @@ risk:
 | fill | Fill / `exec_id` + Order + точний виконаний notional + позиція + revision |
 | звіт біржі / результат відправки / ack | статус і метадані Order + revision |
 | safety-блокування відправки | `Order(FAILED)` + `SafetyBlockRecord` + revision |
+| явне прийняття baseline позиції | known `PersistedPosition` + `PositionBaselineRecord` + revision |
 
 Order і позицію від одного fill **не можна** зберігати окремими транзакціями.
 
@@ -1047,7 +1048,14 @@ exchange cum_filled_qty > local filled_qty
   - неповний snapshot (`complete=False`) → кожен символ `INCOMPLETE_SNAPSHOT`, нічого не виводиться і не публікується.
 
   Агрегат: `reconciled = snapshot_complete and all_known and all_explained`; порожній повний scope → reconciled; символи впорядковані детерміновано. Для повного snapshot кожна біржова qty (також 0 — як known flat, не як відсутній запис) публікується як **runtime**-позиція (`publish_exchange_positions`): copy-on-write, одним кроком, без store commit і без зміни revision; durable projection не змінюється; poisoned стан відмовляє; рестарт забуває публікацію. Runtime known + durable unknown легітимні: fills рухають лише runtime. Runtime known ≠ durable known (mismatch) → наступний fill символу fail closed (`PositionProjectionMismatchError`). Читання доказів, класифікація і публікація — під одним lock акаунта без await. **Межа staleness:** результат узгоджує лише наданий snapshot і не доводить, що біржа не змінилась після нього — це final verification координатора (13.11). Safety gates не змінюються; `mark_exchange_reconciled` не викликається.
-- **Baseline acceptance** — запланована явна дія оператора «прийняти поточну біржову позицію як baseline»: **не реалізується зараз**; лише explicit; durable; з причиною / audit event; після неї поточна біржова qty стає persisted known baseline, і наступний рестарт пояснює позицію автоматично. Неявного прийняття немає.
+- **[інваріант: реалізовано] Явне прийняття baseline** (`app/execution/position_baseline.py`: `accept_position_baseline(account_state=, command=PositionBaselineAcceptance(symbol, expected_exchange_qty, expected_revision, reason), clock=, baseline_ids=)` → `PositionBaselineAcceptanceResult(symbol, qty, outcome ACCEPTED | ALREADY_ACCEPTED, baseline_record, revision)`). Привілейована durable дія, **ніколи не автоматична**: `explained=False` сам по собі нічого не приймає; одна команда — один символ, batch / «прийняти все» немає.
+  - **Джерело qty** — поточна runtime-позиція, опублікована reconciliation з біржі; довільна нова qty не приймається. Немає runtime → `BaselineRuntimeUnknownError`.
+  - **Захист від застарілої дії:** `expected_revision` (`StaleRevisionError`) **і** `expected_exchange_qty == runtime` (`BaselineQtyMismatchError`): runtime-публікація не змінює revision, тому новіша reconciliation (5 → 7) робить команду «5» застарілою.
+  - **Порядок під одним lock:** poison → revision → runtime є → qty → no-op → один `clock.now()` (строго aware UTC, `strict_change_time`; не раніше попереднього baseline) і один новий `baseline_id` (інжектоване джерело; за замовчуванням `secrets`, 128 біт) → одна `AccountStateChange` → publish. Durable known == runtime → `ALREADY_ACCEPTED`: без Clock, id, commit і revision.
+  - **Атомарність:** known durable позиція + `PositionBaselineRecord(baseline_id, symbol, qty, reason, accepted_at, account_revision)` + CAS R → R+1 — одна зміна; runtime не змінюється. `AccountStateChange` відхиляє record без відповідної known-позиції (той самий символ, точно та сама qty) і з `account_revision` ≠ new revision. Mismatch (durable 2, runtime 5) і durable unknown / відсутній — саме ті випадки, які дія розв'язує; flat (0) приймається як known flat.
+  - **Audit:** reason обов'язковий і канонічний (1–500 символів, без пробілів на краях, без control / format символів; не нормалізується, а відхиляється), не повинен містити секретів; ідентичності оператора немає (майбутня інтеграція). Records append-only (`baseline_id` ніколи не перезаписується, колізія → `BaselineIdConflictError` / `StoreConflictError`), зберігаються в агрегаті і відновлюються hydrate; читання — `position_baselines(symbol=None)`, кортеж у порядку `(account_revision, baseline_id)`.
+  - **Збої:** definite failure — нічого не змінено, без poison; uncertain — poison, підготовлений стан не публікується, результат визначає hydrate.
+  - **Не доказ біржі назавжди:** record означає лише, що в `accepted_at` явно прийнято спостережену біржову qty. Після рестарту runtime знову невідома і потрібна нова exchange reconciliation (вона пояснює позицію через durable projection). Прийняття **не відкриває gates** і не викликає `mark_exchange_reconciled`: це зробить `RecoveryCoordinator` після повторної reconciliation, ордерів, fills і final verification.
 
 ### 13.10 Кількість, notional і середня ціна **[план V1]**
 
@@ -1089,7 +1097,8 @@ Recovery не закриває gates після першого проходу. F
 
 | Категорія | Що |
 |---|---|
-| Потрібно пізніше | відновлені fills / ордери / позиції — через наявний `AccountStateStore` і атомарні мутації; явне прийняття baseline позиції + причина / audit |
+| Реалізовано | явне прийняття baseline позиції + причина / audit record (`PositionBaselineRecord`, append-only, в агрегаті акаунта) |
+| Потрібно пізніше | відновлені ордери — через наявний `AccountStateStore` і атомарні мутації |
 | Не потрібно для безпеки V1 | persistence foreign orders; execution watermark; час останнього recovery |
 | Майбутнє | durable HALT latch; метадані stream / runtime health |
 
@@ -1135,7 +1144,7 @@ Safety-hardening відправки (`OrderSubmitter`, атомарні бірж
 2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10) — **виконано** (класифікація ордерів snapshot; порівняння notional / avg — разом із п. 4);
 4. відновлення виконань / fills (13.8) — **виконано** (для одного managed-ордера; generic reader + simulator);
-5. reconciliation позицій + workflow baseline (13.9) — передумова **виконана** (інваріант durable position projection); автоматична reconciliation позицій — **виконано**; явне прийняття baseline — ще ні (пункт не завершено);
+5. reconciliation позицій + workflow baseline (13.9) — **виконано**: інваріант durable position projection, автоматична reconciliation позицій і явне прийняття baseline;
 6. open-order discovery (13.7);
 7. `RecoveryCoordinator` + final verification (13.1, 13.11, 13.12);
 8. Bybit read-адаптер + fixtures / testnet-валідація (13.14);

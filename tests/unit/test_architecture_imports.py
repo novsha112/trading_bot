@@ -154,6 +154,16 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     # Position reconciliation of a supplied snapshot: the snapshot DTO and the
     # account state only (no reader, simulator, adapter, persistence, services,
     # safety controller).
+    # Explicit baseline acceptance: the account-state primitive, its record and
+    # the strict clock helper only (no reader, adapter, safety or coordinator).
+    "execution.position_baseline": frozenset(
+        {
+            "app.domain",
+            "app.execution.account_state",
+            "app.execution.models",
+            "app.execution.timing",
+        }
+    ),
     "execution.position_reconciliation": frozenset(
         {"app.domain", "app.exchanges.recovery", "app.execution.account_state"}
     ),

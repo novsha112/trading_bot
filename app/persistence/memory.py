@@ -4,14 +4,16 @@ NOT durable storage (lost with the process).
 
 It models the future database constraints within each ``account_scope_id``:
 unique ``intent_id`` (placements), ``client_order_id`` (orders, notionals,
-approved placements and safety blocks), ``exec_id`` (fills),
+approved placements and safety blocks), ``exec_id`` (fills), ``baseline_id``
+(position baselines),
 ``exchange_order_id`` (when known), ``symbol`` (positions). A commit is
 validated completely first and then applied as a whole, or not at all:
 
 1. revision CAS: ``expected_revision`` must equal the stored revision (0 for an
    account never committed), else ``StoreConflictError``;
 2. identities: an identical rewrite is a no-op; the same identity with different
-   data is a ``StoreConflictError`` (placements, fills, safety blocks); an
+   data is a ``StoreConflictError`` (placements, fills, safety blocks, position
+   baselines: append-only, never overwritten); an
    ``Order`` is replaced only by a higher ``version`` (same version: identical ->
    no-op, different -> conflict; lower -> conflict); positions and notionals
    are projections replaced inside the successful CAS commit. "Identical" means equal AND equally
@@ -48,7 +50,7 @@ from typing import TypeVar
 
 from app.domain.fills import Fill
 from app.domain.orders import Order
-from app.execution.models import PlacementRecord, SafetyBlockRecord
+from app.execution.models import PlacementRecord, PositionBaselineRecord, SafetyBlockRecord
 from app.execution.persistence import (
     AccountStateChange,
     PersistedAccountState,
@@ -79,6 +81,7 @@ class _Account:
     positions: dict[str, PersistedPosition] = field(default_factory=dict)
     notionals: dict[str, Decimal] = field(default_factory=dict)
     safety_blocks: dict[str, SafetyBlockRecord] = field(default_factory=dict)
+    position_baselines: dict[str, PositionBaselineRecord] = field(default_factory=dict)
 
     def copy(self) -> _Account:
         return _Account(
@@ -89,6 +92,7 @@ class _Account:
             positions=dict(self.positions),
             notionals=dict(self.notionals),
             safety_blocks=dict(self.safety_blocks),
+            position_baselines=dict(self.position_baselines),
         )
 
 
@@ -139,6 +143,7 @@ def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
     _no_duplicates(change.position_writes, "symbol", "position")
     _no_duplicates(change.notional_writes, "client_order_id", "notional")
     _no_duplicates(change.safety_block_writes, "client_order_id", "safety block")
+    _no_duplicates(change.position_baseline_writes, "baseline_id", "position baseline")
     account = _Account() if current is None else current.copy()
     for record in change.placement_writes:
         _write_immutable(account.placements, record.intent_id, record, "intent_id")
@@ -152,6 +157,10 @@ def _prepare(current: _Account | None, change: AccountStateChange) -> _Account:
         account.notionals[notional.client_order_id] = notional.filled_notional
     for block in change.safety_block_writes:
         _write_immutable(account.safety_blocks, block.client_order_id, block, "safety block")
+    for baseline in change.position_baseline_writes:
+        _write_immutable(
+            account.position_baselines, baseline.baseline_id, baseline, "position baseline"
+        )
     check_account_references(
         placements=account.placements,
         orders=account.orders,
@@ -193,6 +202,7 @@ class InMemoryAccountStateStore:
                 positions=account.positions,
                 notionals=account.notionals,
                 safety_blocks=account.safety_blocks,
+                position_baselines=account.position_baselines,
             )
 
     async def commit(self, change: AccountStateChange) -> None:
