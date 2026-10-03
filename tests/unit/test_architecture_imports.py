@@ -154,6 +154,18 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
     # Position reconciliation of a supplied snapshot: the snapshot DTO and the
     # account state only (no reader, simulator, adapter, persistence, services,
     # safety controller).
+    # Open-order discovery: the reader protocol and DTOs, the account state and
+    # the pure matcher only (no simulator, adapter, safety or other workflow).
+    "execution.open_order_discovery": frozenset(
+        {
+            "app.domain",
+            "app.exchanges.protocols",
+            "app.exchanges.recovery",
+            "app.execution.account_state",
+            "app.execution.client_order_id",
+            "app.execution.recovery_matching",
+        }
+    ),
     # Explicit baseline acceptance: the account-state primitive, its record and
     # the strict clock helper only (no reader, adapter, safety or coordinator).
     "execution.position_baseline": frozenset(

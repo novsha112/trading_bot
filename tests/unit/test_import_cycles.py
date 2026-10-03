@@ -26,6 +26,7 @@ MODULES = (
     "app.execution.fill_recovery",
     "app.execution.position_reconciliation",
     "app.execution.position_baseline",
+    "app.execution.open_order_discovery",
     "app.services.placement",
     "app.execution.submitter",
     "app.execution.reconciliation",

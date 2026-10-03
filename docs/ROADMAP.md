@@ -325,7 +325,7 @@
 
 **Мета.** Бот коректно відновлюється після будь-якого рестарту і не торгує, якщо його стан не збігається з біржею.
 
-**Стан.** Нормативний контракт exchange recovery — ARCHITECTURE 13 (задокументовано; коду ще немає). Затверджена послідовність (кожен пункт — окремий commit з тестами; safety-hardening відправки вже виконано):
+**Стан.** Нормативний контракт exchange recovery — ARCHITECTURE 13 (задокументовано; кроки 1–6 реалізовано). Затверджена послідовність (кожен пункт — окремий commit з тестами; safety-hardening відправки вже виконано):
 1. exchange recovery DTO / protocol (`ExchangeStateReader`; симулятор реалізує для тестів) — **виконано** (`app/exchanges/recovery.py`, reusable contract-тести; `TradingClient` не змінено);
 2. стабільний namespace `client_order_id` — **виконано** (`app/execution/client_order_id.py`: формат `tb1_<namespace>_<token>`, parser / класифікація id, генератор з ін'єкцією namespace; durable-джерело namespace — ще ні);
 3. чисте зіставлення / класифікація recovery — **виконано** (`app/execution/recovery_matching.py`: managed / foreign / lost-managed / identity conflicts / missing-local-active, без читання біржі й змін стану);
@@ -334,8 +334,8 @@
    - передумова: інваріант durable position projection — **виконано** (known durable позиція покриває всі закомічені fills, також після hydrate);
    - автоматична reconciliation авторитетних позицій — **виконано** (`app/execution/position_reconciliation.py`: класифікація match / mismatch / unknown flat / unexplained, публікація лише runtime-позицій без commit і revision; неповний snapshot нічого не виводить);
    - явне прийняття baseline — **виконано** (`app/execution/position_baseline.py`: явна per-symbol команда з reason, qty = поточна runtime-позиція, захист revision + qty, атомарно known durable позиція + append-only `PositionBaselineRecord` + revision; gates не змінює);
-6. open-order discovery — наступний, ще не виконано;
-7. `RecoveryCoordinator` + final verification;
+6. open-order discovery — **виконано** (`app/execution/open_order_discovery.py`: одне читання `list_open_orders()` без lock, чистий matcher проти поточних локальних ордерів, foreign / lost / conflict / missing → BLOCKED без змін, атомарне доповнення відсутніх exchange id лише для чистого snapshot);
+7. `RecoveryCoordinator` + final verification — наступний, ще не виконано;
 8. Bybit read-адаптер + fixtures / testnet-валідація;
 9. private stream + runtime health;
 10. live preflight (live без здорового private stream не підтримується).

@@ -83,6 +83,14 @@ quantity the known durable projection, together with its append-only
 ``PositionBaselineRecord``, in ONE change (+1 revision); the runtime position is
 unchanged. Never called automatically.
 
+Exchange order id completion (``complete_exchange_order_ids``, driven by
+open-order discovery): records authoritative exchange ids of local orders
+that do not know theirs yet, all in ONE change (+1 revision), all or nothing.
+Only ``None -> id``; an id equal to the recorded one is a no-op, a different
+recorded id is never replaced. It is identity metadata, not an order event:
+status, execution, terms and timestamps are kept (``updated_at`` too; only the
+order ``version`` advances, as every persisted order write requires). No clock.
+
 Fills (``apply_fill``): the fill is found by its ``client_order_id``; symbol,
 side and a known ``exchange_order_id`` must match the order. Only SUBMITTING,
 OPEN, PARTIALLY_FILLED, CANCELING and UNKNOWN orders accept fills (NEW was never
@@ -194,6 +202,16 @@ _BLOCK_STAGE: Final = {
 _ACK_CONTRADICTING_STATUSES: Final = frozenset(
     {OrderStatus.NEW, OrderStatus.FAILED, OrderStatus.REJECTED}
 )
+# Local orders whose exchange id may be completed: sent and still relevant for
+# the exchange (the open-order recovery statuses; terminal orders are final).
+EXCHANGE_ID_COMPLETION_STATUSES: Final = frozenset(
+    {
+        OrderStatus.UNKNOWN,
+        OrderStatus.OPEN,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.CANCELING,
+    }
+)
 # Local statuses in which an exchange execution can arrive (docs/ARCHITECTURE.md 8):
 # NEW was never sent, terminal orders are final.
 FILLABLE_STATUSES: Final = frozenset(
@@ -265,6 +283,24 @@ class BaselineQtyMismatchError(PositionBaselineError):
 class BaselineIdConflictError(PositionBaselineError):
     """The ``baseline_id`` is already used by a recorded baseline (append-only:
     a record is never overwritten)."""
+
+
+class ExchangeIdCompletionError(AccountStateError):
+    """An exchange order id cannot be completed (unknown or non-relevant order,
+    a different id already recorded, an id claimed by another order, a
+    duplicate in the batch); nothing was changed."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class ExchangeOrderIdCompletion:
+    """Record ``exchange_order_id`` for the local order ``client_order_id``."""
+
+    client_order_id: str
+    exchange_order_id: str
+
+    def __post_init__(self) -> None:
+        require_text(self.client_order_id, "client_order_id")
+        require_text(self.exchange_order_id, "exchange_order_id")
 
 
 class MissingFillsError(AccountStateError):
@@ -557,6 +593,82 @@ class LockedAccountState:
     def order(self, client_order_id: str) -> Order | None:
         state = self._live()
         return state.orders.get(require_text(client_order_id, "client_order_id"))
+
+    def orders(self) -> tuple[Order, ...]:
+        """Every local order (all statuses), in reservation order (immutable)."""
+        return tuple(self._live().orders.values())
+
+    async def complete_exchange_order_ids(
+        self, completions: tuple[ExchangeOrderIdCompletion, ...], *, expected_revision: int
+    ) -> tuple[Order, ...]:
+        """Record authoritative exchange order ids, all in ONE change, or nothing.
+
+        Every completion is checked before anything is prepared: the order
+        exists and is in ``EXCHANGE_ID_COMPLETION_STATUSES``; its recorded id is
+        None or exactly the given one; no other local order (any status) has the
+        id; no client or exchange id appears twice in the batch. Completions
+        whose id is already recorded are no-ops; when all are, nothing is
+        committed and ``()`` is returned. Otherwise the changed orders (sorted by
+        ``(client_order_id, exchange_order_id)``) are committed with +1 revision
+        and returned. Status, execution, terms and ``updated_at`` are kept; only
+        ``version`` advances.
+
+        Raises:
+            AccountStatePoisonedError: the account is poisoned.
+            StaleRevisionError: ``expected_revision`` is not the current revision.
+            ExchangeIdCompletionError: any completion is not provable (none applied).
+        """
+        state = self._mutable()
+        if type(completions) is not tuple or not all(
+            type(item) is ExchangeOrderIdCompletion for item in completions
+        ):
+            raise DomainValidationError("completions must be a tuple of ExchangeOrderIdCompletion")
+        self._require_current(state, _require_revision(expected_revision))
+        ordered = sorted(completions, key=lambda c: (c.client_order_id, c.exchange_order_id))
+        for attribute in ("client_order_id", "exchange_order_id"):
+            values = [getattr(item, attribute) for item in ordered]
+            if len(set(values)) != len(values):
+                raise ExchangeIdCompletionError(f"a {attribute} appears twice in the batch")
+        owners = {
+            order.exchange_order_id: order.client_order_id
+            for order in state.orders.values()
+            if order.exchange_order_id is not None
+        }
+        updated: list[Order] = []
+        for item in ordered:
+            order = state.orders.get(item.client_order_id)
+            if order is None:
+                raise ExchangeIdCompletionError(f"no local order {item.client_order_id}")
+            if order.status not in EXCHANGE_ID_COMPLETION_STATUSES:
+                raise ExchangeIdCompletionError(
+                    f"order {order.client_order_id} is {order.status.value}: its exchange id "
+                    "is not completed"
+                )
+            owner = owners.get(item.exchange_order_id)
+            if owner is not None and owner != order.client_order_id:
+                raise ExchangeIdCompletionError(
+                    f"exchange_order_id {item.exchange_order_id} belongs to order {owner}"
+                )
+            if order.exchange_order_id == item.exchange_order_id:
+                continue  # already recorded: benign
+            if order.exchange_order_id is not None:
+                raise ExchangeIdCompletionError(
+                    f"order {order.client_order_id} has exchange_order_id "
+                    f"{order.exchange_order_id}, never replaced by {item.exchange_order_id}"
+                )
+            # Identity metadata, not an event: the order's own time is kept.
+            updated.append(
+                record_exchange_order_id(order, item.exchange_order_id, at=order.updated_at)
+            )
+        if not updated:
+            return ()
+        orders = dict(state.orders)
+        for order in updated:
+            orders[order.client_order_id] = order
+        prepared = dataclasses.replace(state, orders=orders, revision=state.revision + 1)
+        change = self._change(state, new_revision=prepared.revision, order_writes=tuple(updated))
+        await self._commit_and_publish(state, prepared, change)
+        return tuple(updated)
 
     def safety_block(self, client_order_id: str) -> SafetyBlockRecord | None:
         """The durable reason if the safety gate FAILED this order, else None."""
@@ -1238,6 +1350,10 @@ class InMemoryAccountState:
     async def order(self, client_order_id: str) -> Order | None:
         async with self.account_lock() as locked:
             return locked.order(client_order_id)
+
+    async def orders(self) -> tuple[Order, ...]:
+        async with self.account_lock() as locked:
+            return locked.orders()
 
     async def safety_block(self, client_order_id: str) -> SafetyBlockRecord | None:
         async with self.account_lock() as locked:
