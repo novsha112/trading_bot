@@ -973,6 +973,7 @@ Frozen, slots, kw_only; точні скінченні `Decimal`, aware UTC `date
 - **[інваріант]** Колізія ідентичності → fail closed: той самий `client_order_id` з іншим `exchange_order_id`, той самий `exchange_order_id` з іншим `client_order_id`, ті самі ідентифікатори з іншими умовами (symbol, side, type, qty, price, time-in-force, reduce_only) — нічого не змінюється, recovery заблоковано (13.12).
 - **[інваріант]** Глобальний інваріант «кожен ордер, видимий на біржі, має approved `PlacementRecord`» **НЕ вводиться** (13.13).
 - **[план V1] Namespace client id.** Керовані ордери мають стабільний префікс / namespace у `client_order_id`: незмінний між рестартами; специфічний для інсталяції / інстансу бота; вміщається в ліміт біржі разом з унікальною частиною; не генерується заново при старті. Він дозволяє відрізнити lost-managed від foreign. Формат фіксує окремий implementation commit (п. 2 послідовності). Без namespace класифікація 13.7 неможлива, тож open-order discovery від нього залежить.
+- **Реалізовано: wire format і parser namespace** (`app/execution/client_order_id.py`, чистий модуль, лише домен). Формат v1: `tb1_<namespace>_<order-token>` — ASCII, канонічний, `_` лише як роздільник; namespace `[a-z0-9]{1,12}`, токен `[a-z0-9]{1,32}` (локальні межі безпеки формату, не ліміт біржі; майбутній адаптер перевіряє свою capability). `ClientOrderNamespace` будує й розпізнає керовані id; `parse_client_order_id` ніколи не кидає для `str` / `None` і розрізняє ABSENT / UNMANAGED / MANAGED / MALFORMED_MANAGED (наш префікс, зламана структура) / UNSUPPORTED_MANAGED_VERSION (інша версія) — пошкоджений id нашого сімейства **не** стає foreign; `classify_client_order_id` дає OURS / OTHER / ABSENT / MALFORMED_MANAGED / UNSUPPORTED_MANAGED_VERSION лише для рядка id (класифікація біржових ордерів — наступний крок). `NamespacedClientOrderIdGenerator` (Protocol coordinator-а без змін) бере namespace ззовні й один токен `secrets.token_hex(8)` на id; `intent_id` у id не потрапляє. **Стабільність — контракт явної конфігурації / ін'єкції;** durable-джерело namespace інсталяції ще **не** реалізовано. Старі id без префікса не мігруються (майбутній legacy-випадок recovery).
 
 ### 13.6 Відновлення локально відомих ордерів **[план V1]**
 
@@ -1118,7 +1119,7 @@ Recovery не закриває gates після першого проходу. F
 Safety-hardening відправки (`OrderSubmitter`, атомарні біржові gates) — **виконано**. Далі, кожен пункт — окремий commit з тестами:
 
 1. exchange recovery DTO / protocol (13.3–13.4; симулятор реалізує їх для тестів) — **виконано**;
-2. стабільний namespace `client_order_id` (13.5);
+2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10);
 4. відновлення виконань / fills (13.8);
 5. reconciliation позицій + workflow baseline (13.9);

@@ -151,6 +151,9 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.timing",
         }
     ),
+    # Client order id namespace: pure, the domain only (no persistence, exchange,
+    # services or recovery).
+    "execution.client_order_id": frozenset({"app.domain"}),
     # Fallback-safe local change time: the domain clock only.
     "execution.timing": frozenset({"app.domain"}),
     # Storage codecs: no app module at all (not even the domain).

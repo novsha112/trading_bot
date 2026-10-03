@@ -21,6 +21,7 @@ MODULES = (
     "app.execution.recovery",
     "app.persistence.memory",
     "app.execution.safety",
+    "app.execution.client_order_id",
     "app.services.placement",
     "app.execution.submitter",
     "app.execution.reconciliation",
