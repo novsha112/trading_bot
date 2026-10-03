@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Final
 
 from app.domain.enums import OrderStatus
 from app.domain.errors import DomainValidationError
 from app.domain.intents import PlaceOrderIntent
+from app.domain.order_state import EXCHANGE_REPORTED_STATUSES
 from app.domain.validation import (
     require_enum,
     require_non_negative,
@@ -107,21 +107,6 @@ class PlacementRecord:
     @property
     def approved(self) -> bool:
         return self.decision.approved
-
-
-# Statuses an exchange can actually report about an order. Local lifecycle
-# statuses (NEW, SUBMITTING, CANCELING, UNKNOWN) and FAILED ("never sent") are
-# never exchange facts.
-EXCHANGE_REPORTED_STATUSES: Final = frozenset(
-    {
-        OrderStatus.OPEN,
-        OrderStatus.PARTIALLY_FILLED,
-        OrderStatus.FILLED,
-        OrderStatus.CANCELED,
-        OrderStatus.REJECTED,
-        OrderStatus.EXPIRED,
-    }
-)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

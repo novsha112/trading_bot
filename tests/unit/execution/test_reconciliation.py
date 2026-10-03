@@ -16,7 +16,7 @@ from app.domain.enums import OrderStatus, OrderType, Side, TimeInForce
 from app.domain.errors import DomainValidationError
 from app.domain.fills import Fill
 from app.domain.intents import PlaceOrderIntent
-from app.domain.order_state import transition
+from app.domain.order_state import EXCHANGE_REPORTED_STATUSES, transition
 from app.domain.orders import Order, OrderUpdate
 from app.exchanges.errors import (
     ExchangeAmbiguousResultError,
@@ -34,7 +34,7 @@ from app.execution.account_state import (
     LockedAccountState,
     MissingFillsError,
 )
-from app.execution.models import EXCHANGE_REPORTED_STATUSES, ExchangeOrderState
+from app.execution.models import ExchangeOrderState
 from app.execution.reconciliation import (
     OrderNotUnknownError,
     OrderStillUnknownError,

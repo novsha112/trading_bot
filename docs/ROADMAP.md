@@ -326,7 +326,7 @@
 **Мета.** Бот коректно відновлюється після будь-якого рестарту і не торгує, якщо його стан не збігається з біржею.
 
 **Стан.** Нормативний контракт exchange recovery — ARCHITECTURE 13 (задокументовано; коду ще немає). Затверджена послідовність (кожен пункт — окремий commit з тестами; safety-hardening відправки вже виконано):
-1. exchange recovery DTO / protocol (`ExchangeStateReader`; симулятор реалізує для тестів);
+1. exchange recovery DTO / protocol (`ExchangeStateReader`; симулятор реалізує для тестів) — **виконано** (`app/exchanges/recovery.py`, reusable contract-тести; `TradingClient` не змінено);
 2. стабільний namespace `client_order_id`;
 3. чисте зіставлення / класифікація recovery;
 4. відновлення виконань / fills;

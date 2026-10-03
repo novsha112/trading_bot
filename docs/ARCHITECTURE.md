@@ -947,7 +947,10 @@ hydrate (11.0)
 
 Чинний `get_order(OrderRef) -> OrderUpdate | None` недостатній (немає умов ордера, `None` без межі покриття); `get_open_orders(symbol)` — лише один символ і `OrderUpdate` з обов'язковим `client_order_id`, тож ордер без client id неможливо представити; `AccountClient.get_positions` повертає доменний `Position` (з PnL) без сигналу повноти; історії виконань немає. Це прогалини, які закриває п. 1 послідовності (13.16).
 
-### 13.4 Заплановані DTO **[план V1]**
+### 13.4 DTO і read-only протокол **[інваріант: реалізовано]**
+
+**Реалізовано** (`app/exchanges/recovery.py`, `ExchangeStateReader` у `app/exchanges/protocols.py`; `TradingClient` не змінено): DTO нижче з суворою валідацією (точні `Decimal` без float / int / підкласів, точні `bool`, UTC; значення не нормалізуються) і read-only протокол `list_open_orders()`, `get_position_snapshot()`, `list_executions(query, *, cursor=None)` — scope є властивістю конфігурації reader-а, `AccountScope` не вводився. Додатково до мінімуму: статус `ExchangeOrder` узгоджений із кумулятивним виконанням (правила домену), у `OpenOrdersSnapshot` лише OPEN / PARTIALLY_FILLED і `server_ts` не раніше `updated_ts` ордерів, `ExecutionPage` містить лише виконання, що відповідають її query (вікно включне з обох боків). `EXCHANGE_REPORTED_STATUSES` перенесено в `app/domain/order_state.py` (одне джерело для exchanges і execution). `SimulatedExchange` реалізує протокол (детермінована пагінація, курсори прив'язані до query, ін'єкція збою сторінки, partial snapshot позицій, зовнішні ордери й виконання як тестові входи); поведінковий контракт — `tests/unit/exchanges/test_exchange_state_reader_contract.py`, придатний для майбутніх reader-ів. Зіставлення, recovery-логіка й Bybit-реалізація — ні.
+
 
 Frozen, slots, kw_only; точні скінченні `Decimal`, aware UTC `datetime` (як чинні моделі). Повний код визначить commit п. 1.
 
@@ -1114,7 +1117,7 @@ Recovery не закриває gates після першого проходу. F
 
 Safety-hardening відправки (`OrderSubmitter`, атомарні біржові gates) — **виконано**. Далі, кожен пункт — окремий commit з тестами:
 
-1. exchange recovery DTO / protocol (13.3–13.4; симулятор реалізує їх для тестів);
+1. exchange recovery DTO / protocol (13.3–13.4; симулятор реалізує їх для тестів) — **виконано**;
 2. стабільний namespace `client_order_id` (13.5);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10);
 4. відновлення виконань / fills (13.8);

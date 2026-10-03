@@ -91,6 +91,13 @@ ALLOWED_TRANSITIONS: Final[Mapping[OrderStatus, frozenset[OrderStatus]]] = Mappi
 
 TERMINAL_STATUSES: Final = frozenset({_S.FILLED, _S.CANCELED, _S.REJECTED, _S.EXPIRED, _S.FAILED})
 
+# Statuses an exchange can actually report about an order. Local lifecycle
+# statuses (NEW, SUBMITTING, CANCELING, UNKNOWN) and FAILED ("never sent") are
+# never exchange facts.
+EXCHANGE_REPORTED_STATUSES: Final = frozenset(
+    {_S.OPEN, _S.PARTIALLY_FILLED, _S.FILLED, _S.CANCELED, _S.REJECTED, _S.EXPIRED}
+)
+
 # Self-transitions that carry new execution data and must increase filled_qty.
 _FILL_PROGRESS_SELF_TRANSITIONS: Final = frozenset({_S.PARTIALLY_FILLED, _S.CANCELING})
 

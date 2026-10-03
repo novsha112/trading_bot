@@ -281,6 +281,11 @@ class SimulatedPositionLedger:
         state = self._states.get(symbol)
         return None if state is None else _to_position(state, mark)
 
+    def signed_quantities(self) -> dict[str, Decimal]:
+        """Signed quantity of every symbol that ever had a fill (flat included),
+        sorted by symbol."""
+        return {symbol: self._states[symbol].qty for symbol in sorted(self._states)}
+
     def begin_batch(self) -> PositionBatch:
         """A working copy for preparing several fills; reads see the batch's own
         prepared fills. The ledger is not changed until ``commit``."""

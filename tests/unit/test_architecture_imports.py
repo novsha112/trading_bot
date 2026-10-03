@@ -93,11 +93,14 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.domain",
             "app.exchanges.models",
             "app.exchanges.errors",
+            "app.exchanges.recovery",
             "app.exchanges.simulated_positions",
             "app.exchanges.simulated_fees",
             "app.exchanges.simulated_accounting",
         }
     ),
+    # Recovery read DTOs: domain only (no execution, services or persistence).
+    "exchanges.recovery": frozenset({"app.domain"}),
     # Position accounting: domain only (no exchange contracts, no instrument rules).
     "exchanges.simulated_positions": frozenset({"app.domain"}),
     # Fee model: domain only.

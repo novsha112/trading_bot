@@ -4,6 +4,9 @@
 * ``AccountClient``: balances and positions.
 * ``TradingClient``: order placement, cancellation and queries; used only by the
   execution layer (and the kill switch).
+* ``ExchangeStateReader``: read-only recovery capabilities (complete open-order
+  snapshot, position snapshot, execution history pages); no mutation at all, so
+  recovery code depending on it cannot send or cancel anything.
 
 Protocols are structural and checked statically by mypy (no runtime_checkable).
 Errors are reported with the classes from ``app.exchanges.errors``; a failure to
@@ -20,6 +23,12 @@ from app.domain.market import Ticker
 from app.domain.orders import OrderUpdate
 from app.domain.positions import Position
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
+from app.exchanges.recovery import (
+    ExecutionPage,
+    ExecutionQuery,
+    OpenOrdersSnapshot,
+    PositionSnapshot,
+)
 
 
 class MarketDataClient(Protocol):
@@ -86,4 +95,34 @@ class TradingClient(Protocol):
 
     async def get_open_orders(self, *, symbol: str) -> tuple[OrderUpdate, ...]:
         """All open orders of ``symbol``; an empty tuple means none are open."""
+        ...
+
+
+class ExchangeStateReader(Protocol):
+    """Read-only exchange state for startup recovery (docs/ARCHITECTURE.md 13.3).
+
+    The scope (account, category, settlement) is a property of the reader's own
+    configuration. Read failures raise exchange errors; a partial open-order set,
+    an empty page instead of an error or an unknown cursor never pass silently.
+    """
+
+    async def list_open_orders(self) -> OpenOrdersSnapshot:
+        """The COMPLETE set of open orders of the scope (all pages read)."""
+        ...
+
+    async def get_position_snapshot(self) -> PositionSnapshot:
+        """Positions of the scope; ``complete`` says whether an absent symbol is
+        flat (True) or unknown (False)."""
+        ...
+
+    async def list_executions(
+        self, query: ExecutionQuery, *, cursor: str | None = None
+    ) -> ExecutionPage:
+        """One page of ``query`` (``cursor`` from the previous page of the SAME
+        query, None for the first). ``next_cursor is None`` = exhausted.
+
+        Raises:
+            ExchangeRejectedError: unknown cursor or a cursor of another query.
+            ExchangeResponseError: no valid answer for this page (nothing returned).
+        """
         ...

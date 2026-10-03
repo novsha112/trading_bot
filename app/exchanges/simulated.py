@@ -105,6 +105,27 @@ Semantics:
 * All timestamps come from the injected ``Clock``. Nothing is ever ambiguous: there
   is no transport.
 
+Recovery reads (``ExchangeStateReader``; the simulator's whole state is its scope):
+* ``list_open_orders()``: every OPEN / PARTIALLY_FILLED order (bot-placed and
+  external) with its full terms and exact cumulative notional, by
+  (created_ts, exchange_order_id); ``server_ts`` is one clock read.
+* ``get_position_snapshot()``: the signed quantity of every symbol that ever had
+  a fill (flat included), ``complete=True``; after the test input
+  ``restrict_position_snapshot(symbols)`` only those symbols and
+  ``complete=False``.
+* ``list_executions(query, cursor=None)``: the execution history (every fill as
+  a TRADE, plus test-recorded executions) matching the query, inclusive window,
+  ordered by (exchange_ts, exec_id) for reproducibility only (no exchange
+  ordering is claimed), in pages of ``execution_page_size``. Cursors are opaque,
+  deterministic and bound to their query: an unknown cursor or one of another
+  query -> ``ExchangeRejectedError``. ``set_execution_page_failures({n, ...})``
+  makes page n fail with ``ExchangeResponseError`` on every request (nothing
+  returned). A page the DTO rejects (e.g. one exec id twice) is a response error.
+* Test inputs (not part of any protocol): ``add_external_order`` (an order placed
+  outside the bot, optionally without client id: listed, never matched or
+  filled) and ``record_external_execution`` (a raw history record; no effect on
+  orders, positions or cash, duplicates allowed).
+
 Methods never await, so each call is atomic within one event loop.
 """
 
@@ -143,8 +164,19 @@ from app.exchanges.errors import (
     ExchangeDuplicateOrderError,
     ExchangeRejectedError,
     ExchangeRequestValidationError,
+    ExchangeResponseError,
 )
 from app.exchanges.models import OrderAck, OrderRef, OrderRequest
+from app.exchanges.recovery import (
+    ExchangeExecution,
+    ExchangeOrder,
+    ExchangePosition,
+    ExecutionKind,
+    ExecutionPage,
+    ExecutionQuery,
+    OpenOrdersSnapshot,
+    PositionSnapshot,
+)
 from app.exchanges.simulated_accounting import (
     CashState,
     EquityState,
@@ -157,6 +189,9 @@ from app.exchanges.simulated_positions import MarkQuote, SimulatedPositionLedger
 
 EXCHANGE_ORDER_ID_PREFIX: Final = "SIM-"
 EXEC_ID_PREFIX: Final = "SIM-EXEC-"
+CURSOR_PREFIX: Final = "SIM-CURSOR-"
+DEFAULT_EXECUTION_PAGE_SIZE: Final = 50
+"""Simulator default only; not any exchange's limit."""
 _ACTIVE_STATUSES: Final = frozenset({OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED})
 _RESTING_TIME_IN_FORCE: Final = frozenset({TimeInForce.GTC, TimeInForce.POST_ONLY})
 _ZERO: Final = Decimal(0)
@@ -230,6 +265,26 @@ class _SimulatedOrder:
             client_order_id=self.request.client_order_id,
             exchange_order_id=self.exchange_order_id,
             exchange_ts=self.created_at,
+        )
+
+    def to_exchange_order(self) -> ExchangeOrder:
+        request = self.request
+        return ExchangeOrder(
+            exchange_order_id=self.exchange_order_id,
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side,
+            order_type=request.order_type,
+            price=request.price,
+            qty=request.qty,
+            time_in_force=request.time_in_force,
+            reduce_only=request.reduce_only,
+            status=self.status,
+            cum_filled_qty=self.filled_qty,
+            cum_filled_notional=self.filled_notional,
+            avg_fill_price=self.avg_fill_price,
+            created_ts=self.created_at,
+            updated_ts=self.updated_at,
         )
 
     def to_update(self) -> OrderUpdate:
@@ -389,6 +444,23 @@ def _fill_qty(
         ) from None
 
 
+def _trade_execution(fill: Fill) -> ExchangeExecution:
+    return ExchangeExecution(
+        exec_id=fill.exec_id,
+        exchange_order_id=fill.exchange_order_id,
+        client_order_id=fill.client_order_id,
+        symbol=fill.symbol,
+        side=fill.side,
+        price=fill.price,
+        qty=fill.qty,
+        fee=fill.fee,
+        fee_asset=fill.fee_asset,
+        is_maker=fill.is_maker,
+        kind=ExecutionKind.TRADE,
+        exchange_ts=fill.exchange_ts,
+    )
+
+
 def _require_symbol(symbol: object) -> str:
     try:
         return require_text(symbol, "symbol")
@@ -402,11 +474,18 @@ class SimulatedExchange:
     __slots__ = (
         "_cash",
         "_clock",
+        "_cursor_sequence",
+        "_cursors",
         "_exec_sequence",
+        "_executions",
+        "_external_orders",
+        "_failing_pages",
         "_fees",
         "_instruments",
         "_marks",
         "_orders",
+        "_page_size",
+        "_position_scope",
         "_positions",
         "_sequence",
     )
@@ -418,7 +497,10 @@ class SimulatedExchange:
         instruments: tuple[InstrumentSpec, ...] = (),
         fees: SimulatedFeePolicy | None = None,
         cash: SimulatedCashConfig | None = None,
+        execution_page_size: int = DEFAULT_EXECUTION_PAGE_SIZE,
     ) -> None:
+        if type(execution_page_size) is not int or execution_page_size <= 0:
+            raise ValueError("execution_page_size must be an int > 0")
         if fees is not None and not isinstance(fees, SimulatedFeePolicy):
             raise TypeError("fees must be a SimulatedFeePolicy or None")
         if cash is not None and not isinstance(cash, SimulatedCashConfig):
@@ -457,6 +539,14 @@ class SimulatedExchange:
                         f"cash asset {cash.asset} (no conversion)"
                     )
         self._cash = None if cash is None else SimulatedCashLedger(cash)
+        # Recovery reads: execution history, external orders, cursors, test inputs.
+        self._executions: list[ExchangeExecution] = []
+        self._external_orders: dict[str, ExchangeOrder] = {}
+        self._page_size = execution_page_size
+        self._cursors: dict[str, tuple[ExecutionQuery, int]] = {}
+        self._cursor_sequence = 0
+        self._failing_pages: frozenset[int] = frozenset()
+        self._position_scope: tuple[str, ...] | None = None
 
     def __repr__(self) -> str:
         return f"SimulatedExchange(orders={len(self._orders)})"
@@ -492,6 +582,11 @@ class SimulatedExchange:
             raise ExchangeDuplicateOrderError(
                 f"simulated exchange: client_order_id {order.client_order_id} already exists "
                 f"with different terms"
+            )
+        if any(o.client_order_id == order.client_order_id for o in self._external_orders.values()):
+            raise ExchangeDuplicateOrderError(
+                f"simulated exchange: client_order_id {order.client_order_id} belongs to "
+                "an external order"
             )
         if order.order_type is not OrderType.LIMIT:
             raise ExchangeRejectedError(
@@ -673,6 +768,7 @@ class SimulatedExchange:
         for new_record in new_records:
             self._orders[new_record.request.client_order_id] = new_record
         self._exec_sequence = sequence
+        self._executions.extend(_trade_execution(fill) for fill in fills)
         return tuple(fills)
 
     def _check_reduce_only_direction(self, order: OrderRequest) -> None:
@@ -686,6 +782,150 @@ class SimulatedExchange:
                 f"simulated exchange: reduce_only {order.side.value} order "
                 f"{order.client_order_id} would not reduce {state} {order.symbol} position"
             )
+
+    # --- recovery reads (ExchangeStateReader) -------------------------------------
+
+    async def list_open_orders(self) -> OpenOrdersSnapshot:
+        """Every open order of the simulator (bot-placed and external)."""
+        orders = [
+            record.to_exchange_order()
+            for record in self._orders.values()
+            if record.status in _ACTIVE_STATUSES
+        ]
+        orders.extend(self._external_orders.values())
+        orders.sort(key=lambda order: (order.created_ts, order.exchange_order_id))
+        return OpenOrdersSnapshot(orders=tuple(orders), server_ts=self._now())
+
+    async def get_position_snapshot(self) -> PositionSnapshot:
+        """Signed positions of every symbol that ever had a fill; partial (and
+        ``complete=False``) only after ``restrict_position_snapshot``."""
+        quantities = self._positions.signed_quantities()
+        scope = self._position_scope
+        positions = tuple(
+            ExchangePosition(symbol=symbol, qty=qty)
+            for symbol, qty in quantities.items()
+            if scope is None or symbol in scope
+        )
+        return PositionSnapshot(positions=positions, complete=scope is None, server_ts=self._now())
+
+    async def list_executions(
+        self, query: ExecutionQuery, *, cursor: str | None = None
+    ) -> ExecutionPage:
+        """One page of the execution history matching ``query``."""
+        if type(query) is not ExecutionQuery:
+            raise ExchangeRequestValidationError("simulated exchange: expected an ExecutionQuery")
+        offset = 0
+        if cursor is not None:
+            known = self._cursors.get(cursor) if type(cursor) is str else None
+            if known is None:
+                raise ExchangeRejectedError("simulated exchange: unknown execution cursor")
+            if known[0] != query:
+                raise ExchangeRejectedError(
+                    "simulated exchange: execution cursor belongs to another query"
+                )
+            offset = known[1]
+        page_number = offset // self._page_size + 1
+        if page_number in self._failing_pages:
+            raise ExchangeResponseError(
+                f"simulated exchange: execution page {page_number} failed (injected)"
+            )
+        matching = sorted(
+            (execution for execution in self._executions if query.matches(execution)),
+            key=lambda execution: (execution.exchange_ts, execution.exec_id),
+        )
+        end = offset + self._page_size
+        next_cursor: str | None = None
+        if end < len(matching):
+            self._cursor_sequence += 1
+            next_cursor = f"{CURSOR_PREFIX}{self._cursor_sequence:010d}"
+            self._cursors[next_cursor] = (query, end)
+        try:
+            return ExecutionPage(
+                query=query, executions=tuple(matching[offset:end]), next_cursor=next_cursor
+            )
+        except DomainValidationError as error:
+            raise ExchangeResponseError(
+                f"simulated exchange: invalid execution page {page_number}: {error}"
+            ) from None
+
+    # --- test inputs for recovery scenarios (not part of any protocol) ------------
+
+    def add_external_order(
+        self,
+        *,
+        client_order_id: str | None,
+        symbol: str,
+        side: Side,
+        price: Decimal,
+        qty: Decimal,
+        time_in_force: TimeInForce = TimeInForce.GTC,
+        reduce_only: bool = False,
+    ) -> ExchangeOrder:
+        """Simulation input: an OPEN limit order placed outside the bot (any
+        symbol, optionally without client id). It is listed by
+        ``list_open_orders`` but never matched, filled or canceled here. A client
+        id already used by any order of this simulator is refused."""
+        if client_order_id is not None and (
+            client_order_id in self._orders
+            or any(o.client_order_id == client_order_id for o in self._external_orders.values())
+        ):
+            raise ExchangeDuplicateOrderError(
+                f"simulated exchange: client_order_id {client_order_id} already exists"
+            )
+        now = self._now()
+        try:
+            order = ExchangeOrder(
+                exchange_order_id=self._next_exchange_order_id(),
+                client_order_id=client_order_id,
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                price=price,
+                qty=qty,
+                time_in_force=time_in_force,
+                reduce_only=reduce_only,
+                status=OrderStatus.OPEN,
+                cum_filled_qty=_ZERO,
+                cum_filled_notional=None,
+                avg_fill_price=None,
+                created_ts=now,
+                updated_ts=now,
+            )
+        except DomainValidationError as error:
+            raise ExchangeRequestValidationError(
+                f"simulated exchange: invalid external order: {error}"
+            ) from None
+        self._external_orders[order.exchange_order_id] = order
+        return order
+
+    def record_external_execution(self, execution: ExchangeExecution) -> None:
+        """Simulation input: append a raw execution record to the history (no
+        effect on orders, positions or cash; the same exec id may be recorded
+        again, identical or not)."""
+        if type(execution) is not ExchangeExecution:
+            raise ExchangeRequestValidationError(
+                "simulated exchange: expected an ExchangeExecution"
+            )
+        self._executions.append(execution)
+
+    def set_execution_page_failures(self, pages: frozenset[int]) -> None:
+        """Simulation input: every request for one of these (1-based) execution
+        pages raises ``ExchangeResponseError`` until replaced (empty = none)."""
+        if type(pages) is not frozenset or not all(
+            type(page) is int and page > 0 for page in pages
+        ):
+            raise ValueError("pages must be a frozenset of ints > 0")
+        self._failing_pages = pages
+
+    def restrict_position_snapshot(self, symbols: tuple[str, ...] | None) -> None:
+        """Simulation input: later position snapshots contain only ``symbols``
+        and are partial (``complete=False``); None restores the complete one."""
+        if symbols is not None:
+            if type(symbols) is not tuple:
+                raise ValueError("symbols must be a tuple or None")
+            for symbol in symbols:
+                _require_symbol(symbol)
+        self._position_scope = symbols
 
     async def get_cash_state(self) -> CashState | None:
         """Simulation-only read (not part of ``TradingClient``): cash components of
