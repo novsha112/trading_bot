@@ -1033,9 +1033,10 @@ exchange cum_filled_qty > local filled_qty
 
 - **Known ≠ reconciled.** Авторитетний повний snapshot може зробити runtime-позицію *відомою*; `positions_reconciled` закривається лише коли позиція ще й *пояснена*.
 - **[інваріант]** Core ніколи сам не робить `відсутній символ → qty 0`. Це дозволено лише для snapshot, семантика якого (контракт адаптера) гарантує повноту відповідного scope; Bybit-специфічна інтерпретація лишається в адаптері (13.14). Неповна пагінація → виняток, snapshot не повертається.
+- **[інваріант: реалізовано] Durable projection.** A durable known position is the bot's internally consistent durable projection through all fills committed by that account state. Стан акаунта тримає два окремі погляди: runtime-позицію (`position_qty`, невідома після hydrate до exchange reconciliation) і durable projection (`durable_position` → `PersistedPosition`: немає рядка / `known=False` / `known=True` з qty) — локальний доказ, а не поточна позиція біржі. Hydrate відновлює durable projection, runtime лишається невідомою. Кожен fill, закомічений для символу з durable `known=True`, просуває projection у тій самій `AccountStateChange` (fill + order + notional + позиція + revision) — також коли runtime-позиція невідома, тобто missing fills, застосовані після hydrate, просувають projection атомарно. Durable unknown через fill ніколи не стає known. Reduce-only перевіряється відносно known projection, коли runtime невідома (fail closed). Known runtime ≠ known durable → `PositionProjectionMismatchError`. Для даних, записаних до цього інваріанта, hydrate не реконструює projection з fills (немає історичного checkpoint); міграція не потрібна (durable SQL-сховища ще немає).
 - **Пояснена позиція (V1):**
-  - persisted known baseline + знакова сума відновлених fills = авторитетна біржова qty; **або**
-  - persisted unknown + авторитетна біржова qty == 0 + відновлених fills немає.
+  - **поточна durable projection після fill recovery == авторитетна біржова qty** (fills — доказ того, як отримано projection; вдруге вони **не** додаються); **або**
+  - durable unknown / немає рядка + авторитетна біржова qty == 0 + немає position-level доказів виконань.
 - Ненульова авторитетна позиція при persisted unknown: runtime може стати known, але позиція лишається **unexplained**, gate не закривається, effective PAUSED.
 - **Baseline acceptance** — запланована явна дія оператора «прийняти поточну біржову позицію як baseline»: **не реалізується зараз**; лише explicit; durable; з причиною / audit event; після неї поточна біржова qty стає persisted known baseline, і наступний рестарт пояснює позицію автоматично. Неявного прийняття немає.
 
@@ -1125,7 +1126,7 @@ Safety-hardening відправки (`OrderSubmitter`, атомарні бірж
 2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10) — **виконано** (класифікація ордерів snapshot; порівняння notional / avg — разом із п. 4);
 4. відновлення виконань / fills (13.8) — **виконано** (для одного managed-ордера; generic reader + simulator);
-5. reconciliation позицій + workflow baseline (13.9);
+5. reconciliation позицій + workflow baseline (13.9) — передумова **виконана** (інваріант durable position projection); reconciliation позицій і прийняття baseline — ще ні;
 6. open-order discovery (13.7);
 7. `RecoveryCoordinator` + final verification (13.1, 13.11, 13.12);
 8. Bybit read-адаптер + fixtures / testnet-валідація (13.14);

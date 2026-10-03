@@ -330,7 +330,10 @@
 2. стабільний namespace `client_order_id` — **виконано** (`app/execution/client_order_id.py`: формат `tb1_<namespace>_<token>`, parser / класифікація id, генератор з ін'єкцією namespace; durable-джерело namespace — ще ні);
 3. чисте зіставлення / класифікація recovery — **виконано** (`app/execution/recovery_matching.py`: managed / foreign / lost-managed / identity conflicts / missing-local-active, без читання біржі й змін стану);
 4. відновлення виконань / fills — **виконано** (`app/execution/fill_recovery.py`: повна історія, дедуп, блок не-TRADE, preflight до мутації, точні qty / notional через наявний `apply_fill`);
-5. reconciliation позицій + workflow прийняття baseline;
+5. reconciliation позицій + workflow прийняття baseline — **ще не виконано**:
+   - передумова: інваріант durable position projection — **виконано** (known durable позиція покриває всі закомічені fills, також після hydrate);
+   - reconciliation авторитетних позицій — ні;
+   - явне прийняття baseline — ні;
 6. open-order discovery;
 7. `RecoveryCoordinator` + final verification;
 8. Bybit read-адаптер + fixtures / testnet-валідація;

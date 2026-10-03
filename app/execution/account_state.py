@@ -57,9 +57,22 @@ account state from the durable state; the locally provable crash classification
 in ONE change before the account state exists. Every position starts unknown.
 Hydrated is not recovered, recovered is not safe to trade.
 
-Positions: ``None`` (no entry) = unknown / not reconciled; ``0`` = known flat;
-``> 0`` long, ``< 0`` short. A missing entry is never read as flat. Until
-reconciliation exists, ``set_position_qty`` seeds or clears a position.
+Positions, two separate views per symbol:
+* RUNTIME position (``position_qty``): ``None`` (no entry) = unknown / not
+  reconciled; ``0`` = known flat; ``> 0`` long, ``< 0`` short. A missing entry is
+  never read as flat. Unknown after ``hydrate`` until exchange reconciliation.
+* DURABLE position projection (``durable_position``): the committed
+  ``PersistedPosition`` (no row / ``known=False`` / ``known=True`` with qty), the
+  bot's own durable evidence, never the exchange's current position. Invariant:
+  a durable ``known=True`` qty covers every fill committed for that symbol by
+  this account state; each such fill advances it in the same change (also while
+  the runtime position is unknown, e.g. a fill recovered after ``hydrate``). A
+  durable unknown never becomes known through a fill. ``hydrate`` restores the
+  durable projection, not the runtime position.
+``set_position_qty`` (a trusted value, or None to clear) sets both. Runtime known
+without a known durable projection is not produced by any current mutation; a
+fill there moves only the runtime value. A known runtime value that differs from
+the known durable projection fails closed (``PositionProjectionMismatchError``).
 
 Fills (``apply_fill``): the fill is found by its ``client_order_id``; symbol,
 side and a known ``exchange_order_id`` must match the order. Only SUBMITTING,
@@ -68,9 +81,11 @@ sent; terminal orders are final). Cumulative quantity, exact notional and the
 average price follow ``app.domain.fill_math``; the new status is FILLED when the
 order is complete, otherwise CANCELING stays CANCELING and every other source
 becomes PARTIALLY_FILLED (the existing state machine). The position follows
-``app.portfolio.positions`` (unknown stays unknown; a reduce-only fill can never
-reverse a known position). Everything is prepared first; the order, the exact
-notional, the position, the applied fill and the revision are then committed
+``app.portfolio.positions`` from the runtime position, or from the known durable
+projection when the runtime one is unknown (unknown stays unknown; a reduce-only
+fill can never reverse a known position, else ``FillApplicationError``).
+Everything is prepared first; the order, the exact notional, the position (runtime
+and durable), the applied fill and the revision are then committed
 together, or nothing changes. An identical ``exec_id`` replay changes nothing;
 the same ``exec_id`` with different data raises ``FillConflictError``.
 
@@ -218,6 +233,11 @@ class ExchangeStateMismatchError(AccountStateError):
     forbids); nothing was changed."""
 
 
+class PositionProjectionMismatchError(FillApplicationError):
+    """The known runtime position and the known durable projection of a symbol
+    differ: a fill is never applied to one of them arbitrarily."""
+
+
 class MissingFillsError(AccountStateError):
     """The exchange reports more execution than the fills applied locally. Fills
     are never synthesized from an order report: the missing fills must be
@@ -252,7 +272,10 @@ class _State:
     """Exact executed notional per order: the source of its average price."""
     placements: dict[str, PlacementRecord] = dataclasses.field(default_factory=dict)
     positions: dict[str, Decimal] = dataclasses.field(default_factory=dict)
-    """Known signed positions only; a missing symbol is unknown."""
+    """RUNTIME known signed positions only; a missing symbol is unknown."""
+    durable_positions: dict[str, PersistedPosition] = dataclasses.field(default_factory=dict)
+    """The committed durable position projection per symbol (evidence, not exchange
+    authority): exactly what the store holds; a missing symbol has no durable row."""
     fills: dict[str, Fill] = dataclasses.field(default_factory=dict)
     safety_blocks: dict[str, SafetyBlockRecord] = dataclasses.field(default_factory=dict)
     """Why an order was FAILED by the safety gate (definitely not sent)."""
@@ -370,6 +393,13 @@ class LockedAccountState:
         """Exact accumulated fill notional of an order (None: no such order)."""
         state = self._live()
         return state.notionals.get(require_text(client_order_id, "client_order_id"))
+
+    def durable_position(self, symbol: str) -> PersistedPosition | None:
+        """The committed durable position projection of ``symbol`` (None: no
+        durable row; ``known=False``: a durable unknown). Local evidence only,
+        never the exchange's current position."""
+        state = self._live()
+        return state.durable_positions.get(require_text(symbol, "symbol"))
 
     def placement(self, intent_id: str) -> PlacementRecord | None:
         state = self._live()
@@ -492,22 +522,24 @@ class LockedAccountState:
         require_text(symbol, "symbol")
         if qty is not None and (type(qty) is not Decimal or not qty.is_finite()):
             raise DomainValidationError("position qty must be a finite, exact Decimal or None")
+        row = PersistedPosition(symbol=symbol, known=qty is not None, qty=qty)
         current = state.positions.get(symbol)
-        if (current is None and qty is None) or (
-            current is not None and qty is not None and current == qty
-        ):
-            return
+        durable = state.durable_positions.get(symbol)
+        durable_unknown = durable is None or not durable.known
+        if current == qty and (durable == row or (qty is None and durable_unknown)):
+            return  # runtime and durable already hold this value (absent = unknown)
         positions = dict(state.positions)
         if qty is None:
-            del positions[symbol]
+            positions.pop(symbol, None)
         else:
             positions[symbol] = qty
-        prepared = dataclasses.replace(state, positions=positions, revision=state.revision + 1)
-        change = self._change(
+        prepared = dataclasses.replace(
             state,
-            new_revision=prepared.revision,
-            position_writes=(PersistedPosition(symbol=symbol, known=qty is not None, qty=qty),),
+            positions=positions,
+            durable_positions=_with(state.durable_positions, symbol, row),
+            revision=state.revision + 1,
         )
+        change = self._change(state, new_revision=prepared.revision, position_writes=(row,))
         await self._commit_and_publish(state, prepared, change)
 
     async def _publish_order(self, state: _State, order: Order) -> Order:
@@ -753,17 +785,7 @@ class LockedAccountState:
             exchange_order_id=fill.exchange_order_id,
             last_exchange_update_ts=fill.exchange_ts,
         )
-        try:
-            position = position_after_fill(
-                state.positions.get(order.symbol),
-                side=fill.side,
-                qty=fill.qty,
-                reduce_only=order.reduce_only,
-            )
-        except PositionStateError as error:
-            raise FillApplicationError(
-                f"fill {fill.exec_id} of order {order.client_order_id}: {error}"
-            ) from error
+        runtime, durable = self._positions_after_fill(state, order, fill)
         # One durable change: fill, order, notional, position and revision together.
         prepared = dataclasses.replace(
             state,
@@ -771,8 +793,13 @@ class LockedAccountState:
             notionals=_with(state.notionals, order.client_order_id, totals.filled_notional),
             positions=(
                 state.positions
-                if position is None
-                else _with(state.positions, order.symbol, position)
+                if runtime is None
+                else _with(state.positions, order.symbol, runtime)
+            ),
+            durable_positions=(
+                state.durable_positions
+                if durable is None
+                else _with(state.durable_positions, order.symbol, durable)
             ),
             fills=_with(state.fills, fill.exec_id, fill),
             revision=state.revision + 1,
@@ -788,14 +815,46 @@ class LockedAccountState:
                     filled_notional=totals.filled_notional,
                 ),
             ),
-            position_writes=(
-                ()
-                if position is None
-                else (PersistedPosition(symbol=order.symbol, known=True, qty=position),)
-            ),
+            position_writes=() if durable is None else (durable,),
         )
         await self._commit_and_publish(state, prepared, change)
         return updated
+
+    @staticmethod
+    def _positions_after_fill(
+        state: _State, order: Order, fill: Fill
+    ) -> tuple[Decimal | None, PersistedPosition | None]:
+        """(runtime position after the fill or None if it stays unknown, the new
+        durable row or None if the durable projection is not known).
+
+        One shared computation (``position_after_fill``) from the position the
+        fill applies to: the runtime one when known, else the durable known
+        projection. A known durable projection always advances with the fill (in
+        the same change), so ``known=True`` keeps covering every committed fill;
+        an unknown one never becomes known here. Runtime and durable known with
+        different values fail closed."""
+        symbol = order.symbol
+        runtime = state.positions.get(symbol)
+        row = state.durable_positions.get(symbol)
+        durable = row.qty if row is not None and row.known else None
+        if runtime is not None and durable is not None and runtime != durable:
+            raise PositionProjectionMismatchError(
+                f"fill {fill.exec_id}: runtime position {runtime} of {symbol} differs from "
+                f"its durable projection {durable}"
+            )
+        base = runtime if runtime is not None else durable
+        try:
+            after = position_after_fill(
+                base, side=fill.side, qty=fill.qty, reduce_only=order.reduce_only
+            )
+        except PositionStateError as error:
+            raise FillApplicationError(
+                f"fill {fill.exec_id} of order {order.client_order_id}: {error}"
+            ) from error
+        runtime_after = after if runtime is not None else None
+        if durable is None or after is None:
+            return runtime_after, None
+        return runtime_after, PersistedPosition(symbol=symbol, known=True, qty=after)
 
     @staticmethod
     def _fill_target(state: _State, fill: Fill) -> Order:
@@ -887,6 +946,7 @@ def _runtime_state(snapshot: PersistedAccountState, change: AccountStateChange |
         notionals=dict(snapshot.notionals),
         placements=dict(snapshot.placements),
         positions={},
+        durable_positions=dict(snapshot.positions),
         fills=dict(snapshot.fills),
         safety_blocks=dict(snapshot.safety_blocks),
         revision=revision,
@@ -1010,6 +1070,10 @@ class InMemoryAccountState:
     async def filled_notional(self, client_order_id: str) -> Decimal | None:
         async with self.account_lock() as locked:
             return locked.filled_notional(client_order_id)
+
+    async def durable_position(self, symbol: str) -> PersistedPosition | None:
+        async with self.account_lock() as locked:
+            return locked.durable_position(symbol)
 
     async def placement(self, intent_id: str) -> PlacementRecord | None:
         async with self.account_lock() as locked:
