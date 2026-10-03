@@ -23,6 +23,7 @@ MODULES = (
     "app.execution.safety",
     "app.execution.client_order_id",
     "app.execution.recovery_matching",
+    "app.execution.fill_recovery",
     "app.services.placement",
     "app.execution.submitter",
     "app.execution.reconciliation",

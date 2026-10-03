@@ -151,6 +151,19 @@ MODULE_APP_ALLOWLIST: dict[str, frozenset[str]] = {
             "app.execution.timing",
         }
     ),
+    # Missing-fill recovery of one order: the read-only exchange reader and DTOs,
+    # the account state's public API, matching and timing (no adapter, simulator,
+    # persistence or services).
+    "execution.fill_recovery": frozenset(
+        {
+            "app.domain",
+            "app.exchanges.protocols",
+            "app.exchanges.recovery",
+            "app.execution.account_state",
+            "app.execution.recovery_matching",
+            "app.execution.timing",
+        }
+    ),
     # Pure recovery order matching: domain, the exchange recovery DTOs and the
     # client order id namespace only (no reader, persistence, services, adapters).
     "execution.recovery_matching": frozenset(

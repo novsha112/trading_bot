@@ -366,6 +366,11 @@ class LockedAccountState:
         state = self._live()
         return state.fills.get(require_text(exec_id, "exec_id"))
 
+    def filled_notional(self, client_order_id: str) -> Decimal | None:
+        """Exact accumulated fill notional of an order (None: no such order)."""
+        state = self._live()
+        return state.notionals.get(require_text(client_order_id, "client_order_id"))
+
     def placement(self, intent_id: str) -> PlacementRecord | None:
         state = self._live()
         return state.placements.get(require_text(intent_id, "intent_id"))
@@ -1001,6 +1006,10 @@ class InMemoryAccountState:
     async def fill(self, exec_id: str) -> Fill | None:
         async with self.account_lock() as locked:
             return locked.fill(exec_id)
+
+    async def filled_notional(self, client_order_id: str) -> Decimal | None:
+        async with self.account_lock() as locked:
+            return locked.filled_notional(client_order_id)
 
     async def placement(self, intent_id: str) -> PlacementRecord | None:
         async with self.account_lock() as locked:

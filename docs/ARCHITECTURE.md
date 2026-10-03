@@ -1027,6 +1027,7 @@ exchange cum_filled_qty > local filled_qty
 - **Пагінація виконань.** Execution layer бачить явну семантику сторінок і курсора; вікно запиту фіксоване; помилка будь-якої сторінки, перевищення ліміту сторінок або сторінка з чужим запитом → історія неповна, gate не закривається. Часткова історія ніколи не подається як успіх.
 - **Вікно історії.** `start` — достатньо рання межа від durable часу створення ордера (з поправкою на розбіжність годинників, яку визначить контракт адаптера); `end` — фіксована верхня межа запиту. Час старту процесу як нижня межа **заборонений**. Якщо зберігання історії біржею не покриває потрібний період → помилка можливостей, recovery заблоковано. Execution watermark у V1 не потрібен (per-order запити).
 - **Завершеність для ордера:** `Σ qty застосованих fills == local filled_qty == exchange cum_filled_qty`, де біржове значення прочитано **після** завершення вибірки виконань.
+- **Реалізовано для generic reader + simulator** (`app/execution/fill_recovery.py`, `recover_missing_fills(account_state, reader, match, query, clock)`): для одного `ManagedOrderMatch` і фіксованого `ExecutionQuery` (вікно задає викликач) — повне читання всіх сторінок поза lock (точне відлуння query, цикл курсорів → помилка протоколу, без штучного ліміту сторінок, помилка будь-якої сторінки → нічого не застосовано); preflight усієї історії до першої мутації (дедуп `exec_id`, конфлікт payload, лише `TRADE` — інші типи блокують, ідентичність кожного виконання: exchange id, присутній і рівний client id, symbol, side; історія == біржовий `cum_filled_qty`); під account lock — повторна перевірка ордера, порівняння вже застосованих fills за всіма полями `Fill`, локальне виконання — підмножина історії; потім відсутні fills через наявний атомарний `apply_fill` у порядку `(exchange_ts, exec_id)` і точна перевірка `filled_qty` / notional. Definite-збій commit лишає попередні fills (повтор їх дедупить), uncertain — poison і негайна зупинка. Generic-інваріант notional: історія виконань == локальний notional; `ExchangeOrder.cum_filled_notional` **не** є safety-інваріантом без доведеної capability reader-а (симулятор рахує його точно — окремий тест). `UnknownOrderReconciler` і старий шлях `MissingFills` не змінювались.
 
 ### 13.9 Позиції **[план V1]**
 
@@ -1123,7 +1124,7 @@ Safety-hardening відправки (`OrderSubmitter`, атомарні бірж
 1. exchange recovery DTO / protocol (13.3–13.4; симулятор реалізує їх для тестів) — **виконано**;
 2. стабільний namespace `client_order_id` (13.5) — **виконано** (формат і parser; durable-джерело namespace — ні);
 3. чисте зіставлення / класифікація recovery (13.5–13.7, 13.10) — **виконано** (класифікація ордерів snapshot; порівняння notional / avg — разом із п. 4);
-4. відновлення виконань / fills (13.8);
+4. відновлення виконань / fills (13.8) — **виконано** (для одного managed-ордера; generic reader + simulator);
 5. reconciliation позицій + workflow baseline (13.9);
 6. open-order discovery (13.7);
 7. `RecoveryCoordinator` + final verification (13.1, 13.11, 13.12);
